@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = ["json"]
 # JSON framing shared by the bundled transports. The core never parses a payload.
@@ -25,3 +28,16 @@ xxhash-rust.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+proptest.workspace = true
+quote.workspace = true
+serde_json.workspace = true
+syn.workspace = true
+
+# Three levels, three binaries. See docs/testing.md.
+[[test]]
+name = "static"
+path = "tests/static/main.rs"
+
+[[test]]
+name = "runtime"
+path = "tests/runtime/main.rs"

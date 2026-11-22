@@ -20,6 +20,29 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
+# Test-only.
+proptest = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+# Decided once, for every crate. `cargo xtask verify` turns warnings into errors,
+# so anything listed here as "warn" is a gate too.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# A lock guard held over an await point blocks every reader for as long as
+# the awaited thing takes.
+await_holding_lock = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# A library does not write to the terminal.
+print_stdout = "deny"
+print_stderr = "deny"
+mem_forget = "deny"
+exit = "deny"
 
 [profile.release]
 debug = 1
