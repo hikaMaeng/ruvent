@@ -1,0 +1,16 @@
+# ruvent bench — 2026-11-22T06:25:16Z
+# rustc: rustc 1.96.0 (ac68faa20 2026-05-25)
+# os: Microsoft Windows [Version 10.0.26300.10075]
+# cpu: AMD Ryzen Threadripper 3960X 24-Core Processor 
+# logical cores: 48
+# journal location (temp dir): G:\UserData\hika0\Temp
+# command: target/release/examples/bench.exe 200000 256
+# config: EngineConfig::default() => Scheduled{window=100ms}, Persist{events=None, settled=false}, batch_max=2048, inbox=65536, Compaction{min_records=50000, ratio=4}; WorkerConfig::default() except max_in_flight=concurrency; payload=256 bytes
+# strict rows run commands/10
+round trip, no journal             round_trips=  199936 concurrency= 256 done_in=  1339.9ms per_sec=   149215 on_disk_in=  1342.4ms events=399872 journal_records=5939 journal_writes=14 compactions=0 engine_wakeups=5970
+round trip, file, window 100ms     round_trips=  199936 concurrency= 256 done_in=  1299.6ms per_sec=   153847 on_disk_in=  1302.0ms events=399872 journal_records=6531 journal_writes=14 compactions=0 engine_wakeups=5966
+round trip, file, strict           round_trips=   19968 concurrency= 256 done_in=   499.9ms per_sec=    39947 on_disk_in=   499.9ms events=39936 journal_records=79873 journal_writes=537 compactions=0 engine_wakeups=538
+chain of 3, no journal             chains=  199936 concurrency= 256 done_in=  6579.7ms per_sec=    30387 on_disk_in=  6583.3ms events=1799424 journal_records=433741 journal_writes=63 compactions=0 engine_wakeups=18087
+chain of 3, file, window 100ms     chains=  199936 concurrency= 256 done_in=  6558.5ms per_sec=    30485 on_disk_in=  6561.1ms events=1799424 journal_records=432541 journal_writes=63 compactions=0 engine_wakeups=18090
+chain of 3, file, strict           chains=   19968 concurrency= 256 done_in=  1695.9ms per_sec=    11774 on_disk_in=  1697.1ms events=179712 journal_records=239617 journal_writes=1263 compactions=0 engine_wakeups=1262
+# exit=0
