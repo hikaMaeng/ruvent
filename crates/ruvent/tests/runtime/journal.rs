@@ -328,3 +328,215 @@ async fn strict_mode_acknowledges_only_what_is_on_disk() {
     recovered.shutdown().await.unwrap();
     engine.shutdown().await.unwrap();
 }
+
+/// Asked for, a compaction happens now: the journal becomes one snapshot of
+/// what is owed, and a restart reads back exactly that.
+#[tokio::test]
+async fn an_explicit_compaction_folds_the_journal_now() {
+    let path = scratch("explicit");
+    let engine = Engine::open(&path, manual()).await.unwrap();
+    for index in 0..50 {
+        engine.submit("q", command(&format!("t{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+        run_one(&engine, "q").await;
+        engine.flush().await.unwrap();
+    }
+    engine.submit("q", command("stays")).await.unwrap();
+    engine.flush().await.unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(engine.stats().compactions, 0);
+
+    engine.compact().await.unwrap().unwrap();
+    assert_eq!(engine.stats().compactions, 1);
+    let after = std::fs::metadata(&path).unwrap().len();
+    assert!(after < before / 4, "a hundred superseded statements folded into two: {before} bytes then {after}");
+    engine.shutdown().await.unwrap();
+
+    let (_journal, recovered) = FileJournal::open(&path).unwrap();
+    assert_eq!(recovered.records.len(), 2, "the epoch and the owed message, nothing else: {:?}", recovered.records);
+    drop(_journal);
+    let engine = Engine::open(&path, manual()).await.unwrap();
+    assert_eq!(owed(&engine, "q").await, ["stays"]);
+    engine.shutdown().await.unwrap();
+}
+
+/// A journal whose writes each wait for a permit.
+struct Held(Arc<tokio::sync::Semaphore>);
+
+#[async_trait]
+impl Journal for Held {
+    async fn append(&mut self, _prev: u64, _through: u64, _records: &[Record]) -> io::Result<()> {
+        self.0.acquire().await.unwrap().forget();
+        Ok(())
+    }
+
+    async fn rewrite(&mut self, _at: u64, _records: &[Record]) -> io::Result<()> {
+        self.0.acquire().await.unwrap().forget();
+        Ok(())
+    }
+}
+
+/// A flush resolves when its changes are on disk, not before — also after
+/// a flush whose changes had cancelled out and wrote nothing.
+#[tokio::test(start_paused = true)]
+async fn a_flush_resolves_only_once_its_changes_are_on_disk() {
+    let permits = Arc::new(tokio::sync::Semaphore::new(1)); // the epoch
+    let engine = Engine::start(manual(), Held(permits.clone()), Recovered::default());
+
+    // Changes that cancel out: the flush has nothing to wait for.
+    engine.submit("q", command("gone")).await.unwrap();
+    let delivery = engine.dequeue("q", 1, None, NOW).await.unwrap().remove(0);
+    engine.ack("q", delivery.id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), engine.flush()).await.expect("nothing to write, nothing to wait for").unwrap();
+
+    // A change that does not: its flush waits for the stuck write.
+    engine.submit("q", command("kept")).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(3600), engine.flush()).await.is_err(), "a flush resolved while its write was still stuck");
+    permits.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), engine.flush()).await.expect("the write landed").unwrap();
+    assert_eq!(engine.stats().journal_lag, 0);
+}
+
+/// Up to its threshold a journal is left alone, however superseded: folding
+/// costs a full rewrite, and a small journal is cheap to replay.
+#[tokio::test]
+async fn a_journal_under_its_threshold_is_not_folded() {
+    let path = scratch("small");
+    let engine = Engine::open(&path, EngineConfig { compaction: Compaction { min_records: 61, ratio: 1 }, ..manual() }).await.unwrap();
+    for index in 0..30 {
+        engine.submit("churn", command(&format!("c{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+        let delivery = engine.dequeue("churn", 1, None, NOW).await.unwrap().remove(0);
+        engine.ack("churn", delivery.id).await.unwrap();
+        engine.flush().await.unwrap();
+    }
+    let stats = engine.stats();
+    assert_eq!(stats.journal_records, 61, "the epoch and thirty messages written as owed, then as gone");
+    assert_eq!(stats.compactions, 0, "61 records, all but one superseded: at the threshold of 61 is not over it");
+    engine.shutdown().await.unwrap();
+}
+
+/// While running, too, the journal is folded soon after it crosses its
+/// threshold: at no moment — so at no crash — does it hold much more than
+/// one and a half times the threshold.
+#[tokio::test]
+async fn a_running_journal_never_grows_far_past_its_threshold() {
+    const MIN: usize = 100;
+    let path = scratch("running");
+    let image = scratch("running-image");
+    let engine = Engine::open(&path, EngineConfig { compaction: Compaction { min_records: MIN as u64, ratio: 2 }, ..manual() }).await.unwrap();
+    let mut largest = 0;
+    for index in 0..300 {
+        engine.submit("churn", command(&format!("c{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+        let delivery = engine.dequeue("churn", 1, None, NOW).await.unwrap().remove(0);
+        engine.ack("churn", delivery.id).await.unwrap();
+        engine.flush().await.unwrap();
+        std::fs::copy(&path, &image).unwrap();
+        let (journal, recovered) = FileJournal::open(&image).unwrap();
+        drop(journal);
+        largest = largest.max(recovered.records.len());
+    }
+    assert!(engine.stats().compactions >= 3, "600 superseded records over a threshold of {MIN}");
+    assert!(largest <= MIN + MIN / 2, "the journal reached {largest} records against a threshold of {MIN}");
+    engine.shutdown().await.unwrap();
+}
+
+/// A journal in which nothing is superseded is never rewritten, even at a
+/// ratio of one: the snapshot would be the same size as the file.
+#[tokio::test]
+async fn a_journal_with_nothing_superseded_is_never_rewritten() {
+    let path = scratch("live");
+    let engine = Engine::open(&path, EngineConfig { compaction: Compaction { min_records: 20, ratio: 1 }, ..manual() }).await.unwrap();
+    for index in 0..40 {
+        engine.submit("q", command(&format!("t{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+    }
+    assert_eq!(engine.stats().journal_records, 41, "the epoch and forty owed messages, every one still true");
+    assert_eq!(engine.stats().compactions, 0);
+    engine.shutdown().await.unwrap();
+    assert_eq!(engine.stats().compactions, 0, "not on the way out either");
+}
+
+fn records_on_disk(path: &std::path::Path) -> usize {
+    let (journal, recovered) = FileJournal::open(path).unwrap();
+    drop(journal);
+    recovered.records.len()
+}
+
+/// A clean stop folds a journal that is over its threshold and mostly
+/// superseded — and leaves any other journal as it is.
+#[tokio::test]
+async fn a_clean_stop_folds_only_a_journal_over_its_threshold() {
+    // Under the threshold, however superseded: left alone.
+    let small = scratch("stop-small");
+    let engine = Engine::open(&small, EngineConfig { compaction: Compaction { min_records: 61, ratio: 1 }, ..manual() }).await.unwrap();
+    for index in 0..30 {
+        engine.submit("churn", command(&format!("c{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+        let delivery = engine.dequeue("churn", 1, None, NOW).await.unwrap().remove(0);
+        engine.ack("churn", delivery.id).await.unwrap();
+        engine.flush().await.unwrap();
+    }
+    engine.shutdown().await.unwrap();
+    assert_eq!(records_on_disk(&small), 61, "at its threshold, a journal is not over it and is not folded on the way out");
+
+    // Over the threshold, and superseded since the last time it was looked
+    // at while running: folded on the way out.
+    let large = scratch("stop-large");
+    let engine = Engine::open(&large, EngineConfig { compaction: Compaction { min_records: 100, ratio: 2 }, ..manual() }).await.unwrap();
+    for index in 0..60 {
+        engine.submit("owed", command(&format!("o{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+    }
+    for index in 0..20 {
+        engine.submit("churn", command(&format!("c{index}"))).await.unwrap();
+        engine.flush().await.unwrap();
+        let delivery = engine.dequeue("churn", 1, None, NOW).await.unwrap().remove(0);
+        engine.ack("churn", delivery.id).await.unwrap();
+        engine.flush().await.unwrap();
+    }
+    // 101 records: looked at, and 61 of them still true — not folded.
+    assert_eq!((engine.stats().journal_records, engine.stats().compactions), (101, 0));
+    for delivery in engine.dequeue("owed", 40, None, NOW).await.unwrap() {
+        engine.ack("owed", delivery.id).await.unwrap();
+    }
+    engine.flush().await.unwrap();
+    // 141 records, 21 of them true; too soon after the last look to look again.
+    assert_eq!((engine.stats().journal_records, engine.stats().compactions), (141, 0));
+    engine.shutdown().await.unwrap();
+    assert_eq!(records_on_disk(&large), 21, "the epoch and the twenty messages still owed");
+}
+
+/// Fails every write after the first `good` ones.
+struct Failing {
+    good: usize,
+}
+
+#[async_trait]
+impl Journal for Failing {
+    async fn append(&mut self, _prev: u64, _through: u64, _records: &[Record]) -> io::Result<()> {
+        if self.good == 0 {
+            return Err(io::Error::other("disk on fire"));
+        }
+        self.good -= 1;
+        Ok(())
+    }
+
+    async fn rewrite(&mut self, _at: u64, _records: &[Record]) -> io::Result<()> {
+        Err(io::Error::other("disk on fire"))
+    }
+}
+
+/// A failed journal write stops the engine for good, and every caller is
+/// told why. Carrying on would build on work a restart would not remember.
+#[tokio::test]
+async fn a_failed_journal_write_stops_the_engine_and_says_why() {
+    let engine = Engine::start(manual(), Failing { good: 1 }, Recovered::default()); // the epoch succeeds
+    engine.submit("q", command("t1")).await.unwrap();
+    assert!(engine.flush().await.is_err(), "the flush whose write failed is not reported as done");
+    let refused = engine.submit("q", command("t2")).await.unwrap_err();
+    assert_eq!(refused.to_string(), "engine closed: journal write failed: disk on fire");
+    assert!(engine.is_closed());
+    assert!(engine.dequeue("q", 1, None, NOW).await.is_err(), "nothing is handed out after a failure");
+}

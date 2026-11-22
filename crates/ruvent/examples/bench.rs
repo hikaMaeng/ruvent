@@ -14,6 +14,9 @@
 //!
 //!   cargo run --release --example bench -- [commands] [concurrency]
 
+// A measurement program reports on the terminal; the library never does.
+#![allow(clippy::print_stdout)]
+
 use ruvent::{App, Audience, Begin, Bytes, Command, Context, Durability, Engine, EngineConfig, Envelope, Failure, From, Identity, Outcome, Proposal, Service};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

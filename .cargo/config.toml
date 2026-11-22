@@ -1,0 +1,3 @@
+[alias]
+# One command for every gate. See docs/testing.md.
+xtask = "run --quiet --package xtask --"

@@ -5,5 +5,8 @@
 //! one structural decision of the library, written so that breaking it fails
 //! a build instead of waiting for someone to notice.
 
+mod api;
 mod architecture;
+mod contracts;
+mod docs;
 mod source;

@@ -449,8 +449,11 @@ async fn a_feature_installs_itself_as_a_module() {
     assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
 }
 
-/// Begin outcomes are the whole vocabulary a hand-written worker needs.
-/// A command run by the engine API alone, as a non-framework user would.
+/// > 이 러스트 라이브러리는 독립된 서버로 동작하는게 아니라 러스트 라이브러리로 활용되길 원한다.
+///
+/// What this observes: the engine is usable on its own, inside any program,
+/// with no framework, no transport and no port — a command submitted, run
+/// and answered through the engine API alone.
 #[tokio::test]
 async fn the_engine_alone_is_usable_without_the_framework() {
     let engine = Engine::volatile(EngineConfig::default());

@@ -299,3 +299,6 @@ impl Subscription {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

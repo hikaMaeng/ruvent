@@ -17,6 +17,8 @@
 //! Transports are plugins, and nothing listens on a port unless you add one.
 
 pub mod app;
+#[cfg(doctest)]
+mod compile_fail;
 pub mod engine;
 pub mod envelope;
 pub mod gateway;

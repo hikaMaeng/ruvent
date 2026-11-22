@@ -41,7 +41,10 @@ impl Model {
         let mut due: Vec<(u64, u64)> = self
             .messages
             .iter()
-            .filter_map(|(id, (state, _))| matches!(state, State::Leased(at) if *at <= now).then(|| if let State::Leased(at) = state { (*at, *id) } else { unreachable!() }))
+            .filter_map(|(id, (state, _))| match state {
+                State::Leased(at) if *at <= now => Some((*at, *id)),
+                _ => None,
+            })
             .collect();
         due.sort();
         for (_, id) in due {

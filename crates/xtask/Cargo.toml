@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+description = "The repository's gates, run as one command: cargo xtask verify."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true

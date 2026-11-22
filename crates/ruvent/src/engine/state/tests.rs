@@ -346,7 +346,23 @@ impl Harness {
             }
             Step::Advance { ms } => self.now += ms as u64,
             Step::Harvest => {
+                // The engine writes only when the state says it is dirty, so
+                // anything a harvest would write must have made it dirty.
+                let dirty = self.state.is_dirty();
                 let records = self.state.harvest();
+                prop_assert!(dirty || records.is_empty(), "{} records were due but the state did not say it was dirty", records.len());
+                // One write states an execution once, in its final state.
+                let mut stated = HashSet::new();
+                for record in &records {
+                    if let Record::Exec { key, .. } = record {
+                        prop_assert!(stated.insert(key.clone()), "execution {} stated twice in one write", key);
+                    }
+                }
+                for record in &records {
+                    if let Record::Event(event) = record {
+                        prop_assert!(event.position > self.state.drop_through, "event at {} was written after retention had dropped it", event.position);
+                    }
+                }
                 self.journal.extend(records);
                 prop_assert!(!self.state.is_dirty(), "a harvest leaves nothing unwritten");
                 self.check_replay("an appended batch")?;
@@ -362,6 +378,11 @@ impl Harness {
             }
             Step::Restart => {
                 let mut next = replay(&self.setup, &self.journal, now);
+                // What replay staged is what the engine publishes as the
+                // readable log after a restart: it must be exactly the log.
+                let staged: Vec<u64> = next.staged.iter().map(|event| event.position).filter(|position| *position > next.drop_through).collect();
+                let kept: Vec<u64> = next.order.iter().map(|event| event.position).collect();
+                prop_assert_eq!(staged, kept, "the log readers see after a restart is not the replayed log");
                 next.open_epoch();
                 prop_assert!(next.epoch > self.state.epoch, "a new incarnation has a higher epoch");
                 // The engine writes the new epoch before it serves anyone, so
@@ -398,6 +419,14 @@ impl Harness {
         for event in &self.state.order {
             prop_assert!(seen.insert(event.event_id), "event {} is in the log twice", event.event_id);
         }
+        let bytes: usize = self.state.order.iter().map(|event| cost(event)).sum();
+        prop_assert_eq!(self.state.bytes, bytes, "the byte count drifted from the events it counts");
+        // The dedup index holds exactly the retained events: no more, or it
+        // grows without bound and refuses facts that are no longer there.
+        prop_assert_eq!(self.state.ids.len(), self.state.order.len(), "the dedup index and the log disagree in size");
+        for event in &self.state.order {
+            prop_assert_eq!(self.state.ids.get(&event.event_id).map(|known| known.position), Some(event.position));
+        }
 
         // One owner per execution.
         let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
@@ -422,6 +451,15 @@ impl Harness {
 
         for execution in self.state.executions.values() {
             prop_assert!(execution.attempts <= self.setup.max_attempts);
+        }
+
+        // Within a queue, a message id names one thing: a live message or
+        // one dead letter. A restart must not hand out an id still in use.
+        for (name, queue) in &self.state.queues {
+            let mut ids: BTreeSet<u64> = queue.messages.keys().copied().collect();
+            for (id, _) in &queue.dead {
+                prop_assert!(ids.insert(*id), "id {} on {} names two things", id, name);
+            }
         }
         Ok(())
     }
@@ -513,4 +551,80 @@ fn an_event_recorded_again_after_retention_dropped_it_is_replayed_once() {
     harness.run(&Step::Harvest).unwrap();
     harness.run(&Step::Restart).expect("the log must not hold one event twice after a restart");
     assert_eq!(harness.state.order.len(), 1);
+}
+
+/// After a restart, a new message never takes the id of a dead letter.
+#[test]
+fn a_restart_never_reuses_a_dead_letters_id() {
+    let mut harness = Harness::new(Setup { max_attempts: 1, ..plain(10) });
+    submit(&mut harness, 0);
+    take_and_begin(&mut harness);
+    harness.run(&Step::Release { pick: 0, delay: 0 }).unwrap();
+    take_and_begin(&mut harness); // out of attempts: dead letter
+    assert_eq!(harness.state.queues[&Text::from("a")].dead.len(), 1);
+    harness.run(&Step::Harvest).unwrap();
+    harness.run(&Step::Restart).unwrap();
+    submit(&mut harness, 1); // the invariants check the new id against the dead one
+    let dead = harness.state.queues[&Text::from("a")].dead[0].0;
+    assert!(harness.state.queues[&Text::from("a")].messages.keys().all(|id| *id > dead));
+}
+
+/// Attempt numbers only grow, across restarts too. A handler may hand its
+/// attempt to the outside world as a fencing token.
+#[test]
+fn attempt_numbers_only_grow_across_restarts() {
+    let mut harness = Harness::new(plain(10));
+    submit(&mut harness, 0);
+    take_and_begin(&mut harness);
+    let before = harness.claims[0].attempt;
+    harness.run(&Step::Harvest).unwrap();
+    harness.run(&Step::Restart).unwrap();
+    take_and_begin(&mut harness);
+    assert!(harness.claims[0].attempt > before, "attempt {} after a restart, {before} before", harness.claims[0].attempt);
+}
+
+/// An execution that expired while it was waiting to be written, followed by
+/// a new one under the same key, is stated once in the next write.
+#[test]
+fn a_key_listed_twice_is_stated_once() {
+    let mut harness = Harness::new(plain(1));
+    submit(&mut harness, 0);
+    take_and_begin(&mut harness);
+    harness.run(&Step::Finish { pick: 0, ok: true }).unwrap(); // k0 listed for the next write
+    submit(&mut harness, 1);
+    take_and_begin(&mut harness);
+    harness.run(&Step::Finish { pick: 0, ok: true }).unwrap(); // k0 expires while listed
+    submit(&mut harness, 0);
+    take_and_begin(&mut harness); // a new k0, listed again
+    harness.run(&Step::Harvest).expect("one write states an execution once");
+}
+
+/// After a restart the expiry list can name a key twice: the old settlement
+/// and a newer one. The old entry expiring must not take the newer
+/// settlement with it.
+#[test]
+fn an_old_expiry_entry_does_not_take_a_newer_settlement_with_it() {
+    let mut harness = Harness::new(Setup { settled: true, settled_window: 10, ..plain(10) });
+    let run = |harness: &mut Harness, key| {
+        submit(harness, key);
+        take_and_begin(harness);
+        let last = (harness.claims.len() - 1) as u16;
+        harness.run(&Step::Finish { pick: last, ok: true }).unwrap();
+    };
+    run(&mut harness, 0); // k0 settles at T
+    harness.run(&Step::Harvest).unwrap();
+    harness.run(&Step::Advance { ms: 20 }).unwrap();
+    run(&mut harness, 1); // k0's window has passed: forgotten
+    run(&mut harness, 0); // k0 runs again and settles at T+20
+    harness.run(&Step::Harvest).unwrap();
+    harness.run(&Step::Restart).unwrap(); // replay lists (T, k0) and (T+20, k0)
+    harness.run(&Step::Advance { ms: 5 }).unwrap();
+    run(&mut harness, 2); // (T, k0) expires; k0 settled at T+20 must stay
+
+    submit(&mut harness, 0);
+    harness.run(&Step::Take { queue: 0, max: 1 }).unwrap();
+    let claims = harness.claims.len();
+    let last = (harness.deliveries.len() - 1) as u16;
+    harness.run(&Step::Begin { pick: last }).unwrap();
+    assert_eq!(harness.claims.len(), claims, "k0 settled 5 ms ago, inside its window: answered, not run again");
 }

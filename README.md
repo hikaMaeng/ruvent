@@ -42,7 +42,7 @@ async fn main() -> std::io::Result<()> {
 | [docs/usage.md](docs/usage.md) | 서비스 작성, 핸들러 규칙, 전송 플러그인 |
 | [docs/constraints.md](docs/constraints.md) | 보장하는 것과 보장하지 않는 것 |
 | [docs/origin.md](docs/origin.md) | 원본(ndx_business `packages/agent`) 분석과 대응표 |
-| [docs/testing.md](docs/testing.md) | 테스트가 증명하는 것, 실측 수치 |
+| [docs/testing.md](docs/testing.md) | 정적·런타임·인수 세 수준의 테스트망, 테스트가 찾은 결함, 실측 수치 |
 
 ## 구성
 
@@ -55,10 +55,14 @@ async fn main() -> std::io::Result<()> {
 | `crates/ruvent/src/gateway/` | 전송 중립 클라이언트 경계: 인증, 정책, 구독 |
 | `crates/ruvent/src/wire/` | 전송 플러그인이 공유하는 JSON 프레임 |
 | `crates/ruvent/src/envelope/` | 고정 엔벨롭 계약 |
+| `crates/ruvent/tests/static/` | 정적 수준: 구조 규칙, 공개 API 고정본, 타입 계약, 문서 일치 |
+| `crates/ruvent/tests/runtime/` | 런타임 수준: 엔진, 저널, 파일 형식, wire, 프레임워크 |
+| `crates/ruvent/tests/acceptance/` | 인수 수준: 요구 원문마다 하나, 프로세스 강제 종료 |
+| `crates/xtask/` | 모든 관문을 한 명령으로: `cargo xtask verify` |
 
 ## 확인
 
 ```sh
-cargo test -p ruvent
-cargo run --release --example bench
+cargo xtask verify                      # 포맷, 린트, 정적·런타임·인수 테스트 전부
+cargo run --release --example bench     # 실측
 ```

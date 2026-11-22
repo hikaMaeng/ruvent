@@ -229,7 +229,7 @@ async fn each_reactor_is_issued_its_own_event_in_the_same_step() {
     // Recording the same fact again stores nothing and issues nothing.
     engine.append(vec![fact]).await.unwrap();
     assert!(engine.dequeue("billing", 10, None, NOW).await.unwrap().is_empty());
-    assert_eq!((engine.stats().events, engine.stats().duplicates), (1, 1));
+    assert_eq!((engine.stats().events, engine.stats().duplicates, engine.stats().enqueued), (1, 1, 2), "one fact, one duplicate, one message per reactor");
 }
 
 #[tokio::test(start_paused = true)]
@@ -279,4 +279,138 @@ async fn the_log_is_bounded_as_it_grows_and_a_reader_left_behind_is_told() {
     assert_eq!(engine.stats().retained_events, 4);
     engine.append(vec![event(10)]).await.unwrap();
     assert_eq!(actions(&read(&engine, "room")), ["e10"]);
+}
+
+/// A stopped engine refuses every call, and the refusal says why.
+#[tokio::test]
+async fn a_stopped_engine_refuses_and_says_why() {
+    let engine = Engine::volatile(EngineConfig::default());
+    assert!(!engine.is_closed());
+    engine.shutdown().await.unwrap();
+    assert!(engine.is_closed());
+    let refused = engine.submit("q", command("t1", "r", "{}")).await.unwrap_err();
+    assert_eq!(refused.to_string(), "engine closed: engine has stopped");
+    assert!(engine.dequeue("q", 1, None, NOW).await.is_err());
+    assert!(engine.flush().await.is_err());
+}
+
+/// Streamed progress never makes a handler wait: when the inbox is full it
+/// is dropped, and every drop — and only a drop — is counted.
+#[tokio::test(start_paused = true)]
+async fn progress_is_dropped_and_counted_only_when_the_inbox_is_full() {
+    // On this single-threaded runtime the engine does not run until the test
+    // yields, so the inbox fills after exactly its capacity.
+    let engine = Engine::volatile(EngineConfig { inbox: 4, ..EngineConfig::default() });
+    let command = Arc::new(Envelope::draft(Kind::Command, "job.run", "r", "{}"));
+    let say = || Emit { action: "delta".into(), payload: Bytes::new(), kind: Kind::Progress, key: None, audience: Audience::Client };
+    let sent: Vec<bool> = (0..10).map(|_| engine.emit_nowait(command.clone(), 1, say())).collect();
+    assert_eq!(sent, [true, true, true, true, false, false, false, false, false, false]);
+    assert_eq!(engine.stats().progress_dropped, 6);
+}
+
+/// A command submitted without a time is stamped by the engine; one with a
+/// time keeps it.
+#[tokio::test(start_paused = true)]
+async fn a_command_without_a_time_is_stamped_on_submission() {
+    // Read before the engine reads it: the engine's clock starts there.
+    let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let engine = Engine::volatile(EngineConfig::default());
+    engine.submit("q", command("t1", "r", "{}")).await.unwrap();
+    let mut dated = command("t2", "r", "{}");
+    dated.created_at = 42;
+    engine.submit("q", dated).await.unwrap();
+    let delivered = engine.dequeue("q", 2, None, NOW).await.unwrap();
+    assert!(delivered[0].command.created_at >= wall && delivered[0].command.created_at < wall + 60_000, "stamped with the engine's clock: {}", delivered[0].command.created_at);
+    assert_eq!(delivered[1].command.created_at, 42);
+}
+
+/// A reader whose cursor is exactly the last event retention dropped has
+/// read that event, so it has missed nothing; one before it has.
+#[tokio::test(start_paused = true)]
+async fn a_reader_at_the_last_dropped_event_has_missed_nothing() {
+    let engine = Engine::volatile(EngineConfig { retention: Retention { max_events: 2, ..Retention::default() }, ..EngineConfig::default() });
+    let event = |index: usize| Envelope::draft(Kind::Fact, format!("e{index}"), "room", "{}");
+    let stored = engine.append((0..4).map(event).collect()).await.unwrap();
+    // e0 and e1 were dropped; e2 and e3 remain.
+    let at_last_dropped = engine.subscribe(vec!["room".to_owned()], From::Position(stored[1].position));
+    assert!(!at_last_dropped.lagged(), "it read e1, and e2 onward is all there");
+    let before_it = engine.subscribe(vec!["room".to_owned()], From::Position(stored[0].position));
+    assert!(before_it.lagged(), "it never saw e1");
+}
+
+/// A reader waiting on a channel whose every event retention has dropped is
+/// still woken by the next event on it.
+#[tokio::test(start_paused = true)]
+async fn a_reader_is_woken_on_a_channel_retention_emptied() {
+    let engine = Engine::volatile(EngineConfig { retention: Retention { max_events: 1, ..Retention::default() }, ..EngineConfig::default() });
+    engine.append(vec![Envelope::draft(Kind::Fact, "first", "a", "{}")]).await.unwrap();
+    let mut reader = engine.subscribe(vec!["a".to_owned()], From::Now);
+    let waiting = tokio::spawn(async move { reader.next(10).await });
+    tokio::task::yield_now().await;
+
+    // An event elsewhere pushes channel `a`'s only event out.
+    engine.append(vec![Envelope::draft(Kind::Fact, "elsewhere", "b", "{}")]).await.unwrap();
+    engine.append(vec![Envelope::draft(Kind::Fact, "second", "a", "{}")]).await.unwrap();
+    let woken = tokio::time::timeout(Duration::from_secs(60), waiting).await.expect("the reader was never woken").unwrap();
+    assert_eq!(actions(&woken), ["second"]);
+}
+
+/// Opening a subscription never unhooks one already waiting on the same
+/// channel: every reader is woken by an event, however many there are.
+#[tokio::test(start_paused = true)]
+async fn a_new_reader_does_not_unhook_one_already_waiting() {
+    let engine = Engine::volatile(EngineConfig::default());
+    let mut first = engine.subscribe(vec!["a".to_owned()], From::Now);
+    let waiting = tokio::spawn(async move { first.next(10).await });
+    tokio::task::yield_now().await;
+
+    let mut second = engine.subscribe(vec!["a".to_owned()], From::Now);
+    engine.append(vec![Envelope::draft(Kind::Fact, "news", "a", "{}")]).await.unwrap();
+    let woken = tokio::time::timeout(Duration::from_secs(60), waiting).await.expect("the first reader was unhooked").unwrap();
+    assert_eq!(actions(&woken), ["news"]);
+    assert_eq!(actions(&second.next(10).await), ["news"]);
+}
+
+/// The log is bounded by bytes as well as by count: an event costs its
+/// payload plus a fixed 256 bytes, and the oldest go first once the total
+/// would pass the bound.
+#[tokio::test(start_paused = true)]
+async fn the_log_is_bounded_by_bytes() {
+    const EACH: u64 = 256 + 1_000;
+    let retention = Retention { max_bytes: 3 * EACH as usize, ..Retention::default() };
+    let engine = Engine::volatile(EngineConfig { retention, ..EngineConfig::default() });
+    let event = |index: usize| Envelope::draft(Kind::Fact, format!("e{index}"), "room", vec![b'x'; 1_000]);
+    engine.append((0..5).map(event).collect()).await.unwrap();
+    let stats = engine.stats();
+    assert_eq!((stats.retained_events, stats.retained_bytes), (3, 3 * EACH));
+    assert_eq!(actions(&read(&engine, "room")), ["e2", "e3", "e4"]);
+}
+
+/// A settled execution is remembered for its window, so the same transaction
+/// sent again is answered instead of run; after the window — once the next
+/// execution settles — it is forgotten and would run again.
+#[tokio::test(start_paused = true)]
+async fn a_settled_execution_is_remembered_only_for_its_window() {
+    let retention = Retention { settled: Duration::from_secs(1), ..Retention::default() };
+    let engine = Engine::volatile(EngineConfig { retention, ..EngineConfig::default() });
+    let run = |key: &'static str| {
+        let engine = engine.clone();
+        async move {
+            engine.submit("q", command(key, "r", "{}")).await.unwrap();
+            let delivery = engine.dequeue("q", 1, None, NOW).await.unwrap().remove(0);
+            match engine.begin("q", delivery.id).await.unwrap() {
+                Begin::Claimed { command, attempt, .. } => {
+                    assert!(engine.finish(command, attempt, Outcome::Ok(Bytes::new()), "q", delivery.id).await.unwrap());
+                    "ran"
+                }
+                Begin::Settled => "answered",
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    assert_eq!(run("k0").await, "ran");
+    assert_eq!(run("k0").await, "answered", "inside the window");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(run("k1").await, "ran"); // a settle, which is when expiry is applied
+    assert_eq!(run("k0").await, "ran", "the window has passed");
 }

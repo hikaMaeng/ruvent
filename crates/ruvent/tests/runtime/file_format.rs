@@ -25,6 +25,11 @@ fn a_file_that_is_not_a_journal_is_refused_and_left_alone() {
     let refused = FileJournal::open(&path).err().expect("a foreign file must be refused");
     assert_eq!(refused.kind(), io::ErrorKind::InvalidData);
     assert_eq!(std::fs::read(&path).unwrap(), contents, "the file must be untouched");
+
+    // Shorter than the header, and not the start of one: still foreign.
+    std::fs::write(&path, b"hello").unwrap();
+    assert_eq!(FileJournal::open(&path).err().expect("a short foreign file must be refused").kind(), io::ErrorKind::InvalidData);
+    assert_eq!(std::fs::read(&path).unwrap(), b"hello");
 }
 
 /// A crash while the journal was being created can leave part of the header.
@@ -148,4 +153,46 @@ async fn damage_anywhere_yields_a_prefix_of_what_was_written() {
             check(&damaged, &format!("bit {bit} of byte {byte} flipped"));
         }
     }
+}
+
+/// A frame built to pass its CRC while claiming a body shorter than the
+/// frame header is refused like any damage — cut off, never read past.
+#[test]
+fn a_crafted_frame_too_short_for_its_header_is_cut_off_not_read() {
+    let path = scratch("crafted");
+    let (journal, _) = FileJournal::open(&path).unwrap();
+    drop(journal);
+    let header = std::fs::read(&path).unwrap();
+    let body = [1u8, 0, 0, 0, 0];
+    let mut crafted = header.clone();
+    crafted.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    crafted.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+    crafted.extend_from_slice(&body);
+    std::fs::write(&path, &crafted).unwrap();
+
+    let (journal, recovered) = FileJournal::open(&path).expect("refused as damage, not as a panic");
+    drop(journal);
+    assert_eq!((recovered.records.len(), recovered.through), (0, 0));
+    assert_eq!(std::fs::read(&path).unwrap(), header, "cut back to the header");
+}
+
+/// What is written after a torn tail was found survives the next restart:
+/// the tail is cut off on open, so new frames follow the last intact one
+/// instead of landing behind garbage that would hide them.
+#[tokio::test]
+async fn writes_after_a_torn_tail_survive_the_next_restart() {
+    let path = scratch("after-torn");
+    write_fixture(&path).await;
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::io::Write::write_all(&mut file, &[200, 0, 0, 0, 1, 2, 3, 4, 1, 9, 9]).unwrap();
+    drop(file);
+
+    let (mut journal, recovered) = FileJournal::open(&path).unwrap();
+    let through = recovered.through;
+    journal.append(through, through + 1, &[Record::Epoch(9)]).await.unwrap();
+    drop(journal);
+
+    let (_journal, recovered) = FileJournal::open(&path).unwrap();
+    assert_eq!(recovered.through, through + 1, "the batch written after the torn tail was lost");
+    assert!(matches!(recovered.records.last(), Some(Record::Epoch(9))));
 }

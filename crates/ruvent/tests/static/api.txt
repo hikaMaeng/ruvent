@@ -1,0 +1,203 @@
+app/mod.rs: impl App :: async fn run (self) -> io :: Result < () >
+app/mod.rs: impl App :: async fn start (self) -> io :: Result < Started >
+app/mod.rs: impl App :: fn authenticator (mut self , authenticator : impl Authenticator) -> Self
+app/mod.rs: impl App :: fn durability (mut self , durability : Durability) -> Self
+app/mod.rs: impl App :: fn engine (mut self , config : EngineConfig) -> Self
+app/mod.rs: impl App :: fn mount (self , module : impl Module) -> Self
+app/mod.rs: impl App :: fn open (path : impl Into < PathBuf >) -> Self
+app/mod.rs: impl App :: fn persist_events (mut self , events : Events) -> Self
+app/mod.rs: impl App :: fn policy (mut self , policy : impl Policy) -> Self
+app/mod.rs: impl App :: fn service (mut self , service : Service) -> Self
+app/mod.rs: impl App :: fn transport (mut self , transport : impl Transport) -> Self
+app/mod.rs: impl App :: fn volatile () -> Self
+app/mod.rs: impl Started :: async fn shutdown (self) -> io :: Result < () >
+app/mod.rs: impl Started :: fn engine (& self) -> & Engine
+app/mod.rs: impl Started :: fn gateway (& self) -> & Gateway
+app/mod.rs: impl< F : FnOnce (App) -> App > Module for F
+app/mod.rs: struct App {  }
+app/mod.rs: struct Started {  }
+app/mod.rs: trait Module : 
+app/mod.rs: trait Module :: fn install (self , app : App) -> App
+app/mod.rs: use service :: Service
+app/service.rs: impl Service :: fn accept (mut self , action : impl Into < String > , handler : impl Handler) -> Self
+app/service.rs: impl Service :: fn config (mut self , config : WorkerConfig) -> Self
+app/service.rs: impl Service :: fn max_in_flight (mut self , max : usize) -> Self
+app/service.rs: impl Service :: fn new (name : impl Into < String >) -> Self
+app/service.rs: impl Service :: fn on (mut self , action : impl Into < String > , handler : impl Handler) -> Self
+app/service.rs: impl Service :: fn timeout (mut self , timeout : Duration) -> Self
+app/service.rs: impl Service :: fn transient (mut self) -> Self
+app/service.rs: struct Service {  }
+engine/config.rs: enum Durability { Scheduled { window: Duration }, Strict }
+engine/config.rs: enum Events { None, All, Channels(Vec < String >), Except(Vec < String >), Custom(Arc < dyn Fn (& Envelope) -> bool + Send + Sync >) }
+engine/config.rs: impl Default for Compaction
+engine/config.rs: impl Default for Durability
+engine/config.rs: impl Default for EngineConfig
+engine/config.rs: impl Default for Retention
+engine/config.rs: struct Compaction { min_records: u64, ratio: u64 }
+engine/config.rs: struct EngineConfig { reactions: ReactionTable, max_attempts: u32, batch_max: usize, inbox: usize, durability: Durability, persist: Persist, retention: Retention, compaction: Compaction }
+engine/config.rs: struct Persist { events: Events, settled: bool, transient_queues: HashSet < Text > }
+engine/config.rs: struct Retention { max_events: usize, max_bytes: usize, max_age: Duration, settled: Duration, max_settled: usize, dead_letters: usize }
+engine/config.rs: type ReactionTable = HashMap < String , Vec < String > >
+engine/log.rs: enum From { Start, Now, Position(u64) }
+engine/log.rs: impl Subscription :: async fn next (& mut self , max : usize) -> Vec < Arc < Envelope > >
+engine/log.rs: impl Subscription :: fn cursor (& self) -> u64
+engine/log.rs: impl Subscription :: fn lagged (& self) -> bool
+engine/log.rs: impl Subscription :: fn poll (& mut self , max : usize) -> Vec < Arc < Envelope > >
+engine/log.rs: struct Stats { events: u64, duplicates: u64, enqueued: u64, delivered: u64, journal_records: u64, journal_writes: u64, compactions: u64, journal_lag: u64, retained_events: u64, retained_bytes: u64, progress_dropped: u64, wakeups: u64 }
+engine/log.rs: struct Subscription {  }
+engine/mod.rs: enum Begin { Claimed { command: Arc < Envelope >, attempt: u64, attempts: u32 }, Duplicate, Settled, Conflict, Exhausted, Gone }
+engine/mod.rs: enum Outcome { Ok(Bytes), Failed(Bytes) }
+engine/mod.rs: impl Engine :: async fn ack (& self , queue : impl Into < Text > , id : u64) -> Result < bool , Closed >
+engine/mod.rs: impl Engine :: async fn append (& self , drafts : Vec < Envelope >) -> Result < Vec < Arc < Envelope > > , Closed >
+engine/mod.rs: impl Engine :: async fn begin (& self , queue : impl Into < Text > , id : u64) -> Result < Begin , Closed >
+engine/mod.rs: impl Engine :: async fn compact (& self) -> Result < io :: Result < () > , Closed >
+engine/mod.rs: impl Engine :: async fn dead_letters (& self , queue : impl Into < Text >) -> Result < Vec < Arc < Command > > , Closed >
+engine/mod.rs: impl Engine :: async fn dequeue (& self , queue : impl Into < Text > , max : usize , visibility : Option < Duration > , wait : Option < Duration >) -> Result < Vec < Delivery > , Closed >
+engine/mod.rs: impl Engine :: async fn emit (& self , command : Arc < Envelope > , attempt : u64 , emit : Emit) -> Result < bool , Closed >
+engine/mod.rs: impl Engine :: async fn finish (& self , command : Arc < Envelope > , attempt : u64 , outcome : Outcome , queue : impl Into < Text > , id : u64) -> Result < bool , Closed >
+engine/mod.rs: impl Engine :: async fn flush (& self) -> Result < () , Closed >
+engine/mod.rs: impl Engine :: async fn nack (& self , queue : impl Into < Text > , id : u64 , delay : Duration) -> Result < bool , Closed >
+engine/mod.rs: impl Engine :: async fn open (path : impl Into < PathBuf > , config : EngineConfig) -> io :: Result < Self >
+engine/mod.rs: impl Engine :: async fn owns (& self , key : impl Into < Text > , attempt : u64) -> Result < bool , Closed >
+engine/mod.rs: impl Engine :: async fn release (& self , key : impl Into < Text > , attempt : u64 , queue : impl Into < Text > , id : u64 , retry : Duration) -> Result < bool , Closed >
+engine/mod.rs: impl Engine :: async fn shutdown (& self) -> Result < () , Closed >
+engine/mod.rs: impl Engine :: async fn submit (& self , queue : impl Into < Text > , command : Command) -> Result < u64 , Closed >
+engine/mod.rs: impl Engine :: fn emit_nowait (& self , command : Arc < Envelope > , attempt : u64 , emit : Emit) -> bool
+engine/mod.rs: impl Engine :: fn is_closed (& self) -> bool
+engine/mod.rs: impl Engine :: fn read_stream (& self , stream : & str , after : u64 , limit : usize) -> Vec < Arc < Envelope > >
+engine/mod.rs: impl Engine :: fn start < J : Journal > (config : EngineConfig , journal : J , recovered : Recovered) -> Self
+engine/mod.rs: impl Engine :: fn stats (& self) -> Stats
+engine/mod.rs: impl Engine :: fn subscribe (& self , channels : Vec < String > , from : From) -> Subscription
+engine/mod.rs: impl Engine :: fn volatile (config : EngineConfig) -> Self
+engine/mod.rs: impl fmt :: Display for Closed
+engine/mod.rs: impl std :: error :: Error for Closed
+engine/mod.rs: struct Closed(String)
+engine/mod.rs: struct Engine {  }
+engine/mod.rs: use config :: { Compaction , Durability , EngineConfig , Events , Persist , ReactionTable , Retention }
+engine/mod.rs: use log :: { From , Stats , Subscription }
+engine/mod.rs: use queue :: Delivery
+engine/queue.rs: struct Delivery { id: u64, command: Arc < Command >, read_count: u32 }
+envelope/mod.rs: enum Audience { Client, Worker }
+envelope/mod.rs: enum Kind { Command, Fact, Result, Progress, Failure, Control }
+envelope/mod.rs: enum Source { Client, Server, Worker, Scheduler }
+envelope/mod.rs: fn json < T : Serialize > (value : & T) -> Bytes
+envelope/mod.rs: fn stream_of (session_id : Option < & str > , channel : & str) -> Text
+envelope/mod.rs: impl Command :: fn new (action : impl Into < Text > , channel : impl Into < Text > , payload : impl Into < Bytes >) -> Self
+envelope/mod.rs: impl Command :: fn reply_to (mut self , channel : impl Into < Text >) -> Self
+envelope/mod.rs: impl Command :: fn session (mut self , session_id : impl Into < Text >) -> Self
+envelope/mod.rs: impl Command :: fn transaction_key (mut self , key : impl Into < Text >) -> Self
+envelope/mod.rs: impl Envelope :: fn draft (kind : Kind , action : impl Into < Text > , channel : impl Into < Text > , payload : impl Into < Bytes >) -> Self
+envelope/mod.rs: impl Envelope :: fn follow (cause : & Envelope , event_id : EventId , kind : Kind , action : Text , payload : Bytes , now : u64) -> Self
+envelope/mod.rs: impl Envelope :: fn from_command (command : & Command) -> Self
+envelope/mod.rs: impl Envelope :: fn json < T : serde :: de :: DeserializeOwned > (& self) -> Result < T , serde_json :: Error >
+envelope/mod.rs: impl EventId :: fn as_bytes (& self) -> & [u8 ; 16]
+envelope/mod.rs: impl EventId :: fn derive (parts : & [& [u8]]) -> Self
+envelope/mod.rs: impl EventId :: fn parse (text : & str) -> Option < Self >
+envelope/mod.rs: impl EventId :: fn random () -> Self
+envelope/mod.rs: impl EventId :: fn reaction (queue : & str , fact : EventId) -> Self
+envelope/mod.rs: impl Kind :: fn as_str (self) -> & 'static str
+envelope/mod.rs: impl Source :: fn as_str (self) -> & 'static str
+envelope/mod.rs: impl fmt :: Debug for EventId
+envelope/mod.rs: impl fmt :: Display for EventId
+envelope/mod.rs: struct Command { event_id: EventId, created_at: u64, action: Text, transaction_key: Text, channel: Text, audience: Audience, reply_channel: Option < Text >, session_id: Option < Text >, run_id: Option < Text >, turn_id: Option < Text >, correlation_id: Option < Text >, principal: Option < Text >, payload: Bytes }
+envelope/mod.rs: struct Emit { action: Text, payload: Bytes, kind: Kind, key: Option < Text >, audience: Audience }
+envelope/mod.rs: struct Envelope { event_id: EventId, kind: Kind, stream: Text, position: u64, action: Text, transaction_key: Text, channel: Text, reply_channel: Option < Text >, session_id: Option < Text >, run_id: Option < Text >, turn_id: Option < Text >, causation: Option < EventId >, correlation_id: Text, principal: Option < Text >, source: Source, audience: Audience, created_at: u64, payload: Bytes }
+envelope/mod.rs: struct EventId(_)
+envelope/mod.rs: type Text = Arc < str >
+gateway/mod.rs: enum ClientFrame { Subscribe { channels: Vec < String >, from: From }, Event(Proposal) }
+gateway/mod.rs: enum Rejected { NotAdmitted, InvalidSubscription, Forbidden, Unavailable }
+gateway/mod.rs: enum ServerFrame { Ready, Subscribed { channels: Vec < String >, cursor: u64 }, Event(Arc < Envelope >), Accepted { event_id: EventId, transaction_key: Text }, Rejected { reason: Rejected } }
+gateway/mod.rs: impl Default for Proposal
+gateway/mod.rs: impl Gateway :: async fn authenticate (& self , credentials : & Credentials) -> Option < Identity >
+gateway/mod.rs: impl Gateway :: async fn launch (& self , transports : Vec < Box < dyn Transport > > , shutdown : CancellationToken) -> io :: Result < () >
+gateway/mod.rs: impl Gateway :: async fn poll (& self , identity : & Identity , channels : Vec < String > , from : From , max : usize , wait : Duration) -> Result < (Vec < Arc < Envelope > > , u64) , Rejected >
+gateway/mod.rs: impl Gateway :: async fn serve < C : Connection > (& self , mut connection : C , identity : Identity)
+gateway/mod.rs: impl Gateway :: async fn submit (& self , identity : & Identity , proposal : Proposal) -> Result < (EventId , Text) , Rejected >
+gateway/mod.rs: impl Gateway :: fn engine (& self) -> & Engine
+gateway/mod.rs: impl Gateway :: fn new (engine : Engine , authenticator : Arc < dyn Authenticator > , policy : Arc < dyn Policy > , routes : HashMap < String , String >) -> Self
+gateway/mod.rs: impl Rejected :: fn as_str (self) -> & 'static str
+gateway/mod.rs: impl< F > where F : Fn (& Credentials) -> Option < Identity > + Send + Sync + 'static , Authenticator for F
+gateway/mod.rs: struct Credentials { token: Option < String >, peer: Option < SocketAddr > }
+gateway/mod.rs: struct Gateway {  }
+gateway/mod.rs: struct Identity { user: String }
+gateway/mod.rs: struct Proposal { action: Text, payload: Bytes, transaction_key: Option < Text >, channel: Option < Text >, reply_channel: Option < Text >, session_id: Option < Text >, run_id: Option < Text >, turn_id: Option < Text > }
+gateway/mod.rs: trait Authenticator : Send + Sync + 'static
+gateway/mod.rs: trait Authenticator :: async fn authenticate (& self , credentials : & Credentials) -> Option < Identity >
+gateway/mod.rs: trait Connection : Send
+gateway/mod.rs: trait Connection :: async fn recv (& mut self) -> Option < ClientFrame >
+gateway/mod.rs: trait Connection :: async fn send (& mut self , frame : ServerFrame) -> io :: Result < () >
+gateway/mod.rs: trait Policy : Send + Sync + 'static
+gateway/mod.rs: trait Policy :: fn admit (& self , _identity : & Identity , command : Command) -> Option < Command >
+gateway/mod.rs: trait Policy :: fn may_read (& self , _identity : & Identity , _channel : & str) -> bool
+gateway/mod.rs: trait Transport : Send + 'static
+gateway/mod.rs: trait Transport :: async fn run (self : Box < Self > , gateway : Gateway , shutdown : CancellationToken) -> io :: Result < () >
+gateway/mod.rs: use policy :: { Anonymous , Open , OwnedSessions }
+gateway/policy.rs: impl Authenticator for Anonymous
+gateway/policy.rs: impl OwnedSessions :: fn new (reply_channel_for : impl Fn (& str) -> String + Send + Sync + 'static) -> Self
+gateway/policy.rs: impl Policy for Open
+gateway/policy.rs: impl Policy for OwnedSessions
+gateway/policy.rs: struct Anonymous
+gateway/policy.rs: struct Open
+gateway/policy.rs: struct OwnedSessions {  }
+journal/file.rs: impl FileJournal :: fn open (path : impl Into < PathBuf >) -> io :: Result < (Self , Recovered) >
+journal/file.rs: impl Journal for FileJournal
+journal/file.rs: struct FileJournal {  }
+journal/mod.rs: enum Record { Epoch(u64), Put { queue: Text, id: u64, command: Arc < Command > }, Del { queue: Text, id: u64 }, Dead { queue: Text, id: u64, command: Arc < Command > }, Exec { key: Text, request: EventId, fingerprint: u128, attempt: u64, attempts: u32, done: Option < (bool , Bytes , u64) > }, Forget { key: Text }, Event(Arc < Envelope >) }
+journal/mod.rs: impl Journal for Volatile
+journal/mod.rs: struct Recovered { records: Vec < Record >, through: u64 }
+journal/mod.rs: struct Volatile
+journal/mod.rs: trait Journal : Send + 'static
+journal/mod.rs: trait Journal :: async fn append (& mut self , prev : u64 , through : u64 , records : & [Record]) -> io :: Result < () >
+journal/mod.rs: trait Journal :: async fn rewrite (& mut self , at : u64 , records : & [Record]) -> io :: Result < () >
+journal/mod.rs: use file :: FileJournal
+lib.rs: pub mod app
+lib.rs: pub mod engine
+lib.rs: pub mod envelope
+lib.rs: pub mod gateway
+lib.rs: pub mod journal
+lib.rs: pub mod wire
+lib.rs: pub mod worker
+lib.rs: use app :: { App , Module , Service , Started }
+lib.rs: use async_trait :: async_trait
+lib.rs: use bytes :: Bytes
+lib.rs: use engine :: { Begin , Closed , Compaction , Delivery , Durability , Engine , EngineConfig , Events , From , Outcome , Persist , ReactionTable , Retention , Stats , Subscription }
+lib.rs: use envelope :: json
+lib.rs: use envelope :: { stream_of , Audience , Command , Emit , Envelope , EventId , Kind , Source , Text }
+lib.rs: use gateway :: { Anonymous , Authenticator , ClientFrame , Connection , Credentials , Gateway , Identity , Open , OwnedSessions , Policy , Proposal , Rejected , ServerFrame , Transport }
+lib.rs: use journal :: { FileJournal , Journal , Record , Recovered , Volatile }
+lib.rs: use tokio_util :: sync :: CancellationToken
+lib.rs: use worker :: { Backoff , Context , Failure , Handler , Lost , Running , Worker , WorkerConfig }
+wire/json.rs: fn decode_client (text : & str) -> Option < ClientFrame >
+wire/json.rs: fn encode_event (event : & Envelope) -> String
+wire/json.rs: fn encode_server (frame : & ServerFrame) -> String
+wire/json.rs: fn parse_from (cursor : Option < & str > , from : Option < & str >) -> Option < From >
+wire/mod.rs: pub mod json
+worker/context.rs: impl Context :: async fn fact (& self , key : impl Into < Text > , action : impl Into < Text > , payload : impl Into < Bytes > , audience : Audience) -> Result < () , Lost >
+worker/context.rs: impl Context :: async fn fence (& self) -> bool
+worker/context.rs: impl Context :: fn attempt (& self) -> u64
+worker/context.rs: impl Context :: fn cancellation (& self) -> CancellationToken
+worker/context.rs: impl Context :: fn cancelled (& self) -> tokio_util :: sync :: WaitForCancellationFuture < '_ >
+worker/context.rs: impl Context :: fn engine (& self) -> & Engine
+worker/context.rs: impl Context :: fn progress (& self , action : impl Into < Text > , payload : impl Into < Bytes >)
+worker/context.rs: impl fmt :: Display for Lost
+worker/context.rs: impl std :: error :: Error for Lost
+worker/context.rs: struct Context {  }
+worker/context.rs: struct Lost
+worker/mod.rs: enum Failure { Fatal(String), Retry { after: Duration } }
+worker/mod.rs: impl Backoff :: fn after (& self , attempts : u32) -> Duration
+worker/mod.rs: impl Default for WorkerConfig
+worker/mod.rs: impl Failure :: fn fatal (error : impl std :: fmt :: Display) -> Self
+worker/mod.rs: impl Failure :: fn retry (after : Duration) -> Self
+worker/mod.rs: impl From < Lost > for Failure
+worker/mod.rs: impl Running :: async fn shutdown (self)
+worker/mod.rs: impl Worker :: fn new (engine : Engine , config : WorkerConfig) -> Self
+worker/mod.rs: impl Worker :: fn route (mut self , queue : impl Into < Text > , handler : impl Handler) -> Self
+worker/mod.rs: impl Worker :: fn start (self) -> Running
+worker/mod.rs: impl< F , Fut > where F : Fn (Context , Arc < Envelope >) -> Fut + Send + Sync + 'static , Fut : Future < Output = Result < Bytes , Failure > > + Send + 'static , Handler for F
+worker/mod.rs: struct Backoff { first: Duration, max: Duration }
+worker/mod.rs: struct Running {  }
+worker/mod.rs: struct Worker {  }
+worker/mod.rs: struct WorkerConfig { max_in_flight: usize, batch: usize, timeout: Duration, backoff: Backoff }
+worker/mod.rs: trait Handler : Send + Sync + 'static
+worker/mod.rs: trait Handler :: async fn handle (& self , cx : Context , command : Arc < Envelope >) -> Result < Bytes , Failure >
+worker/mod.rs: use context :: { Context , Lost }

@@ -18,6 +18,8 @@ const LAYERS: &[(&str, &[&str])] = &[
     ("gateway", &["engine", "envelope"]),
     ("wire", &["engine", "envelope", "gateway"]),
     ("app", &["engine", "envelope", "gateway", "worker"]),
+    // Doctests that must not compile, each with a twin that must.
+    ("compile_fail", &[]),
 ];
 
 fn crate_paths(code: &str) -> BTreeSet<String> {

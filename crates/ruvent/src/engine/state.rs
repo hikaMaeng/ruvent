@@ -260,6 +260,13 @@ impl State {
         }
         for key in std::mem::take(&mut self.touched) {
             let Some(execution) = self.executions.get_mut(&key) else { continue };
+            // A key can be listed twice: its execution expired while listed,
+            // and a new one under the same key was listed again. `dirty`
+            // belongs to the execution, so the second listing finds it clean
+            // and states nothing twice.
+            if !execution.dirty {
+                continue;
+            }
             let wanted = Self::wanted(&self.persist, execution);
             if wanted {
                 records.push(Self::exec_record(&key, execution));
