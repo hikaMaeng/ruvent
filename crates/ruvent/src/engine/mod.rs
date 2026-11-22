@@ -200,6 +200,7 @@ impl Engine {
             batch_max: config.batch_max.max(1),
             written: recovered.through,
             in_journal: recovered.records.len() as u64,
+            compaction_checked: 0,
             flight: None,
             launched: 0,
             landed: 0,
@@ -398,6 +399,8 @@ struct Core {
     written: u64,
     /// Records the journal file currently holds, superseded ones included.
     in_journal: u64,
+    /// `in_journal` when the compaction test last ran.
+    compaction_checked: u64,
     /// The one write that may be in progress. `None` is the only state in
     /// which another may be issued.
     flight: Option<Flight>,
@@ -499,7 +502,7 @@ impl Core {
         // let the writer go so the journal and its lock are released before
         // anyone is told the engine has stopped.
         self.inbox.close();
-        if !self.settle().await {
+        if !self.settle().await || !self.fold_before_leaving().await {
             return;
         }
         let Core { jobs, writer, stopping, .. } = self;
@@ -589,6 +592,7 @@ impl Core {
         let counters = &self.shared.counters;
         if flight.snapshot {
             self.in_journal = flight.records;
+            self.compaction_checked = flight.records;
             counters.compactions.fetch_add(1, Ordering::Relaxed);
             for reply in self.compactions.drain(..) {
                 let _ = reply.send(Ok(()));
@@ -597,8 +601,13 @@ impl Core {
             self.in_journal += flight.records;
             counters.writes.fetch_add(1, Ordering::Relaxed);
             // Mostly superseded statements by now? Then fold it.
-            if self.in_journal > self.compaction.min_records && self.in_journal > self.compaction.ratio.saturating_mul(self.state.live_records()) {
-                self.compact_wanted = true;
+            // Counting what a snapshot would hold is a scan, so it is done
+            // once per half threshold of new records, not once per write.
+            if self.in_journal > self.compaction.min_records && self.in_journal >= self.compaction_checked + self.compaction.min_records / 2 {
+                self.compaction_checked = self.in_journal;
+                if self.in_journal > self.compaction.ratio.saturating_mul(self.state.live_records()) {
+                    self.compact_wanted = true;
+                }
             }
         }
         self.answer_flushes();
@@ -653,6 +662,21 @@ impl Core {
                 return true;
             }
         }
+    }
+
+    /// On the way out, folds a journal that is over its threshold, so the
+    /// next start replays a snapshot instead of everything since the last
+    /// fold. Called with the journal already agreeing with memory.
+    async fn fold_before_leaving(&mut self) -> bool {
+        let over = self.in_journal > self.compaction.min_records && self.in_journal > self.compaction.ratio.saturating_mul(self.state.live_records());
+        if !(over || self.compact_wanted) {
+            return true;
+        }
+        if !self.compact() {
+            return false;
+        }
+        let landed = landing(&mut self.flight).await;
+        self.land(landed)
     }
 
     /// Stops for good. Memory has moved past what the journal holds, so

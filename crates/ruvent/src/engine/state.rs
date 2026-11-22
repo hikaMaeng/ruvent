@@ -303,11 +303,18 @@ impl State {
         records
     }
 
-    /// Roughly how many records a snapshot would hold. Compared against the
-    /// journal's length to decide when it is mostly superseded statements.
+    /// How many records a snapshot would hold right now: exactly what
+    /// [`State::snapshot`] would write, and nothing it would not. Settled
+    /// executions and events the policy does not keep live only in memory;
+    /// counting them would make a journal full of superseded statements look
+    /// healthy and stop it from ever being folded.
+    ///
+    /// A full scan. The engine asks only now and then; see `Core::land`.
     pub fn live_records(&self) -> u64 {
-        let messages: usize = self.queues.values().map(|queue| queue.messages.len() + queue.dead.len()).sum();
-        (1 + messages + self.executions.len() + self.order.len()) as u64
+        let messages: usize = self.queues.iter().filter(|(name, _)| !self.persist.transient_queues.contains(*name)).map(|(_, queue)| queue.messages.len() + queue.dead.len()).sum();
+        let executions = self.executions.values().filter(|execution| Self::wanted(&self.persist, execution)).count();
+        let events = self.order.iter().filter(|event| self.persist.events.wants(event)).count();
+        (1 + messages + executions + events) as u64
     }
 
     pub fn retained(&self) -> (u64, u64) {

@@ -26,6 +26,10 @@ pub mod wire;
 pub mod worker;
 
 pub use app::{App, Module, Service, Started};
+/// Implementing [`Transport`], [`Connection`], [`Journal`], [`Authenticator`] or
+/// [`Handler`] by hand needs this attribute; it is re-exported so a plugin
+/// does not have to pick a matching version of the crate itself.
+pub use async_trait::async_trait;
 pub use bytes::Bytes;
 pub use engine::{Begin, Closed, Compaction, Delivery, Durability, Engine, EngineConfig, Events, From, Outcome, Persist, ReactionTable, Retention, Stats, Subscription};
 #[cfg(feature = "json")]

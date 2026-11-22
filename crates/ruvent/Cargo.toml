@@ -41,3 +41,8 @@ path = "tests/static/main.rs"
 [[test]]
 name = "runtime"
 path = "tests/runtime/main.rs"
+
+[[test]]
+name = "acceptance"
+path = "tests/acceptance/main.rs"
+required-features = ["json"]

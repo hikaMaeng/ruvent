@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 fn value() -> impl Strategy<Value = Value> {
     let leaf = prop_oneof![Just(Value::Null), any::<bool>().prop_map(Value::from), any::<i64>().prop_map(Value::from), any::<u64>().prop_map(Value::from), ".{0,12}".prop_map(Value::from)];
-    leaf.prop_recursive(3, 24, 4, |inner| prop_oneof![prop::collection::vec(inner.clone(), 0..4).prop_map(Value::from), prop::collection::btree_map(".{0,6}", inner, 0..4).prop_map(|map| Value::Object(map.into_iter().collect()))])
+    leaf.prop_recursive(3, 24, 4, |inner| {
+        prop_oneof![prop::collection::vec(inner.clone(), 0..4).prop_map(Value::from), prop::collection::btree_map(".{0,6}", inner, 0..4).prop_map(|map| Value::Object(map.into_iter().collect()))]
+    })
 }
 
 fn text() -> impl Strategy<Value = Option<String>> {

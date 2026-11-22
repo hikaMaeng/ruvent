@@ -352,7 +352,11 @@ impl Harness {
                 self.check_replay("an appended batch")?;
             }
             Step::Compact => {
+                // The compaction trigger compares the journal against this
+                // count; it must be what a snapshot actually writes.
+                let estimate = self.state.live_records();
                 self.journal = self.state.snapshot();
+                prop_assert_eq!(self.journal.len() as u64, estimate, "live_records() is not the size of a snapshot");
                 prop_assert!(!self.state.is_dirty(), "a snapshot leaves nothing unwritten");
                 self.check_replay("a snapshot")?;
             }
