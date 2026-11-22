@@ -26,17 +26,18 @@ const fn gate(name: &'static str, args: &'static [&'static str]) -> Gate {
 const GATES: &[Gate] = &[
     gate("format", &["fmt", "--all", "--", "--check"]),
     gate("lint", &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]),
-    gate("lint without json", &["clippy", "-p", "ruvent", "--no-default-features", "--lib", "--", "-D", "warnings"]),
-    Gate { name: "api docs", args: &["doc", "-p", "ruvent", "--no-deps"], env: &[("RUSTDOCFLAGS", "-D warnings")] },
+    Gate { name: "api docs", args: &["doc", "--workspace", "--no-deps"], env: &[("RUSTDOCFLAGS", "-D warnings")] },
     gate("static", &["test", "-p", "ruvent", "--test", "static"]),
-    gate("compile-fail pairs", &["test", "-p", "ruvent", "--doc"]),
     gate("state machine", &["test", "-p", "ruvent", "--lib"]),
-    gate("state machine without json", &["test", "-p", "ruvent", "--lib", "--no-default-features"]),
     gate("runtime", &["test", "-p", "ruvent", "--test", "runtime"]),
     gate("acceptance", &["test", "-p", "ruvent", "--test", "acceptance"]),
+    gate("protocol", &["test", "-p", "ruvent-protocol"]),
+    gate("server", &["test", "-p", "ruvent-server"]),
+    gate("client and workers", &["test", "-p", "ruvent-client"]),
+    gate("proxies", &["test", "-p", "ruvent-proxy", "-p", "ruvent-proxy-ws", "-p", "ruvent-proxy-http"]),
 ];
 
-const DEEP: &[Gate] = &[Gate { name: "properties at 100,000 cases", args: &["test", "--release", "-p", "ruvent", "--lib", "--test", "runtime"], env: &[("PROPTEST_CASES", "100000")] }];
+const DEEP: &[Gate] = &[Gate { name: "properties at 100,000 cases", args: &["test", "--release", "-p", "ruvent", "-p", "ruvent-protocol", "--lib"], env: &[("PROPTEST_CASES", "100000")] }];
 
 /// The files whose logic the mutation run judges the tests against.
 const MUTANTS: &[Gate] = &[Gate {
@@ -46,15 +47,13 @@ const MUTANTS: &[Gate] = &[Gate {
         "--package",
         "ruvent",
         "--file",
-        "crates/ruvent/src/engine/state.rs",
-        "--file",
-        "crates/ruvent/src/engine/queue.rs",
-        "--file",
-        "crates/ruvent/src/engine/log.rs",
-        "--file",
-        "crates/ruvent/src/journal/file.rs",
+        "crates/ruvent/src/engine/state/mod.rs",
         "--file",
         "crates/ruvent/src/engine/mod.rs",
+        "--file",
+        "crates/ruvent/src/envelope/codec.rs",
+        "--file",
+        "crates/ruvent/src/journal/codec.rs",
         "--timeout",
         "300",
         "--jobs",
@@ -66,8 +65,6 @@ const MUTANTS: &[Gate] = &[Gate {
         "--test",
         "acceptance",
     ],
-    // Enough cases to exercise the state machine, few enough that 400-odd
-    // mutants finish in under an hour.
     env: &[("PROPTEST_CASES", "256")],
 }];
 

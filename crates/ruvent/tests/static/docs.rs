@@ -4,7 +4,7 @@
 //! anything while it is complete and current, so both directions are checked:
 //! every test is on the map, and everything on the map is a test.
 
-use crate::source::{tests, workspace_root, Source};
+use crate::source::{tests, workspace_root, workspace_tests, Source};
 use std::collections::BTreeSet;
 
 /// Names of every test function in the suite, as `name`.
@@ -45,8 +45,8 @@ fn referenced(markdown: &str) -> BTreeSet<String> {
 
 #[test]
 fn every_test_is_on_the_map_and_the_map_names_only_tests() {
-    let names = test_names(&tests());
-    assert!(names.len() > 50, "the test-name scan found only {} tests; it is broken", names.len());
+    let names = test_names(&workspace_tests());
+    assert!(names.len() > 80, "the test-name scan found only {} tests; it is broken", names.len());
     let map = referenced(&testing_md());
     let missing: Vec<&String> = names.difference(&map).collect();
     // A long snake_case name in a table row is a test reference; one that
@@ -59,7 +59,7 @@ fn every_test_is_on_the_map_and_the_map_names_only_tests() {
 #[test]
 fn every_acceptance_test_quotes_its_requirement() {
     let mut unquoted = Vec::new();
-    for source in tests().iter().filter(|source| source.path.starts_with("acceptance/") && !source.path.ends_with("main.rs") && !source.path.ends_with("memory.rs")) {
+    for source in tests().iter().filter(|source| source.path.starts_with("acceptance/") && !source.path.ends_with("main.rs")) {
         let lines: Vec<&str> = source.text.lines().collect();
         for (at, line) in lines.iter().enumerate() {
             let trimmed = line.trim();

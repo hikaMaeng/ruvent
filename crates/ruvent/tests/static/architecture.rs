@@ -1,25 +1,23 @@
 //! Structural rules, checked against the source text.
 
-use crate::source::{crate_root, library, Source};
+use crate::source::{crate_root, library, strip_comments, workspace_root, Source};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-/// Which modules each module may name. A dependency not listed here is a
-/// decision, and making it means editing this table.
+/// Which modules of the core each module may name. A dependency not listed
+/// here is a decision, and making it means editing this table.
 ///
 /// ```text
-/// app ──► worker ──► engine ──► journal ──► envelope
-///   └───► gateway ───┘   wire ──► gateway
+/// methods ──► engine ──► journal ──► envelope ──► names
+///                  └───► snapshot ──┘
 /// ```
 const LAYERS: &[(&str, &[&str])] = &[
-    ("envelope", &[]),
-    ("journal", &["envelope"]),
-    ("engine", &["envelope", "journal"]),
-    ("worker", &["engine", "envelope"]),
-    ("gateway", &["engine", "envelope"]),
-    ("wire", &["engine", "envelope", "gateway"]),
-    ("app", &["engine", "envelope", "gateway", "worker"]),
-    // Doctests that must not compile, each with a twin that must.
-    ("compile_fail", &[]),
+    ("names", &[]),
+    ("envelope", &["names"]),
+    ("journal", &["envelope", "names"]),
+    ("snapshot", &["envelope", "names"]),
+    ("engine", &["envelope", "journal", "names", "snapshot"]),
+    ("methods", &["engine", "envelope", "names"]),
 ];
 
 fn crate_paths(code: &str) -> BTreeSet<String> {
@@ -38,7 +36,6 @@ fn modules_depend_only_downward() {
                 violations.push(format!("{} names crate::{used}", source.path));
             }
         }
-        // Reaching two levels up is a way around this table.
         if source.code().contains("super::super") {
             violations.push(format!("{} uses super::super", source.path));
         }
@@ -53,23 +50,64 @@ fn every_module_is_in_the_layer_table_and_no_layer_is_stale() {
     assert_eq!(present, listed);
 }
 
-/// Every place the library waits on the clock. Nothing else may.
+/// Library source of every crate in the workspace: `crates/*/src/**`, without
+/// binaries' `main.rs` and without in-tree tests. Paths are `crate/path`.
+fn workspace_library() -> Vec<Source> {
+    let mut found = Vec::new();
+    let crates = workspace_root().join("crates");
+    let mut members: Vec<_> = std::fs::read_dir(&crates).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.join("Cargo.toml").exists()).collect();
+    members.sort();
+    for member in members {
+        let name = member.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "xtask" {
+            continue;
+        }
+        let mut stack = vec![member.join("src")];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else { continue };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let relative = path.strip_prefix(member.join("src")).unwrap().to_string_lossy().replace('\\', "/");
+                let is_test = relative.ends_with("tests.rs") || relative.contains("/tests/");
+                if path.extension().is_some_and(|extension| extension == "rs") && relative != "main.rs" && !is_test {
+                    let text = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+                    found.push(Source { path: format!("{name}/{relative}"), text });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every place a library waits on the clock. Nothing else may.
 ///
 /// | where | what it is |
 /// | --- | --- |
-/// | `engine/mod.rs` `time::sleep(` | the one pinned timer, re-armed only when the earliest real deadline changes |
-/// | `worker/mod.rs` `time::timeout(` | the deadline on one execution step |
-/// | `gateway/mod.rs` `time::timeout(` | how long a connectionless read waits for events |
-const TIMERS: &[(&str, &str, usize)] = &[("engine/mod.rs", "time::sleep(", 1), ("worker/mod.rs", "time::timeout(", 1), ("gateway/mod.rs", "time::timeout(", 1)];
+/// | `ruvent/snapshot/mod.rs` `time::timeout(` | a snapshot unit's age limit |
+/// | `ruvent-client/worker/lane.rs` `time::timeout(` | a handler's lease: past it the run is abandoned |
+/// | `ruvent-server/connection/mod.rs` `time::timeout(` | how long a new connection has to say hello |
+/// | `ruvent-proxy/hub/mod.rs` `time::timeout(` | how long an authentication worker has to answer |
+/// | `ruvent-proxy/hub/mod.rs` `time::sleep(` | back-off before reconnecting to the upstream server |
+const TIMERS: &[(&str, &str, usize)] = &[
+    ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
+    ("ruvent-client/worker/lane.rs", "time::timeout(", 1),
+    ("ruvent-server/connection/mod.rs", "time::timeout(", 1),
+    ("ruvent-proxy/hub/mod.rs", "time::timeout(", 1),
+    ("ruvent-proxy/hub/mod.rs", "time::sleep(", 1),
+];
 
-/// Ways of finding out by asking again. None may appear in the library.
+/// Ways of finding out by asking again. None may appear in a library.
 const POLLING: &[&str] = &["interval(", "interval_at(", "thread::sleep", "yield_now", "spin_loop", "try_recv(", "sleep_until(", "timeout_at(", "MissedTickBehavior"];
 
 #[test]
 fn nothing_polls_and_every_timer_is_declared() {
     let mut violations = Vec::new();
     let mut found: BTreeMap<(String, &str), usize> = BTreeMap::new();
-    for source in library() {
+    for source in workspace_library() {
         for needle in POLLING {
             if source.count(needle) > 0 {
                 violations.push(format!("{} uses `{needle}`", source.path));
@@ -81,8 +119,6 @@ fn nothing_polls_and_every_timer_is_declared() {
                 found.insert((source.path.clone(), needle), count);
             }
         }
-        // A bare `sleep(` or `timeout(` imported by name would slip past the
-        // qualified search above.
         for import in ["time::{", "time::sleep;", "time::timeout;"] {
             if source.code().contains(&format!("use tokio::{import}")) {
                 violations.push(format!("{} imports from tokio::time by name; write `tokio::time::…` at the call so it is counted", source.path));
@@ -100,36 +136,30 @@ fn only<'a>(sources: &'a [Source], needle: &str) -> Vec<(&'a str, usize)> {
     sources.iter().map(|source| (source.path.as_str(), source.count(needle))).filter(|(_, count)| *count > 0).collect()
 }
 
-/// "A write may not start while another is going" is a property of where the
-/// journal is touched from. There is one writer task, one place a write is
-/// issued, and one field that says a write is out.
+/// One writer task owns the journal; the engine hands it one job at a time.
 #[test]
 fn the_journal_is_written_from_one_place() {
     let sources = library();
-    assert_eq!(only(&sources, "journal.append("), [("engine/mod.rs", 1)], "exactly one call site appends to the journal");
-    assert_eq!(only(&sources, "journal.rewrite("), [("engine/mod.rs", 1)], "exactly one call site rewrites the journal");
+    assert_eq!(only(&sources, "journal.append("), [("engine/mod.rs", 2)], "the startup write, and the writer task");
+    assert_eq!(only(&sources, "journal.rewrite("), [("engine/mod.rs", 1)]);
     assert_eq!(only(&sources, "self.flight = Some("), [("engine/mod.rs", 1)], "a flight is taken out in exactly one place");
-    assert_eq!(only(&sources, "self.issue("), [("engine/mod.rs", 2)], "only `launch` and `compact` issue journal work");
-    assert_eq!(only(&sources, "jobs.try_send(").len(), 1, "journal jobs are handed over without waiting, in one place");
-    // The channel to the writer holds one job: there is never a second one
-    // queued behind the write in progress.
-    assert_eq!(only(&sources, "mpsc::channel(1)"), [("engine/mod.rs", 1)]);
+    assert_eq!(only(&sources, "jobs.try_send("), [("engine/mod.rs", 1)]);
+    assert_eq!(only(&sources, "mpsc::channel::<Job>(1)"), [("engine/mod.rs", 1)], "the writer never has a second job queued behind the one in flight");
 }
 
 #[test]
 fn the_engine_state_has_one_owner() {
     let sources = library();
-    // The state machine is built once and moved into the engine task.
     assert_eq!(only(&sources, "State::new("), [("engine/mod.rs", 1)]);
     assert_eq!(only(&sources, "tokio::spawn(core.run())"), [("engine/mod.rs", 1)]);
-    // The readable log is written from the engine task and from recovery only.
-    assert_eq!(only(&sources, ".log.write()"), [("engine/log.rs", 1), ("engine/mod.rs", 3)], "write locks on the readable log: subscription open, recovery (2), publish");
+    // No lock guards shared state in the core: the engine task owns it.
+    assert_eq!(only(&sources, "Mutex<"), [("methods/mod.rs", 1)], "only the client's table of calls waiting for an answer is shared");
 }
 
 #[test]
-fn the_library_has_no_unsafe_and_writes_nothing_to_the_terminal() {
+fn no_library_has_unsafe_or_writes_to_the_terminal() {
     let mut violations = Vec::new();
-    for source in library() {
+    for source in workspace_library() {
         for needle in ["unsafe ", "unsafe{", "println!", "eprintln!", "print!(", "dbg!(", "todo!(", "unimplemented!("] {
             if source.count(needle) > 0 {
                 violations.push(format!("{} contains `{needle}`", source.path));
@@ -139,19 +169,30 @@ fn the_library_has_no_unsafe_and_writes_nothing_to_the_terminal() {
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
-/// The engine never looks inside a payload. JSON exists only at the wire, and
-/// in two helpers on the envelope that a handler may call.
+/// The server never looks inside a payload: no JSON in the core.
 #[test]
-fn only_the_wire_knows_json() {
-    let users: Vec<String> = library().iter().filter(|source| source.count("serde_json") > 0).map(|source| source.path.clone()).collect();
-    assert_eq!(users, ["envelope/mod.rs", "wire/json.rs"]);
-    let envelope = library().into_iter().find(|source| source.path == "envelope/mod.rs").unwrap();
-    assert_eq!(envelope.count("#[cfg(feature = \"json\")]"), 2, "both JSON helpers on the envelope are behind the feature");
+fn the_core_knows_no_json() {
+    let users: Vec<String> = library().iter().filter(|source| source.count("serde") > 0).map(|source| source.path.clone()).collect();
+    assert!(users.is_empty(), "{users:?}");
 }
 
 #[test]
-fn the_wall_clock_is_read_once() {
-    assert_eq!(only(&library(), "SystemTime::now"), [("engine/log.rs", 1)], "every timestamp derives from one reading plus the runtime clock");
+fn the_wall_clock_is_read_once_in_the_core() {
+    assert_eq!(only(&library(), "SystemTime::now"), [("snapshot/mod.rs", 1)], "it names snapshot files; deadlines use the monotonic clock");
+}
+
+/// The server keeps no policy: none of the old engine's policy words appear in the core.
+#[test]
+fn the_server_keeps_no_event_policy() {
+    let mut violations = Vec::new();
+    for source in library() {
+        for word in ["max_attempts", "dead_letter", "Dead", "ReactionTable", "transaction_key", "Retention", "audience"] {
+            if source.count(word) > 0 {
+                violations.push(format!("{} contains `{word}`", source.path));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
 fn section<'a>(manifest: &'a str, header: &str) -> Vec<&'a str> {
@@ -166,20 +207,18 @@ fn names(lines: &[&str]) -> Vec<String> {
 #[test]
 fn runtime_dependencies_are_the_declared_set() {
     let manifest = std::fs::read_to_string(crate_root().join("Cargo.toml")).unwrap();
-    assert_eq!(names(&section(&manifest, "[dependencies]")), ["async-trait", "bincode", "bytes", "crc32fast", "parking_lot", "serde", "serde_json", "tokio", "tokio-util", "uuid", "xxhash-rust"]);
-    let json: Vec<&str> = section(&manifest, "[dependencies]").into_iter().filter(|line| line.starts_with("serde_json")).collect();
-    assert!(json[0].contains("optional = true"), "serde_json stays optional: {json:?}");
-    assert_eq!(section(&manifest, "[lints]"), ["workspace = true"], "the crate takes the workspace's lint decisions");
+    assert_eq!(names(&section(&manifest, "[dependencies]")), ["async-trait", "bytes", "crc32fast", "parking_lot", "tokio", "uuid"]);
+    for member in std::fs::read_dir(workspace_root().join("crates")).unwrap() {
+        let manifest = std::fs::read_to_string(member.unwrap().path().join("Cargo.toml")).unwrap();
+        assert_eq!(section(&manifest, "[lints]"), ["workspace = true"], "every crate takes the workspace's lint decisions");
+    }
 }
 
-/// Source files are UTF-8 with LF line ends and no control characters. A
-/// stray NUL or CR in a string literal compiles and changes what the program
-/// does; an editor will not show it.
+/// Source files are UTF-8 with LF line ends and no control characters.
 #[test]
 fn source_files_are_plain_utf8_text() {
-    let root = crate::source::crate_root();
     let mut violations = Vec::new();
-    let mut stack = vec![root.join("src"), root.join("tests"), root.join("examples")];
+    let mut stack = vec![workspace_root().join("crates")];
     while let Some(directory) = stack.pop() {
         for entry in std::fs::read_dir(&directory).unwrap() {
             let path = entry.unwrap().path();
@@ -197,4 +236,31 @@ fn source_files_are_plain_utf8_text() {
         }
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// Every crate has a README, and the root README links to it.
+#[test]
+fn every_crate_is_documented_and_linked() {
+    let root = workspace_root();
+    let index = std::fs::read_to_string(root.join("README.md")).unwrap();
+    let mut missing = Vec::new();
+    for member in std::fs::read_dir(root.join("crates")).unwrap() {
+        let path = member.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "xtask" || !path.join("Cargo.toml").exists() {
+            continue;
+        }
+        if !Path::new(&path.join("README.md")).exists() {
+            missing.push(format!("{name}: no README.md"));
+        }
+        if !index.contains(&format!("crates/{name}/README.md")) {
+            missing.push(format!("{name}: not linked from README.md"));
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+#[test]
+fn the_comment_stripper_is_used_on_code() {
+    assert_eq!(strip_comments("a // b\n"), "a \n");
 }

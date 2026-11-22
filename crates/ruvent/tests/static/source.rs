@@ -67,6 +67,23 @@ pub fn library() -> Vec<Source> {
     load(&crate_root().join("src")).into_iter().filter(|source| !is_test_file(&source.path)).collect()
 }
 
+/// Every source and test file of every crate in the workspace, as
+/// `crate/tests/...` or `crate/src/...`. Tests may sit inline in any of them.
+pub fn workspace_tests() -> Vec<Source> {
+    let mut found = Vec::new();
+    let crates = workspace_root().join("crates");
+    let mut members: Vec<PathBuf> = std::fs::read_dir(&crates).unwrap().map(|entry| entry.unwrap().path()).filter(|path| path.join("Cargo.toml").exists()).collect();
+    members.sort();
+    for member in members {
+        let name = member.file_name().unwrap().to_string_lossy().into_owned();
+        if member.join("tests").is_dir() {
+            found.extend(load(&member.join("tests")).into_iter().map(|source| Source { path: format!("{name}/tests/{}", source.path), ..source }));
+        }
+        found.extend(load(&member.join("src")).into_iter().map(|source| Source { path: format!("{name}/src/{}", source.path), ..source }));
+    }
+    found
+}
+
 /// Every file that holds tests: `tests/**` and the unit tests under `src/**`.
 pub fn tests() -> Vec<Source> {
     let mut found = load(&crate_root().join("tests"));

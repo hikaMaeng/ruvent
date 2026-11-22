@@ -1,0 +1,17 @@
+[package]
+name = "ruvent-proxy"
+description = "What every protocol proxy shares: JSON configuration, end-user authentication, one upstream subscription per channel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruvent.workspace = true
+ruvent-client.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

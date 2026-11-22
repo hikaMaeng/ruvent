@@ -1,630 +1,541 @@
-//! The state machine, driven by random operation sequences.
-//!
-//! Two kinds of property are checked:
-//!
-//! * **replay equivalence** — at every journal write, replaying everything
-//!   written so far into a fresh state gives back exactly the durable part of
-//!   the live state. This is the whole contract of the net-change journal: a
-//!   restart carries on from what was written, no more and no less. It is
-//!   checked for appended batches, for snapshots, and across restarts;
-//! * **invariants after every step** — one owner per execution, no message
-//!   held by nobody, a superseded attempt changes nothing, positions only grow.
-//!
-//! The state is driven directly, synchronously, the way the engine task drives
-//! it. No runtime, no disk: thousands of sequences run in well under a second.
+//! The server's rules, decided against the state machine alone.
 
 use super::*;
-use crate::engine::config::{Events, Persist, Retention};
+use crate::engine::config::{Grant, Pattern};
 use proptest::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::time::Duration;
 
-const QUEUES: [&str; 3] = ["a", "b", "t"];
-const CHANNELS: [&str; 2] = ["keep.c", "temp.c"];
-const FACTS: [&str; 3] = ["fact.x", "fact.y", "fact.z"];
+const A: SessionId = 1;
+const B: SessionId = 2;
+const OTHER: SessionId = 3;
 
-#[derive(Clone, Debug)]
-struct Setup {
-    settled: bool,
-    /// 0 none, 1 all, 2 only `keep.`, 3 all but `keep.`.
-    events: u8,
-    /// Whether queue `t` is configured as transient.
-    transient: bool,
-    max_attempts: u32,
-    max_events: usize,
-    settled_window: u64,
-    max_settled: usize,
-    dead_letters: usize,
-}
-
-fn setup() -> impl Strategy<Value = Setup> {
-    (any::<bool>(), 0..4u8, any::<bool>(), 1..4u32, 2..24usize, 0..60u64, 1..6usize, 1..4usize).prop_map(
-        |(settled, events, transient, max_attempts, max_events, settled_window, max_settled, dead_letters)| Setup {
-            settled,
-            events,
-            transient,
-            max_attempts,
-            max_events,
-            settled_window,
-            max_settled,
-            dead_letters,
-        },
-    )
-}
-
-fn persist(setup: &Setup) -> Persist {
-    let keep = || vec!["keep.".to_owned()];
-    let events = match setup.events {
-        0 => Events::None,
-        1 => Events::All,
-        2 => Events::Channels(keep()),
-        _ => Events::Except(keep()),
-    };
-    let transient_queues: HashSet<Text> = if setup.transient { [Text::from("t")].into() } else { HashSet::new() };
-    Persist { events, settled: setup.settled, transient_queues }
-}
-
-fn build(setup: &Setup) -> State {
-    let reactions: HashMap<Text, Vec<Text>> =
-        [("fact.x", vec!["a"]), ("fact.y", vec!["a", "b"]), ("fact.z", vec!["t"])].into_iter().map(|(action, queues)| (Text::from(action), queues.into_iter().map(Text::from).collect())).collect();
-    let retention = Retention {
-        max_events: setup.max_events,
-        max_bytes: usize::MAX,
-        max_age: Duration::from_secs(3600),
-        settled: Duration::from_millis(setup.settled_window),
-        max_settled: setup.max_settled,
-        dead_letters: setup.dead_letters,
-    };
-    State::new(Arc::new(reactions), setup.max_attempts, retention, persist(setup))
-}
-
-fn replay(setup: &Setup, journal: &[Record], now: u64) -> State {
-    let mut state = build(setup);
-    for record in journal {
-        state.apply(record, now);
-    }
+fn started(config: EngineConfig, ids: Box<dyn IdSource>) -> State {
+    let mut state = State::new(&config, ids);
+    state.recover(Vec::new()).unwrap();
+    state.open(A, &Name::new("svc"));
+    state.open(B, &Name::new("svc"));
+    state.open(OTHER, &Name::new("other"));
+    state.begin(0);
+    let _ = state.take();
     state
+}
+
+fn fresh() -> State {
+    started(EngineConfig::default(), Box::new(V7))
+}
+
+/// Applies one call and returns its reply and everything else it produced.
+fn run(state: &mut State, session: SessionId, call: Call) -> (Reply, Effects) {
+    state.call(session, 7, call);
+    let mut effects = state.take();
+    let at = effects.sends.iter().position(|send| send.session == session && matches!(send.message, Outbound::Reply { .. })).expect("every call is answered");
+    let Outbound::Reply { reply, .. } = effects.sends.remove(at).message else { unreachable!() };
+    (reply, effects)
+}
+
+fn reply(state: &mut State, session: SessionId, call: Call) -> Reply {
+    run(state, session, call).0
+}
+
+fn register(state: &mut State, id: EventId) -> (EventId, WorkKey) {
+    match reply(state, A, Call::RegisterClaimable(Envelope::claimable("work", "do", Bytes::from_static(b"p")).with_id(id))) {
+        Reply::Registered { id, key } => (id, key),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn claim(state: &mut State, session: SessionId, id: EventId, lease_ms: u64) -> Result<Envelope, Refusal> {
+    match reply(state, session, Call::Claim { id, worker: 9, lease_ms }) {
+        Reply::Claimed(event) => Ok(event),
+        Reply::Refused(refusal) => Err(refusal),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn complete(state: &mut State, session: SessionId, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>) -> Reply {
+    reply(state, session, Call::Complete { id, token, follow_ups })
+}
+
+fn token(event: &Envelope) -> ClaimToken {
+    event.claim.expect("claimed").token
+}
+
+fn id(byte: u8) -> EventId {
+    let mut bytes = [byte; 16];
+    bytes[6] = 0x70 | (byte & 0x0f);
+    bytes[8] = 0x80 | (byte & 0x3f);
+    EventId(bytes)
+}
+
+/// Fresh ids from a list, then UUIDv7.
+struct Scripted(std::collections::VecDeque<EventId>);
+
+impl IdSource for Scripted {
+    fn next(&mut self) -> EventId {
+        self.0.pop_front().unwrap_or_else(EventId::new_v7)
+    }
+}
+
+fn the_id_now(state: &State, key: WorkKey) -> EventId {
+    state.queue[&key].id
+}
+
+#[test]
+fn of_two_claims_on_one_waiting_event_exactly_one_wins() {
+    let mut state = fresh();
+    let (id, _) = register(&mut state, EventId::NIL);
+    let won = claim(&mut state, A, id, 1000).unwrap();
+    assert_eq!(claim(&mut state, B, id, 1000), Err(Refusal::AlreadyClaimed));
+    // The loser's report has no effect; the winner's does.
+    let mut stale = token(&won);
+    stale.seq += 1;
+    assert_eq!(complete(&mut state, B, id, stale, Vec::new()), Reply::Refused(Refusal::StaleToken));
+    assert_eq!(complete(&mut state, A, id, token(&won), Vec::new()), Reply::Completed);
+    assert_eq!(state.live(), 0);
+}
+
+#[test]
+fn a_claim_answer_carries_the_whole_envelope_with_key_and_claim_block() {
+    let mut state = fresh();
+    state.begin(500);
+    let (id, key) = register(&mut state, EventId::NIL);
+    let event = claim(&mut state, A, id, 30_000).unwrap();
+    assert_eq!(event.key, Some(key));
+    assert_eq!(event.payload, Bytes::from_static(b"p"));
+    assert_eq!(event.principal.as_deref(), Some("svc"));
+    let claim = event.claim.unwrap();
+    assert_eq!((claim.worker, claim.deadline), (9, 30_500), "the deadline is the server's clock plus the lease");
+}
+
+#[test]
+fn completion_from_another_credential_is_refused_and_the_same_credential_on_a_new_connection_succeeds() {
+    let mut state = fresh();
+    let (id, _) = register(&mut state, EventId::NIL);
+    let event = claim(&mut state, A, id, 1000).unwrap();
+    assert_eq!(complete(&mut state, OTHER, id, token(&event), Vec::new()), Reply::Refused(Refusal::WrongCredential));
+    // The claiming connection goes away; a new connection under the same credential completes.
+    state.close(A);
+    state.open(10, &Name::new("svc"));
+    assert_eq!(complete(&mut state, 10, id, token(&event), Vec::new()), Reply::Completed);
+    assert!(state.attributions.is_empty(), "the attribution goes with its last claim once its connection is gone");
+}
+
+#[test]
+fn an_id_in_the_claimable_queue_refuses_every_kind_of_registration() {
+    let mut state = fresh();
+    let (taken, _) = register(&mut state, id(1));
+    let reused = |kind: Kind| match kind {
+        Kind::Claimable => Envelope::claimable("work", "do", Bytes::new()).with_id(taken),
+        Kind::Dispatch => Envelope::dispatch("work", "do", Bytes::new()).with_id(taken),
+    };
+    assert_eq!(reply(&mut state, A, Call::RegisterClaimable(reused(Kind::Claimable))), Reply::Refused(Refusal::Duplicate));
+    assert_eq!(reply(&mut state, A, Call::RegisterDispatch(reused(Kind::Dispatch))), Reply::Refused(Refusal::Duplicate));
+    // While claimed, too, and as a follow-up.
+    let (parent, _) = register(&mut state, EventId::NIL);
+    let held = claim(&mut state, A, parent, 1000).unwrap();
+    assert_eq!(claim(&mut state, A, taken, 1000).map(|_| ()), Ok(()));
+    assert_eq!(complete(&mut state, A, parent, token(&held), vec![reused(Kind::Claimable)]), Reply::Refused(Refusal::Duplicate));
+    assert!(state.ids.contains_key(&parent), "the parent stays claimed when a follow-up is refused");
+    // Two follow-ups with one id.
+    let twins = vec![Envelope::dispatch("x", "t", Bytes::new()).with_id(id(2)), Envelope::claimable("x", "t", Bytes::new()).with_id(id(2))];
+    let (outcome, effects) = run(&mut state, A, Call::Complete { id: parent, token: token(&held), follow_ups: twins });
+    assert_eq!(outcome, Reply::Refused(Refusal::Duplicate));
+    assert!(effects.records.is_empty() && effects.sends.is_empty(), "a refused completion changes nothing and sends nothing");
+    // Once it leaves the queue the id may be used again.
+    let (_, effects) = run(&mut state, A, Call::Complete { id: parent, token: token(&held), follow_ups: Vec::new() });
+    assert_eq!(effects.records, vec![Record::Remove(state_key_of_removed(&effects))]);
+    assert!(matches!(reply(&mut state, A, Call::RegisterClaimable(Envelope::claimable("work", "do", Bytes::new()).with_id(parent))), Reply::Registered { .. }));
+}
+
+fn state_key_of_removed(effects: &Effects) -> WorkKey {
+    match effects.records.first() {
+        Some(Record::Remove(key)) => *key,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn reissued_ids_skip_the_old_id_and_every_live_id() {
+    let mut state = started(EngineConfig::default(), Box::new(Scripted(std::collections::VecDeque::new())));
+    let (live, _) = register(&mut state, id(5));
+    let (old, key) = register(&mut state, id(6));
+    claim(&mut state, A, old, 10).unwrap();
+    // The next fresh ids offered are the reclaimed event's own id and the other live id.
+    state.id_source = Box::new(Scripted([old, live, id(7)].into()));
+    state.begin(10);
+    let _ = reply(&mut state, A, Call::RegisterDispatch(Envelope::dispatch("noise", "t", Bytes::new()).with_id(id(8))));
+    assert_eq!(the_id_now(&state, key), id(7));
+}
+
+#[test]
+fn reclaim_keeps_the_work_key_and_a_new_registration_under_the_old_id_gets_another() {
+    let mut state = fresh();
+    let (x, first) = register(&mut state, id(0x10));
+    let event = claim(&mut state, A, x, 100).unwrap();
+    state.begin(100);
+    let (_, second) = register(&mut state, EventId::NIL);
+    let y = the_id_now(&state, first);
+    assert_ne!(y, x, "the reclaimed event has a new id");
+    assert_eq!(state.queue[&first].retry, 1);
+    // B registers under x, which left the queue with the reclaim.
+    let (again, third) = register(&mut state, x);
+    assert_eq!(again, x);
+    assert!(first != third && second != third, "two registrations under one id have different work keys");
+    // The old completion, claim and keyed delete arrive late.
+    assert_eq!(complete(&mut state, A, x, token(&event), Vec::new()), Reply::Refused(Refusal::NotClaimed));
+    let rewon = claim(&mut state, A, x, 100).unwrap();
+    assert_eq!(rewon.key, Some(third), "a claim by id reaches whatever has that id now");
+    assert_eq!(complete(&mut state, A, x, token(&event), Vec::new()), Reply::Refused(Refusal::StaleToken));
+    let (outcome, _) = run(&mut state, A, Call::Delete { id: y, result: "out".into(), tag: id(1), key: Some(third) });
+    assert_eq!(outcome, Reply::Deleted { removed: false });
+}
+
+#[test]
+fn only_an_external_registration_reclaims_and_only_once_per_batch() {
+    let mut state = fresh();
+    let (parent, _) = register(&mut state, EventId::NIL);
+    let (late, late_key) = register(&mut state, EventId::NIL);
+    let held = claim(&mut state, A, parent, 1000).unwrap();
+    claim(&mut state, A, late, 10).unwrap();
+    state.begin(500);
+    // A completion with follow-ups and a deletion do not reclaim.
+    assert_eq!(complete(&mut state, A, parent, token(&held), vec![Envelope::claimable("work", "next", Bytes::new())]), Reply::Completed);
+    let _ = reply(&mut state, A, Call::Delete { id: id(9), result: "out".into(), tag: id(9), key: None });
+    assert!(state.queue[&late_key].claim.is_some(), "still claimed: nothing external registered yet");
+    let (_, effects) = run(&mut state, A, Call::RegisterDispatch(Envelope::dispatch("noise", "t", Bytes::new())));
+    assert!(state.queue[&late_key].claim.is_none());
+    assert!(matches!(effects.records.as_slice(), [Record::Reclaim { retry: 1, .. }]));
+    // The second registration of the same batch does not look again.
+    let (fresh_id, _) = register(&mut state, EventId::NIL);
+    claim(&mut state, A, fresh_id, 0).unwrap();
+    let (_, effects) = run(&mut state, A, Call::RegisterDispatch(Envelope::dispatch("noise", "t", Bytes::new())));
+    assert!(effects.records.is_empty());
+}
+
+#[test]
+fn a_thirty_second_claim_expires_after_exactly_thirty_seconds_across_the_u32_millisecond_boundary() {
+    let boundary = u64::from(u32::MAX);
+    for start in [boundary - 10_000, boundary, boundary + 1] {
+        let mut state = fresh();
+        state.begin(start);
+        let (id, key) = register(&mut state, EventId::NIL);
+        claim(&mut state, A, id, 30_000).unwrap();
+        state.begin(start + 29_999);
+        register(&mut state, EventId::NIL);
+        assert!(state.queue[&key].claim.is_some(), "not yet at {start}");
+        state.begin(start + 30_000);
+        register(&mut state, EventId::NIL);
+        assert!(state.queue[&key].claim.is_none(), "expired at {start}");
+    }
+}
+
+#[test]
+fn exhausted_sequences_advance_the_generation_and_gate_the_batch() {
+    let mut state = fresh();
+    let generation = state.generation;
+    state.arrival = u32::MAX;
+    state.claim_seq = u32::MAX - 1;
+    let (first_id, before) = {
+        let (outcome, effects) = run(&mut state, A, Call::RegisterClaimable(Envelope::claimable("work", "do", Bytes::new())));
+        assert!(effects.gate_all, "nothing of a batch that advanced the generation leaves before it is durable");
+        assert_eq!(effects.records.first(), Some(&Record::Generation(generation + 1)));
+        match outcome {
+            Reply::Registered { id, key } => (id, key),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(before, WorkKey { generation: generation + 1, arrival: 0 });
+    let event = claim(&mut state, A, first_id, 100).unwrap();
+    assert_eq!(token(&event), ClaimToken { generation: generation + 1, seq: 0 });
+    let (_, later) = register(&mut state, EventId::NIL);
+    assert!(later > before, "FIFO order continues across the generation change");
+}
+
+#[test]
+fn deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_with_one_notice() {
+    let mut state = fresh();
+    let _ = reply(&mut state, B, Call::Subscribe { channel: "out".into(), after: None });
+    let (waiting, _) = register(&mut state, EventId::NIL);
+    let (claimed, _) = register(&mut state, EventId::NIL);
+    claim(&mut state, A, claimed, 1000).unwrap();
+    for (target, removed, kind) in [(waiting, true, DELETED), (claimed, false, DELETE_FAILED), (id(3), false, DELETE_FAILED), (waiting, false, DELETE_FAILED)] {
+        let tag = EventId::new_v7();
+        let (outcome, effects) = run(&mut state, A, Call::Delete { id: target, result: "out".into(), tag, key: None });
+        assert_eq!(outcome, Reply::Deleted { removed });
+        let notices: Vec<&Envelope> = effects
+            .sends
+            .iter()
+            .filter_map(|send| match &send.message {
+                Outbound::Delivery(event) if send.session == B => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "exactly one result event");
+        assert_eq!((&*notices[0].event_type, notices[0].correlation), (kind, Some(tag)));
+        assert_eq!(&notices[0].payload[..16], &target.0);
+    }
+}
+
+#[test]
+fn delete_then_claim_and_claim_then_delete() {
+    let mut state = fresh();
+    let (first, _) = register(&mut state, EventId::NIL);
+    assert_eq!(reply(&mut state, A, Call::Delete { id: first, result: "out".into(), tag: id(1), key: None }), Reply::Deleted { removed: true });
+    assert_eq!(claim(&mut state, A, first, 10), Err(Refusal::Missing));
+    let (second, key) = register(&mut state, EventId::NIL);
+    claim(&mut state, A, second, 10).unwrap();
+    assert_eq!(reply(&mut state, A, Call::Delete { id: second, result: "out".into(), tag: id(1), key: None }), Reply::Deleted { removed: false });
+    assert!(state.queue[&key].claim.is_some(), "the claim stands");
+}
+
+#[test]
+fn dispatch_reaches_exactly_the_subscribers_at_the_moment_it_is_registered() {
+    let mut state = fresh();
+    let dispatch = |state: &mut State| run(state, A, Call::RegisterDispatch(Envelope::dispatch("feed", "t", Bytes::new()))).1;
+    let delivered = |effects: &Effects| effects.sends.iter().filter(|send| send.session == B && matches!(send.message, Outbound::Delivery(_))).count();
+    assert_eq!(delivered(&dispatch(&mut state)), 0, "nobody subscribed: sent to nobody, kept nowhere");
+    let _ = reply(&mut state, B, Call::Subscribe { channel: "feed".into(), after: None });
+    assert_eq!(delivered(&dispatch(&mut state)), 1);
+    let _ = reply(&mut state, B, Call::Unsubscribe { channel: "feed".into() });
+    assert_eq!(delivered(&dispatch(&mut state)), 0);
+    assert!(state.queue.is_empty() && state.ids.is_empty());
+}
+
+#[test]
+fn the_backlog_comes_in_pages_in_work_key_order() {
+    let mut state = started(EngineConfig { backlog_page: 3, ..EngineConfig::default() }, Box::new(V7));
+    let keys: Vec<WorkKey> = (0..7).map(|_| register(&mut state, EventId::NIL).1).collect();
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let Reply::Subscribed { backlog, more, .. } = reply(&mut state, B, Call::Subscribe { channel: "work".into(), after }) else { panic!() };
+        assert!(backlog.len() <= 3);
+        assert!(backlog.iter().all(|notice| notice.payload.is_empty() && notice.claim.is_none()), "notices are head and key only");
+        seen.extend(backlog.iter().filter_map(|notice| notice.key));
+        after = backlog.last().and_then(|notice| notice.key);
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(seen, keys);
+    assert_eq!(state.subscribers["work"], vec![B], "subscribing again does not add a second subscription");
+}
+
+#[test]
+fn a_completion_that_arrives_before_the_reclaim_is_accepted_and_after_it_is_refused() {
+    // Complete, then register: accepted.
+    let mut state = fresh();
+    let (id, _) = register(&mut state, EventId::NIL);
+    let event = claim(&mut state, A, id, 10).unwrap();
+    state.begin(1000);
+    assert_eq!(complete(&mut state, A, id, token(&event), Vec::new()), Reply::Completed);
+    register(&mut state, EventId::NIL);
+    // Register, then complete: the reclaim came first.
+    let mut state = fresh();
+    let (id, _) = register(&mut state, EventId::NIL);
+    let event = claim(&mut state, A, id, 10).unwrap();
+    state.begin(1000);
+    register(&mut state, EventId::NIL);
+    assert_eq!(complete(&mut state, A, id, token(&event), Vec::new()), Reply::Refused(Refusal::Missing));
+}
+
+#[test]
+fn grants_limit_methods_and_channels_and_delegation() {
+    let mut grants = Grants::new();
+    grants.insert("svc".into(), Grant { methods: vec![Method::RegisterDispatch, Method::Subscribe], channels: vec![Pattern("pub.*".into())], delegate: false });
+    let mut state = started(EngineConfig { grants: Some(grants), ..EngineConfig::default() }, Box::new(V7));
+    assert_eq!(reply(&mut state, A, Call::RegisterClaimable(Envelope::claimable("pub.x", "t", Bytes::new()))), Reply::Refused(Refusal::Forbidden));
+    assert!(matches!(reply(&mut state, A, Call::RegisterDispatch(Envelope::dispatch("pub.x", "t", Bytes::new()))), Reply::Accepted { .. }));
+    assert_eq!(reply(&mut state, A, Call::RegisterDispatch(Envelope::dispatch("priv", "t", Bytes::new()))), Reply::Refused(Refusal::Forbidden));
+    assert_eq!(reply(&mut state, A, Call::RegisterDispatch(Envelope::dispatch("pub.x", "t", Bytes::new()).with_delegate("alice"))), Reply::Refused(Refusal::Forbidden));
+    assert_eq!(reply(&mut state, OTHER, Call::Subscribe { channel: "pub.x".into(), after: None }), Reply::Refused(Refusal::Forbidden), "no grant, no access");
+}
+
+#[test]
+fn requests_carrying_server_fields_or_the_wrong_kind_are_malformed() {
+    let mut state = fresh();
+    let base = || Envelope::claimable("work", "do", Bytes::new());
+    for bad in [Envelope { retry: 1, ..base() }, Envelope { principal: Some("me".into()), ..base() }, Envelope { key: Some(WorkKey::default()), ..base() }, Envelope::claimable("", "do", Bytes::new())]
+    {
+        assert_eq!(reply(&mut state, A, Call::RegisterClaimable(bad)), Reply::Refused(Refusal::Malformed));
+    }
+    assert_eq!(reply(&mut state, A, Call::RegisterDispatch(base())), Reply::Refused(Refusal::Malformed));
+    assert_eq!(reply(&mut state, A, Call::RegisterClaimable(base().with_id(EventId([0xff; 16])))), Reply::Refused(Refusal::InvalidId));
+}
+
+#[test]
+fn recovery_restores_order_and_reissues_what_was_claimed_with_one_more_retry() {
+    let mut state = fresh();
+    let keys: Vec<WorkKey> = (0..3).map(|_| register(&mut state, EventId::NIL).1).collect();
+    let claimed = the_id_now(&state, keys[1]);
+    let event = claim(&mut state, A, claimed, 1000).unwrap();
+    let records = state.snapshot();
+
+    let mut restarted = State::new(&EngineConfig::default(), Box::new(V7));
+    let startup = restarted.recover(records).unwrap();
+    assert_eq!(restarted.generation, state.generation + 1);
+    assert!(matches!(startup.as_slice(), [Record::Generation(_), Record::Reclaim { retry: 1, .. }]));
+    assert_eq!(restarted.queue.keys().copied().collect::<Vec<_>>(), keys, "same order, same keys");
+    assert_ne!(restarted.queue[&keys[1]].id, claimed);
+    assert!(restarted.queue.values().all(|event| event.claim.is_none()));
+    restarted.open(A, &Name::new("svc"));
+    restarted.begin(0);
+    let _ = restarted.take();
+    assert_eq!(complete(&mut restarted, A, claimed, token(&event), Vec::new()), Reply::Refused(Refusal::Missing), "a report from before the restart has no effect");
+    // A later registration queues behind the recovered ones.
+    assert!(register(&mut restarted, EventId::NIL).1 > keys[2]);
+}
+
+#[test]
+fn a_full_snapshot_replays_to_the_same_queue_as_the_records_it_replaced() {
+    let mut state = fresh();
+    let mut log = Vec::new();
+    let mut ids = Vec::new();
+    for step in 0..40u64 {
+        state.begin(step * 10);
+        let (outcome, effects) = run(&mut state, A, Call::RegisterClaimable(Envelope::claimable("work", "do", Bytes::from_static(b"p"))));
+        log.extend(effects.records);
+        let Reply::Registered { id, .. } = outcome else { panic!("{outcome:?}") };
+        ids.push(id);
+        if step % 3 == 0 {
+            let (_, effects) = run(&mut state, A, Call::Claim { id, worker: 1, lease_ms: 15 });
+            log.extend(effects.records);
+        }
+        if step % 5 == 0 {
+            let (_, effects) = run(&mut state, A, Call::Delete { id: ids[step as usize / 2], result: "out".into(), tag: id, key: None });
+            log.extend(effects.records);
+        }
+    }
+    let mut replayed = State::new(&EngineConfig::default(), Box::new(V7));
+    replayed.recover(std::iter::once(Record::Generation(state.generation)).chain(log).collect()).unwrap();
+    let mut folded = State::new(&EngineConfig::default(), Box::new(V7));
+    folded.recover(state.snapshot()).unwrap();
+    let view = |state: &State| state.queue.iter().map(|(key, event)| (*key, event.retry, event.payload.clone())).collect::<Vec<_>>();
+    assert_eq!(view(&replayed), view(&folded));
+}
+
+#[test]
+fn one_off_reply_channels_leave_nothing_behind() {
+    let mut state = fresh();
+    for index in 0..5000 {
+        let channel = format!("reply.{index}");
+        let _ = reply(&mut state, B, Call::Subscribe { channel: channel.as_str().into(), after: None });
+        let (id, _) = match reply(&mut state, A, Call::RegisterClaimable(Envelope::claimable(channel.as_str(), "t", Bytes::new()))) {
+            Reply::Registered { id, key } => (id, key),
+            other => panic!("{other:?}"),
+        };
+        let event = claim(&mut state, A, id, 100).unwrap();
+        complete(&mut state, A, id, token(&event), Vec::new());
+        let _ = reply(&mut state, B, Call::Unsubscribe { channel: channel.as_str().into() });
+    }
+    assert!(state.waiting.is_empty() && state.subscribers.is_empty());
+    assert!(state.names.len() <= 2 * 8 + 1024, "the dictionary stays bounded: {}", state.names.len());
+}
+
+// ── the reference model ─────────────────────────────────────────────────
+
+/// The lifecycle as the proposal states it, written as plainly as possible,
+/// to compare the state machine against.
+#[derive(Default, Clone)]
+struct Model {
+    events: Vec<Modeled>,
+}
+
+#[derive(Clone)]
+struct Modeled {
+    id: EventId,
+    retry: u16,
+    /// Claim token and deadline while claimed.
+    claim: Option<(ClaimToken, u64)>,
 }
 
 #[derive(Clone, Debug)]
 enum Step {
-    Submit {
-        queue: u8,
-        key: u8,
-        variant: u8,
-    },
-    /// The very same command again: same event id, a new message.
-    Resubmit {
-        pick: u16,
-    },
-    Take {
-        queue: u8,
-        max: u8,
-    },
-    Begin {
-        pick: u16,
-    },
-    Finish {
-        pick: u16,
-        ok: bool,
-    },
-    Release {
-        pick: u16,
-        delay: u8,
-    },
-    Ack {
-        pick: u16,
-    },
-    Nack {
-        pick: u16,
-        delay: u8,
-    },
-    Fact {
-        pick: u16,
-        key: u8,
-        fact: u8,
-        worker: bool,
-    },
-    Progress {
-        pick: u16,
-    },
-    Append {
-        fact: u8,
-        channel: u8,
-        key: u8,
-    },
-    Advance {
-        ms: u16,
-    },
-    Harvest,
-    Compact,
-    /// A crash: everything not yet harvested is lost, and the next
-    /// incarnation starts from the journal.
-    Restart,
+    Register,
+    Claim(usize, u64),
+    Complete(usize, bool),
+    Delete(usize),
+    Advance(u64),
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
-        5 => (0..3u8, 0..5u8, 0..4u8).prop_map(|(queue, key, variant)| Step::Submit { queue, key, variant }),
-        1 => any::<u16>().prop_map(|pick| Step::Resubmit { pick }),
-        5 => (0..3u8, 1..4u8).prop_map(|(queue, max)| Step::Take { queue, max }),
-        5 => any::<u16>().prop_map(|pick| Step::Begin { pick }),
-        3 => (any::<u16>(), any::<bool>()).prop_map(|(pick, ok)| Step::Finish { pick, ok }),
-        2 => (any::<u16>(), 0..3u8).prop_map(|(pick, delay)| Step::Release { pick, delay }),
-        1 => any::<u16>().prop_map(|pick| Step::Ack { pick }),
-        1 => (any::<u16>(), 0..3u8).prop_map(|(pick, delay)| Step::Nack { pick, delay }),
-        2 => (any::<u16>(), 0..4u8, 0..3u8, any::<bool>()).prop_map(|(pick, key, fact, worker)| Step::Fact { pick, key, fact, worker }),
-        1 => any::<u16>().prop_map(|pick| Step::Progress { pick }),
-        1 => (0..3u8, 0..2u8, 0..4u8).prop_map(|(fact, channel, key)| Step::Append { fact, channel, key }),
-        2 => (0..40u16).prop_map(|ms| Step::Advance { ms }),
-        2 => Just(Step::Harvest),
-        1 => Just(Step::Compact),
-        1 => Just(Step::Restart),
+        Just(Step::Register),
+        (0..8usize, 1..50u64).prop_map(|(at, lease)| Step::Claim(at, lease)),
+        (0..8usize, any::<bool>()).prop_map(|(at, stale)| Step::Complete(at, stale)),
+        (0..8usize).prop_map(Step::Delete),
+        (1..40u64).prop_map(Step::Advance),
     ]
 }
 
-/// What the journal is supposed to hold, read out of a state.
-#[derive(Debug, PartialEq)]
-struct Durable {
-    epoch: u64,
-    owed: BTreeMap<(String, u64), String>,
-    dead: BTreeMap<String, Vec<(u64, EventId)>>,
-    executions: BTreeMap<String, String>,
-    events: Vec<(u64, EventId)>,
-}
-
-/// The durable part of `state`. Events at or before `above` are left out:
-/// retention may drop an event from memory after it was written, and a
-/// restart may then show it again. Retention is a memory bound, not a promise
-/// to delete.
-fn durable(state: &State, above: u64) -> Durable {
-    let mut owed = BTreeMap::new();
-    let mut dead = BTreeMap::new();
-    for (name, queue) in &state.queues {
-        if state.persist.transient_queues.contains(name) {
-            continue;
-        }
-        for (id, message) in &queue.messages {
-            owed.insert((name.to_string(), *id), format!("{}:{}", message.command.event_id, message.command.transaction_key));
-        }
-        if !queue.dead.is_empty() {
-            dead.insert(name.to_string(), queue.dead.iter().map(|(id, command)| (*id, command.event_id)).collect());
-        }
-    }
-    let executions = state
-        .executions
-        .iter()
-        .filter(|(_, execution)| State::wanted(&state.persist, execution))
-        .map(|(key, execution)| (key.to_string(), format!("{:?}", (execution.request, execution.fingerprint, execution.attempt, execution.attempts, &execution.done))))
-        .collect();
-    let events = state.order.iter().filter(|event| event.position > above && state.persist.events.wants(event)).map(|event| (event.position, event.event_id)).collect();
-    Durable { epoch: state.epoch, owed, dead, executions, events }
-}
-
-struct Claim {
-    queue: Text,
-    id: u64,
-    command: Arc<Envelope>,
-    attempt: u64,
-}
-
-struct Harness {
-    setup: Setup,
-    state: State,
-    journal: Vec<Record>,
-    now: u64,
-    /// Messages taken and not yet begun, acknowledged or returned.
-    deliveries: Vec<(Text, u64)>,
-    /// Every claim ever made in this incarnation, superseded ones included,
-    /// so stale attempts keep being exercised.
-    claims: Vec<Claim>,
-    sent: Vec<(Text, Arc<Command>)>,
-}
-
-fn pick(len: usize, pick: u16) -> Option<usize> {
-    (len > 0).then(|| pick as usize % len)
-}
-
-impl Harness {
-    fn new(setup: Setup) -> Self {
-        let mut state = build(&setup);
-        state.open_epoch();
-        let journal = state.harvest();
-        Self { setup, state, journal, now: 1_000_000, deliveries: Vec::new(), claims: Vec::new(), sent: Vec::new() }
-    }
-
-    /// Everything a stale operation must leave alone.
-    fn observe(&self) -> (usize, usize, Durable) {
-        (self.state.order.len(), self.state.unwritten_changes(), durable(&self.state, self.state.drop_through))
-    }
-
-    fn check_replay(&self, what: &str) -> Result<(), TestCaseError> {
-        let replayed = replay(&self.setup, &self.journal, self.now);
-        let above = self.state.drop_through;
-        prop_assert_eq!(durable(&replayed, above), durable(&self.state, above), "replaying the journal after {} does not give back the durable state", what);
-        Ok(())
-    }
-
-    fn run(&mut self, step: &Step) -> Result<(), TestCaseError> {
-        let now = self.now;
-        match *step {
-            Step::Submit { queue, key, variant } => {
-                let payload: &'static str = if variant % 2 == 0 { "{}" } else { "{\"other\":1}" };
-                let mut command = Command::new("job.run", CHANNELS[(variant / 2) as usize % 2], payload).transaction_key(format!("k{key}"));
-                command.created_at = now;
-                self.state.enqueue(&Text::from(QUEUES[queue as usize]), Arc::new(command));
-            }
-            Step::Resubmit { pick: at } => {
-                if let Some(index) = pick(self.sent.len(), at) {
-                    let (queue, command) = self.sent[index].clone();
-                    self.state.enqueue(&queue, command);
-                }
-            }
-            Step::Take { queue, max } => {
-                let name = Text::from(QUEUES[queue as usize]);
-                let taken = self.state.queues.entry(name.clone()).or_default().take(max as usize, None, now);
-                for delivery in taken {
-                    self.deliveries.push((name.clone(), delivery.id));
-                    self.sent.push((name.clone(), delivery.command));
-                }
-            }
-            Step::Begin { pick: at } => {
-                let Some(index) = pick(self.deliveries.len(), at) else { return Ok(()) };
-                let (queue, id) = self.deliveries.swap_remove(index);
-                let queued = self.state.queues.get(&queue).and_then(|owner| owner.messages.get(&id)).map(|message| message.command.clone());
-                let begin = self.state.begin(&queue, id, now);
-                let still_there = self.state.queues.get(&queue).is_some_and(|owner| owner.messages.contains_key(&id));
-                match begin {
-                    Begin::Gone => prop_assert!(queued.is_none(), "Gone for a message that exists"),
-                    Begin::Claimed { command, attempt, attempts } => {
-                        let queued = queued.expect("claimed a message that does not exist");
-                        prop_assert_eq!(&command.transaction_key, &queued.transaction_key);
-                        prop_assert!(attempts >= 1 && attempts <= self.setup.max_attempts);
-                        prop_assert!(still_there, "a claimed message must stay on its queue until it is finished");
-                        self.claims.push(Claim { queue, id, command, attempt });
-                    }
-                    Begin::Exhausted => {
-                        prop_assert!(!still_there, "an exhausted message must leave the live queue");
-                        prop_assert_eq!(self.state.queues[&queue].dead.back().map(|(dead, _)| *dead), Some(id), "and become the newest dead letter");
-                    }
-                    Begin::Settled | Begin::Conflict => prop_assert!(!still_there, "{:?} must delete the message", begin),
-                    Begin::Duplicate => {}
-                }
-            }
-            Step::Finish { pick: at, ok } => {
-                let Some(index) = pick(self.claims.len(), at) else { return Ok(()) };
-                let claim = self.claims.swap_remove(index);
-                let owned = self.state.owns(&claim.command.transaction_key, claim.attempt);
-                let before = self.observe();
-                let outcome = if ok { Outcome::Ok(Bytes::from_static(b"\"ok\"")) } else { Outcome::Failed(Bytes::from_static(b"no")) };
-                let done = self.state.finish(&claim.command, claim.attempt, outcome, &claim.queue, claim.id, now);
-                prop_assert_eq!(done, owned, "finish succeeds exactly when the attempt owns the execution");
-                if done {
-                    prop_assert!(!self.state.queues[&claim.queue].messages.contains_key(&claim.id), "finishing deletes the message in the same step");
-                } else {
-                    prop_assert_eq!(self.observe(), before, "a superseded finish changed something");
-                }
-            }
-            Step::Release { pick: at, delay } => {
-                let Some(index) = pick(self.claims.len(), at) else { return Ok(()) };
-                let claim = &self.claims[index];
-                let owned = self.state.owns(&claim.command.transaction_key, claim.attempt);
-                let before = self.observe();
-                let released = self.state.release(&claim.command.transaction_key, claim.attempt, &claim.queue, claim.id, [0, 5, 20][delay as usize % 3], now);
-                prop_assert_eq!(released, owned);
-                if !released {
-                    prop_assert_eq!(self.observe(), before, "a superseded release changed something");
-                }
-            }
-            Step::Ack { pick: at } => {
-                if let Some(index) = pick(self.deliveries.len(), at) {
-                    let (queue, id) = self.deliveries.swap_remove(index);
-                    self.state.ack(&queue, id);
-                }
-            }
-            Step::Nack { pick: at, delay } => {
-                if let Some(index) = pick(self.deliveries.len(), at) {
-                    let (queue, id) = self.deliveries.swap_remove(index);
-                    prop_assert!(self.state.nack(&queue, id, [0, 5, 20][delay as usize % 3], now), "a held delivery can always be returned");
-                }
-            }
-            Step::Fact { pick: at, key, fact, worker } => {
-                let Some(index) = pick(self.claims.len(), at) else { return Ok(()) };
-                let audience = if worker { Audience::Worker } else { Audience::Client };
-                let emit = Emit { action: FACTS[fact as usize].into(), payload: Bytes::from_static(b"{}"), kind: Kind::Fact, key: Some(format!("f{key}").into()), audience };
-                self.emit(index, emit)?;
-            }
-            Step::Progress { pick: at } => {
-                let Some(index) = pick(self.claims.len(), at) else { return Ok(()) };
-                let emit = Emit { action: "delta".into(), payload: Bytes::from_static(b"\"x\""), kind: Kind::Progress, key: None, audience: Audience::Client };
-                self.emit(index, emit)?;
-            }
-            Step::Append { fact, channel, key } => {
-                let mut draft = Envelope::draft(Kind::Fact, FACTS[fact as usize], CHANNELS[channel as usize], "{}");
-                draft.event_id = EventId::derive(&[b"appended", &[fact, channel, key]]);
-                self.state.append(draft, now);
-            }
-            Step::Advance { ms } => self.now += ms as u64,
-            Step::Harvest => {
-                // The engine writes only when the state says it is dirty, so
-                // anything a harvest would write must have made it dirty.
-                let dirty = self.state.is_dirty();
-                let records = self.state.harvest();
-                prop_assert!(dirty || records.is_empty(), "{} records were due but the state did not say it was dirty", records.len());
-                // One write states an execution once, in its final state.
-                let mut stated = HashSet::new();
-                for record in &records {
-                    if let Record::Exec { key, .. } = record {
-                        prop_assert!(stated.insert(key.clone()), "execution {} stated twice in one write", key);
-                    }
-                }
-                for record in &records {
-                    if let Record::Event(event) = record {
-                        prop_assert!(event.position > self.state.drop_through, "event at {} was written after retention had dropped it", event.position);
-                    }
-                }
-                self.journal.extend(records);
-                prop_assert!(!self.state.is_dirty(), "a harvest leaves nothing unwritten");
-                self.check_replay("an appended batch")?;
-            }
-            Step::Compact => {
-                // The compaction trigger compares the journal against this
-                // count; it must be what a snapshot actually writes.
-                let estimate = self.state.live_records();
-                self.journal = self.state.snapshot();
-                prop_assert_eq!(self.journal.len() as u64, estimate, "live_records() is not the size of a snapshot");
-                prop_assert!(!self.state.is_dirty(), "a snapshot leaves nothing unwritten");
-                self.check_replay("a snapshot")?;
-            }
-            Step::Restart => {
-                let mut next = replay(&self.setup, &self.journal, now);
-                // What replay staged is what the engine publishes as the
-                // readable log after a restart: it must be exactly the log.
-                let staged: Vec<u64> = next.staged.iter().map(|event| event.position).filter(|position| *position > next.drop_through).collect();
-                let kept: Vec<u64> = next.order.iter().map(|event| event.position).collect();
-                prop_assert_eq!(staged, kept, "the log readers see after a restart is not the replayed log");
-                next.open_epoch();
-                prop_assert!(next.epoch > self.state.epoch, "a new incarnation has a higher epoch");
-                // The engine writes the new epoch before it serves anyone, so
-                // an incarnation that issued positions always has its epoch on
-                // disk. That is what keeps a later one from reusing it.
-                self.journal.extend(next.harvest());
-                self.state = next;
-                self.deliveries.clear();
-                self.claims.clear();
-            }
-        }
-        self.state.staged.clear();
-        self.invariants()
-    }
-
-    fn emit(&mut self, index: usize, emit: Emit) -> Result<(), TestCaseError> {
-        let claim = &self.claims[index];
-        let owned = self.state.owns(&claim.command.transaction_key, claim.attempt);
-        let before = self.observe();
-        let written = self.state.emit(&claim.command.clone(), claim.attempt, emit, self.now);
-        prop_assert_eq!(written, owned, "an emission is recorded exactly when the attempt owns the execution");
-        if !written {
-            prop_assert_eq!(self.observe(), before, "a superseded emission changed something");
-        }
-        Ok(())
-    }
-
-    fn invariants(&self) -> Result<(), TestCaseError> {
-        // Positions only grow, and the log never holds one event twice.
-        let mut seen = HashSet::new();
-        for pair in self.state.order.iter().collect::<Vec<_>>().windows(2) {
-            prop_assert!(pair[0].position < pair[1].position, "positions out of order");
-        }
-        for event in &self.state.order {
-            prop_assert!(seen.insert(event.event_id), "event {} is in the log twice", event.event_id);
-        }
-        let bytes: usize = self.state.order.iter().map(|event| cost(event)).sum();
-        prop_assert_eq!(self.state.bytes, bytes, "the byte count drifted from the events it counts");
-        // The dedup index holds exactly the retained events: no more, or it
-        // grows without bound and refuses facts that are no longer there.
-        prop_assert_eq!(self.state.ids.len(), self.state.order.len(), "the dedup index and the log disagree in size");
-        for event in &self.state.order {
-            prop_assert_eq!(self.state.ids.get(&event.event_id).map(|known| known.position), Some(event.position));
-        }
-
-        // One owner per execution.
-        let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
-        for claim in &self.claims {
-            if self.state.owns(&claim.command.transaction_key, claim.attempt) {
-                *owners.entry(&claim.command.transaction_key).or_default() += 1;
-            }
-        }
-        prop_assert!(owners.values().all(|count| *count == 1), "an execution has two owners: {:?}", owners);
-
-        // A message held without a deadline comes back only when its holder
-        // says so. So it must have a holder: a delivery not yet dealt with, or
-        // an attempt that still owns its execution. Otherwise it is lost to
-        // every consumer until the process restarts.
-        let mut holders: BTreeSet<(Text, u64)> = self.deliveries.iter().cloned().collect();
-        holders.extend(self.claims.iter().filter(|claim| self.state.owns(&claim.command.transaction_key, claim.attempt)).map(|claim| (claim.queue.clone(), claim.id)));
-        for (name, queue) in &self.state.queues {
-            for id in queue.held() {
-                prop_assert!(holders.contains(&(name.clone(), id)), "message {} on {} is held by nobody", id, name);
-            }
-        }
-
-        for execution in self.state.executions.values() {
-            prop_assert!(execution.attempts <= self.setup.max_attempts);
-        }
-
-        // Within a queue, a message id names one thing: a live message or
-        // one dead letter. A restart must not hand out an id still in use.
-        for (name, queue) in &self.state.queues {
-            let mut ids: BTreeSet<u64> = queue.messages.keys().copied().collect();
-            for (id, _) in &queue.dead {
-                prop_assert!(ids.insert(*id), "id {} on {} names two things", id, name);
-            }
-        }
-        Ok(())
-    }
-}
-
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
-
+    /// Random sequences of the methods give the same answers and the same
+    /// queue (order, retry counts, claimed or not) as the reference model.
     #[test]
-    fn the_journal_always_replays_to_the_durable_state(setup in setup(), steps in prop::collection::vec(step(), 1..160)) {
-        let mut harness = Harness::new(setup);
-        for step in &steps {
-            harness.run(step)?;
+    fn the_state_machine_agrees_with_the_reference_model(steps in proptest::collection::vec(step(), 1..80)) {
+        let mut state = fresh();
+        let mut model = Model::default();
+        let mut now = 0u64;
+            let mut known: Vec<EventId> = Vec::new();
+        for step in steps {
+            state.begin(now);
+            match step {
+                Step::Register => {
+                    // The model reclaims first, like the server, then queues.
+                    for event in model.events.iter_mut() {
+                        if event.claim.is_some_and(|(_, deadline)| deadline <= now) {
+                            event.claim = None;
+                            event.retry = event.retry.saturating_add(1);
+                        }
+                    }
+                    let (id, _) = register(&mut state, EventId::NIL);
+                    model.events.push(Modeled { id, retry: 0, claim: None });
+                    // Ids changed by reclaims are read back by work-key order.
+                    for (event, (_, current)) in model.events.iter_mut().zip(state.queue.iter()) {
+                        event.id = current.id;
+                    }
+                    known.push(id);
+                }
+                Step::Claim(at, lease) => {
+                    let Some(&target) = model.events.get(at).map(|event| &event.id) else { continue };
+                    let expected_free = model.events[at].claim.is_none();
+                    let outcome = claim(&mut state, A, target, lease);
+                    prop_assert_eq!(outcome.is_ok(), expected_free);
+                    if let Ok(event) = outcome {
+                        model.events[at].claim = Some((token(&event), now + lease));
+                    }
+                }
+                Step::Complete(at, stale) => {
+                    let Some(event) = model.events.get(at).cloned() else { continue };
+                    let Some((mut claimed, _)) = event.claim else {
+                        prop_assert_eq!(complete(&mut state, A, event.id, ClaimToken::default(), Vec::new()), Reply::Refused(Refusal::NotClaimed));
+                        continue;
+                    };
+                    if stale {
+                        claimed.seq ^= 1;
+                    }
+                    let outcome = complete(&mut state, A, event.id, claimed, Vec::new());
+                    if stale {
+                        prop_assert_eq!(outcome, Reply::Refused(Refusal::StaleToken));
+                    } else {
+                        prop_assert_eq!(outcome, Reply::Completed);
+                        model.events.remove(at);
+                    }
+                }
+                Step::Delete(at) => {
+                    let Some(event) = model.events.get(at).cloned() else { continue };
+                    let outcome = reply(&mut state, A, Call::Delete { id: event.id, result: "out".into(), tag: event.id, key: None });
+                    prop_assert_eq!(outcome, Reply::Deleted { removed: event.claim.is_none() });
+                    if event.claim.is_none() {
+                        model.events.remove(at);
+                    }
+                }
+                Step::Advance(by) => now += by,
+            }
+            let actual: Vec<(EventId, u16, bool)> = state.queue.values().map(|event| (event.id, event.retry, event.claim.is_some())).collect();
+            let expected: Vec<(EventId, u16, bool)> = model.events.iter().map(|event| (event.id, event.retry, event.claim.is_some())).collect();
+            prop_assert_eq!(actual, expected);
+            prop_assert_eq!(state.ids.len(), state.queue.len());
         }
-        harness.run(&Step::Harvest)?;
-        harness.run(&Step::Restart)?;
-        harness.run(&Step::Harvest)?;
+        let _ = known;
     }
-}
-
-// ---------------------------------------------------------------- regressions
-//
-// Each of these was first found by the property above, then pinned here as
-// the smallest sequence that shows it.
-
-fn plain(max_settled: usize) -> Setup {
-    Setup { settled: false, events: 0, transient: false, max_attempts: 3, max_events: 16, settled_window: 0, max_settled, dead_letters: 1 }
-}
-
-fn submit(harness: &mut Harness, key: u8) {
-    harness.run(&Step::Submit { queue: 0, key, variant: 0 }).unwrap();
-}
-
-/// Takes the next message on `a` and begins it.
-fn take_and_begin(harness: &mut Harness) {
-    harness.run(&Step::Take { queue: 0, max: 1 }).unwrap();
-    let last = (harness.deliveries.len() - 1) as u16;
-    harness.run(&Step::Begin { pick: last }).unwrap();
-}
-
-/// The same command submitted twice is two messages carrying one event. The
-/// second must be dropped when it is begun while the first runs — not left
-/// in flight with nobody holding it.
-#[test]
-fn a_second_message_carrying_the_same_event_is_dropped_not_stranded() {
-    let mut harness = Harness::new(plain(10));
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness);
-    assert_eq!(harness.claims.len(), 1);
-    harness.run(&Step::Resubmit { pick: 0 }).unwrap();
-    harness.run(&Step::Take { queue: 0, max: 1 }).unwrap();
-    harness.run(&Step::Begin { pick: 0 }).expect("the duplicate message must not be stranded");
-    assert_eq!(harness.state.queues[&Text::from("a")].messages.len(), 1, "only the message being run is left");
-}
-
-/// An execution forgotten when its dedup window ran out, then started again
-/// under the same key before the next write. The journal must end up saying
-/// the new one exists.
-#[test]
-fn a_key_started_again_after_it_was_forgotten_survives_a_restart() {
-    let mut harness = Harness::new(plain(1));
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness);
-    harness.run(&Step::Harvest).unwrap(); // k0 running, on disk
-    harness.run(&Step::Finish { pick: 0, ok: true }).unwrap();
-    submit(&mut harness, 1);
-    take_and_begin(&mut harness);
-    harness.run(&Step::Finish { pick: 0, ok: true }).unwrap(); // k1 settles, k0's record expires
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness); // k0 again, a new execution
-    harness.run(&Step::Harvest).expect("the restarted execution must be in the journal");
-}
-
-/// A fact retention dropped and that was then recorded again is in the
-/// journal twice. After a restart the log must still hold it once.
-///
-/// Memory is filled with events from a channel that is not journaled, so the
-/// replayed journal has room for both copies.
-#[test]
-fn an_event_recorded_again_after_retention_dropped_it_is_replayed_once() {
-    let mut harness = Harness::new(Setup { events: 2, max_events: 2, ..plain(10) });
-    let kept = |key| Step::Append { fact: 2, channel: 0, key };
-    let unkept = |key| Step::Append { fact: 2, channel: 1, key };
-    harness.run(&kept(0)).unwrap();
-    harness.run(&Step::Harvest).unwrap();
-    harness.run(&unkept(1)).unwrap();
-    harness.run(&unkept(2)).unwrap(); // the kept one is dropped from memory
-    harness.run(&kept(0)).unwrap(); // and recorded again under the same id
-    harness.run(&Step::Harvest).unwrap();
-    harness.run(&Step::Restart).expect("the log must not hold one event twice after a restart");
-    assert_eq!(harness.state.order.len(), 1);
-}
-
-/// After a restart, a new message never takes the id of a dead letter.
-#[test]
-fn a_restart_never_reuses_a_dead_letters_id() {
-    let mut harness = Harness::new(Setup { max_attempts: 1, ..plain(10) });
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness);
-    harness.run(&Step::Release { pick: 0, delay: 0 }).unwrap();
-    take_and_begin(&mut harness); // out of attempts: dead letter
-    assert_eq!(harness.state.queues[&Text::from("a")].dead.len(), 1);
-    harness.run(&Step::Harvest).unwrap();
-    harness.run(&Step::Restart).unwrap();
-    submit(&mut harness, 1); // the invariants check the new id against the dead one
-    let dead = harness.state.queues[&Text::from("a")].dead[0].0;
-    assert!(harness.state.queues[&Text::from("a")].messages.keys().all(|id| *id > dead));
-}
-
-/// Attempt numbers only grow, across restarts too. A handler may hand its
-/// attempt to the outside world as a fencing token.
-#[test]
-fn attempt_numbers_only_grow_across_restarts() {
-    let mut harness = Harness::new(plain(10));
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness);
-    let before = harness.claims[0].attempt;
-    harness.run(&Step::Harvest).unwrap();
-    harness.run(&Step::Restart).unwrap();
-    take_and_begin(&mut harness);
-    assert!(harness.claims[0].attempt > before, "attempt {} after a restart, {before} before", harness.claims[0].attempt);
-}
-
-/// An execution that expired while it was waiting to be written, followed by
-/// a new one under the same key, is stated once in the next write.
-#[test]
-fn a_key_listed_twice_is_stated_once() {
-    let mut harness = Harness::new(plain(1));
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness);
-    harness.run(&Step::Finish { pick: 0, ok: true }).unwrap(); // k0 listed for the next write
-    submit(&mut harness, 1);
-    take_and_begin(&mut harness);
-    harness.run(&Step::Finish { pick: 0, ok: true }).unwrap(); // k0 expires while listed
-    submit(&mut harness, 0);
-    take_and_begin(&mut harness); // a new k0, listed again
-    harness.run(&Step::Harvest).expect("one write states an execution once");
-}
-
-/// After a restart the expiry list can name a key twice: the old settlement
-/// and a newer one. The old entry expiring must not take the newer
-/// settlement with it.
-#[test]
-fn an_old_expiry_entry_does_not_take_a_newer_settlement_with_it() {
-    let mut harness = Harness::new(Setup { settled: true, settled_window: 10, ..plain(10) });
-    let run = |harness: &mut Harness, key| {
-        submit(harness, key);
-        take_and_begin(harness);
-        let last = (harness.claims.len() - 1) as u16;
-        harness.run(&Step::Finish { pick: last, ok: true }).unwrap();
-    };
-    run(&mut harness, 0); // k0 settles at T
-    harness.run(&Step::Harvest).unwrap();
-    harness.run(&Step::Advance { ms: 20 }).unwrap();
-    run(&mut harness, 1); // k0's window has passed: forgotten
-    run(&mut harness, 0); // k0 runs again and settles at T+20
-    harness.run(&Step::Harvest).unwrap();
-    harness.run(&Step::Restart).unwrap(); // replay lists (T, k0) and (T+20, k0)
-    harness.run(&Step::Advance { ms: 5 }).unwrap();
-    run(&mut harness, 2); // (T, k0) expires; k0 settled at T+20 must stay
-
-    submit(&mut harness, 0);
-    harness.run(&Step::Take { queue: 0, max: 1 }).unwrap();
-    let claims = harness.claims.len();
-    let last = (harness.deliveries.len() - 1) as u16;
-    harness.run(&Step::Begin { pick: last }).unwrap();
-    assert_eq!(harness.claims.len(), claims, "k0 settled 5 ms ago, inside its window: answered, not run again");
 }

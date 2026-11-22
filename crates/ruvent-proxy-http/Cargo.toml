@@ -1,0 +1,19 @@
+[package]
+name = "ruvent-proxy-http"
+description = "The HTTP proxy binary: register over POST, subscribe over server-sent events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruvent.workspace = true
+ruvent-client.workspace = true
+ruvent-proxy.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

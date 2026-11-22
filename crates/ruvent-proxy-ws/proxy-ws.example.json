@@ -1,0 +1,31 @@
+{
+  "listen": "0.0.0.0:8400",
+  "upstream": { "address": "127.0.0.1:7400", "token": "proxy-secret-change-me" },
+  "auth": {
+    "mode": "worker",
+    "tokens": [
+      {
+        "token": "dev-token",
+        "user": "dev",
+        "channels": [
+          "chat.*"
+        ]
+      }
+    ],
+    "worker": {
+      "channel": "auth.requests",
+      "type": "authenticate",
+      "reply_channel": "proxy.edge-1.auth",
+      "timeout_ms": 5000
+    }
+  },
+  "channels": [
+    "public.*"
+  ],
+  "user_buffer": 1024,
+  "delegate": true,
+  "reconnect": {
+    "initial_ms": 100,
+    "max_ms": 5000
+  }
+}

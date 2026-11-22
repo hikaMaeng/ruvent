@@ -1,43 +1,34 @@
-//! ruvent — an embedded event-sourcing core.
+//! ruvent — the event server core.
 //!
-//! Two paths with opposite shapes, owned by one single-writer engine:
+//! The server offers seven methods and nothing else: register a claimable
+//! event, register a dispatch event, claim, complete, delete, subscribe,
+//! unsubscribe. Claimable events wait in one queue until a completion report
+//! removes them; dispatch events are handed to the subscribers of their
+//! channel and are gone in the same step. Both use one envelope.
 //!
-//! * **work** travels on leased queues: one message, exactly one consumer at a time;
-//! * **observation** is an append-only log: every interested reader, none of them consuming.
+//! The server does not tell workers, proxies and clients apart: each is a
+//! connection that calls the methods, in-process ([`methods::connect`]) or
+//! over a socket (`ruvent-client`). Retry limits, failure handling and
+//! follow-ups are the workers' logic, not the server's.
 //!
-//! A reaction table joins the two inside the same commit, so recording a fact and
-//! handing out the work that follows from it cannot disagree.
-//!
-//! ## A framework, not a server
-//!
-//! ruvent is a service framework in which the unit of a service is not a
-//! request and its response but an event and the reactions to it. You register
-//! functions against actions with [`App`] and [`Service`]; the queues, the
-//! allow-list and the reaction table are derived from what you registered.
-//! Transports are plugins, and nothing listens on a port unless you add one.
+//! Journaling is not a method. The engine journals the claimable queue so a
+//! restart reloads what was still owed, and optionally collects chosen
+//! channels into operational snapshot files.
 
-pub mod app;
-#[cfg(doctest)]
-mod compile_fail;
 pub mod engine;
 pub mod envelope;
-pub mod gateway;
 pub mod journal;
-#[cfg(feature = "json")]
-pub mod wire;
-pub mod worker;
+pub mod methods;
+pub mod names;
+pub mod snapshot;
 
-pub use app::{App, Module, Service, Started};
-/// Implementing [`Transport`], [`Connection`], [`Journal`], [`Authenticator`] or
-/// [`Handler`] by hand needs this attribute; it is re-exported so a plugin
-/// does not have to pick a matching version of the crate itself.
 pub use async_trait::async_trait;
 pub use bytes::Bytes;
-pub use engine::{Begin, Closed, Compaction, Delivery, Durability, Engine, EngineConfig, Events, From, Outcome, Persist, ReactionTable, Retention, Stats, Subscription};
-#[cfg(feature = "json")]
-pub use envelope::json;
-pub use envelope::{stream_of, Audience, Command, Emit, Envelope, EventId, Kind, Source, Text};
-pub use gateway::{Anonymous, Authenticator, ClientFrame, Connection, Credentials, Gateway, Identity, Open, OwnedSessions, Policy, Proposal, Rejected, ServerFrame, Transport};
+pub use engine::config::{Compaction, Durability, EngineConfig, Grant, Grants, Method};
+pub use engine::ops::{Call, Outbound, Refusal, Reply, SessionId, DELETED, DELETE_FAILED};
+pub use engine::{Closed, Engine, EngineError, Session};
+pub use envelope::{Claim, ClaimToken, Envelope, EventId, Kind, WorkKey};
 pub use journal::{FileJournal, Journal, Record, Recovered, Volatile};
-pub use tokio_util::sync::CancellationToken;
-pub use worker::{Backoff, Context, Failure, Handler, Lost, Running, Worker, WorkerConfig};
+pub use methods::{connect, Backlog, Client, Demux, Inbox, Incoming, Link, Methods};
+pub use names::{Name, Pattern};
+pub use snapshot::SnapshotConfig;

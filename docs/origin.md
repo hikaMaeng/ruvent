@@ -56,39 +56,28 @@ ruvent는 `F:\dev\ndx_business`의 `packages/agent`(TypeScript, PostgreSQL + PGM
 
 ## 대응표
 
+2026-11-23 재구축 이후의 대응이다. 재구축 전의 대응은 git 이력(`061c10a` 이전)에 있다.
+
 | 원본 | ruvent | 달라진 점 |
 | --- | --- | --- |
-| PGMQ `send`/`read`/`delete`/`set_vt`/`archive` | `Engine::submit`/`dequeue`/`ack`·`finish`/`nack`·`release`/(소진 시 자동) | 행 잠금 대신 단일 작성자. 롱폴 대신 엔진 안 주차 |
-| `EventStore.append` | `State::append` | 트랜잭션 7왕복 → 메모리 적용. 기본값에서 디스크 기록 없음 |
-| `ExecutionStore.claim/complete/release` | `State::begin/finish/release` | command append와 소유 획득이 한 연산, complete·result·delete가 한 연산 |
-| `ExecutionStore.renew` + heartbeat 타이머, visibility < lease 이중 시계 | 없음. 스텝 기한 하나 | 같은 프로세스에서는 감독 태스크가 즉시 안다 |
-| `agent_execution_recipient` (같은 키의 재제출이 실행에 합류) | 없음. 재제출은 `Duplicate`로 버림 | 이벤트 하나는 워커 하나 |
-| `TerminalPersistenceError` 재시도 경로 | 없음 | 종결 기록과 삭제가 원자적이라 그 사이가 없다 |
-| `startReactionEnqueue` + 커서 + reconcile sweep + advisory lock 리더 | 리액션 표를 `append` 안에서 적용 | 같은 커밋. 유실 구간이 없어 복구 장치가 없다 |
-| `startEventLogTail` + `pg_notify` + 폴링 폴백 | `Subscription` + `Notify` | 프로세스 내 깨우기 |
-| `EventStreamHub` + `ConnectionMailbox` + `ReplayBuffer` | `Subscription`(당겨 읽기) | 로그가 버퍼. 메일박스·인계 구간 없음 |
-| `event_subscription_cursor` 테이블 | 클라이언트가 든 `position` | 이벤트마다의 커서 `UPDATE` 없음 |
-| `(stream_id, sequence)` 위치 맵 | `position` 숫자 하나 | 커밋이 전역 직렬이라 가능 |
-| `Sequencer` (8192 블록) | 없음 | emit 순서가 곧 커밋 순서 |
-| `createWorkerPool`(thread) / `createInlinePool` | tokio 태스크 / `spawn_blocking` | isolate 비용 없음 |
-| `AbortSignal` | future drop + `CancellationToken` | 취소가 협조가 아니라 구조 |
-| `deterministicEventId` (SHA-256) | `EventId::derive` (xxh3), 진행 이벤트는 위치에서 생성 | 이벤트당 해시 비용. 식별자는 원본과 일치하지 않는다 |
-| 엔벨롭 문자열 필드 (이벤트마다 복사) | `Arc<str>` 공유 | 파생 이벤트가 복사 없이 상속 |
-| `prune` 타이머 (1시간마다) | append·완료 시점에 한도 적용 | 청소 주기가 없다 |
-| `payload.userId` 덮어쓰기 | 엔벨롭 `principal` | payload를 건드리지 않는다 |
-| `createEventBroker` + `createWorkerServer` | `App` + `Service` | 큐·허용 목록·리액션 표가 등록에서 유도된다 |
-| WebSocket 고정 | `Transport` 플러그인 | 프로토콜 선택 가능 |
+| PGMQ `send` / `read` / `delete` / `set_vt` | 메서드 1(착수용 등록) / 6(구독)+3(착수) / 4(완료) / 착수 기한 | 행 잠금 대신 단일 작성자. visibility 대신 착수 블록의 기한, 회수는 다음 등록 때 |
+| `EventStore.append` + 로그 tail + 커서 | 메서드 2(발송용 등록): 그 순간의 구독 접속에 넘기고 끝 | 보존 로그·커서·범위 읽기 없음. 끊긴 접속은 놓친다 |
+| `ExecutionStore.claim/complete/release`, 시도 상한, dead letter | 메서드 3·4, 착수 표지, 재시도 카운트. 상한·실패 처리는 워커(`Service::max_retries`, `failures`) | 서버에 정책이 없다 |
+| 리액션 표(사실 → 큐) | 완료 보고에 실은 후속 이벤트 | 워커가 무엇을 낼지 정한다 |
+| `transaction_key` 멱등·충돌 판정 | 큐에 있는 id 중복 거절(G8), 작업 키(G3) | 완료 뒤의 멱등은 워커가 작업 키로 |
+| 브로커 여러 대(연결·발송 분산) | 프록시(`ruvent-proxy-ws`/`-http`): 채널별 상위 구독 하나 | 서버 연결 수 = 프록시 수 + 워커 서버 수 |
+| 워커 서버(`createWorkerServer`), 인라인/스레드 풀 | `ruvent-client` `App`·`Service`·실행기. 내장도 원격도 같은 메서드 | 허가는 핸들러가 끝나면 반환 |
+| heartbeat·이중 리스 | 착수 기한 하나(워커가 기간으로 정함) | 기한 연장 없음. 긴 일은 실행기 이벤트로 |
+| `event_store` 영구 이력 | 운영 스냅샷(고른 채널, 별도 파일) | 재생하지 않는다 |
+| 게이트웨이 인증 훅 | 서비스 자격(서버), 최종 사용자 인증은 프록시(none / static / worker) | 프록시에 사용자 코드가 없다 |
+| 엔벨롭 문자열 필드 18개 | 단일 이진 엔벨롭(고정 머리 27바이트) | 이름은 번호표로, 착수 정보는 작은 숫자 몇 개 |
 
 ## 원본에 있고 여기 없는 것
 
-* 저장소 하나 앞에 브로커 여러 대를 두어 클라이언트 연결·발송을 나누는 구성(팬아웃 분산). ruvent에서는
-  엔진(저장소)과 게이트웨이(발송)가 한 프로세스에 있다. 발송은 연결마다 tokio 태스크로 여러 코어에
-  퍼지지만, 장비 한 대를 넘지는 못한다.
-* 워커를 별도 프로세스로 흩는 확장. 실행 소유권에 기한이 없어서, 원격 워커가 죽으면 재시작 전까지 묶인다.
-* 영구 이벤트 이력(`event_store` 30일 보존). 여기서 로그는 한정된 버퍼다.
+* 영구 이벤트 이력(`event_store` 30일 보존)과 범위 읽기. 운영 스냅샷은 기록일 뿐 재생 경로가 아니다.
+* 끊긴 클라이언트의 재접속 재전송(Q8). 프록시의 사용자별 재접속 버퍼도 아직 없다.
 * 같은 트랜잭션의 여러 제출자에게 각각 결과를 돌려주는 것.
-* PostgreSQL의 복제·시점 복구·운영 도구.
-* 계정 서비스 연동(`createSessionVerifier`). `Authenticator`를 구현해 붙인다.
+* PostgreSQL의 복제·시점 복구·운영 도구. 서버는 단일 프로세스·단일 저널이다.
 * HTTP 백엔드(`/api/auth/*`, 정적 번들). 프레임워크의 일이 아니다.
 
 ## 원본에서 발견한 문서·코드 불일치

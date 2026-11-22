@@ -1,75 +1,59 @@
-//! The fixed envelope contract. Independent of any payload: the engine routes,
-//! orders and deduplicates on these fields and never looks inside `payload`.
+//! The one event envelope.
 //!
-//! Text fields are shared (`Arc<str>`). An event derived from another — a
-//! result from its command, a reaction from its fact — inherits the stream,
-//! the channel, the session and the rest by bumping reference counts, not by
-//! copying strings. With events issued and consumed in bulk, that is the
-//! difference between a handful of atomic increments per event and a handful
-//! of heap allocations.
+//! Claimable and dispatch events share one layout and differ only in the kind
+//! bit of `flags`. Marking a claim fills the claim block of the same envelope,
+//! in place, in the engine's resident copy. See
+//! `docs/proposals/event-server-redesign.md` §6.0.
+//!
+//! ```text
+//!  fixed head, 27 bytes (every event)
+//!  ┌──────────── id 16 ────────────┬─ channel 4 ─┬── type 4 ──┬flags 1┬retry 2┐
+//!  work key, 8 bytes (claimable, when the server sends it)
+//!  ┌──── generation 4 · arrival 4 ────┐
+//!  claim block, 24 bytes (claimed, sent to the claimer)
+//!  ┌──── token 8 ────┬ claimer 4 ┬ worker 4 ┬──── deadline 8 ────┐
+//!  optional fields (only those whose flag bit is set)
+//!  reply 4 · correlation 16 · principal 4 · delegate 4
+//!  payload: length 4 + bytes
+//! ```
+//!
+//! The byte layout is [`codec`]. Which of these blocks a record carries is
+//! fixed by the record kind, [`codec::Layout`].
 
+pub mod codec;
+
+use crate::names::Name;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3;
+use std::str::FromStr;
 
-/// Shared, immutable text.
-pub type Text = Arc<str>;
-
-/// 128-bit event identity, printed in UUID shape.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct EventId([u8; 16]);
+/// A 16-byte event id in RFC 9562 octet order. All zero means "the server assigns one".
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct EventId(pub [u8; 16]);
 
 impl EventId {
-    pub fn random() -> Self {
-        Self(*uuid::Uuid::new_v4().as_bytes())
+    pub const NIL: EventId = EventId([0; 16]);
+
+    /// A fresh UUIDv7: 48 bits of milliseconds since the Unix epoch, then random bits.
+    pub fn new_v7() -> Self {
+        EventId(uuid::Uuid::now_v7().into_bytes())
     }
 
-    /// Stable identity for something that may be produced more than once.
-    ///
-    /// Under at-least-once delivery the same logical event is derived again on
-    /// every retry; deriving its id from its meaning makes the retries collapse
-    /// into one. The parts are hashed length-delimited, so `["ab", "c"]` and
-    /// `["a", "bc"]` are different identities.
-    pub fn derive(parts: &[&[u8]]) -> Self {
-        let mut hasher = Xxh3::new();
-        for part in parts {
-            hasher.update(&(part.len() as u32).to_le_bytes());
-            hasher.update(part);
-        }
-        let mut bytes = hasher.digest128().to_be_bytes();
-        bytes[6] = (bytes[6] & 0x0f) | 0x80;
-        Self(bytes)
+    pub fn is_nil(&self) -> bool {
+        self.0 == [0; 16]
     }
 
-    /// The identity of the work a fact causes on one reactor's queue. Unique
-    /// per (queue, fact) and identical on a repeat.
-    pub fn reaction(queue: &str, fact: EventId) -> Self {
-        Self::derive(&[b"react", queue.as_bytes(), &fact.0])
-    }
-
-    /// An identity for an event that has no meaning to derive one from. Its
-    /// position in the log is already unique for ever, so no hashing is needed.
-    pub(crate) fn positional(position: u64) -> Self {
-        let mut bytes = [0u8; 16];
-        bytes[6] = 0x70;
-        bytes[8..].copy_from_slice(&position.to_be_bytes());
-        Self(bytes)
-    }
-
-    pub fn parse(text: &str) -> Option<Self> {
-        uuid::Uuid::parse_str(text).ok().map(|id| Self(*id.as_bytes()))
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
+    /// Whether this is a well-formed UUID: version 1 to 8, RFC 9562 variant.
+    pub fn is_uuid(&self) -> bool {
+        let version = self.0[6] >> 4;
+        let variant = self.0[8] >> 6;
+        (1..=8).contains(&version) && variant == 0b10
     }
 }
 
 impl fmt::Display for EventId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        uuid::Uuid::from_bytes(self.0).hyphenated().fmt(f)
+        fmt::Display::fmt(&uuid::Uuid::from_bytes(self.0).hyphenated(), f)
     }
 }
 
@@ -79,252 +63,170 @@ impl fmt::Debug for EventId {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+impl FromStr for EventId {
+    type Err = uuid::Error;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Ok(EventId(uuid::Uuid::parse_str(text)?.into_bytes()))
+    }
+}
+
+/// What the server assigns to each registration: `(generation, arrival)`.
+///
+/// It survives reclaims and restarts, a new registration under a reused id
+/// gets a new one, and the waiting order of the claimable queue is its
+/// numeric order. Field order matters: the derived ordering compares the
+/// generation first.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+pub struct WorkKey {
+    pub generation: u32,
+    pub arrival: u32,
+}
+
+/// Issued fresh at every claim and compared at completion: `(generation, sequence)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+pub struct ClaimToken {
+    pub generation: u32,
+    pub seq: u32,
+}
+
+/// The claim block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Claim {
+    pub token: ClaimToken,
+    /// Attribution number: names the `(service credential, connection)` the
+    /// claim was made under. Never reused within a generation.
+    pub claimer: u32,
+    /// Whatever the claimer tagged itself with. The server stores it and never reads it.
+    pub worker: u32,
+    /// Milliseconds on the server's monotonic clock.
+    pub deadline: u64,
+}
+
+/// What happens to an event: one worker claims it, or it is sent to every subscriber.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
-    Command,
-    Fact,
-    Result,
-    Progress,
-    Failure,
-    Control,
+    /// Waits in the claimable queue until a completion report removes it.
+    Claimable,
+    /// Handed to the channel's subscribers and gone in the same step.
+    Dispatch,
 }
 
-impl Kind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Kind::Command => "command",
-            Kind::Fact => "fact",
-            Kind::Result => "result",
-            Kind::Progress => "progress",
-            Kind::Failure => "failure",
-            Kind::Control => "control",
-        }
-    }
-}
-
-/// Who an event is for. `Worker` events are never indexed for client reads at
-/// all — not filtered late at a socket, simply absent from every channel log.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-pub enum Audience {
-    #[default]
-    Client,
-    Worker,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum Source {
-    Client,
-    Server,
-    Worker,
-    Scheduler,
-}
-
-impl Source {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Source::Client => "client",
-            Source::Server => "server",
-            Source::Worker => "worker",
-            Source::Scheduler => "scheduler",
-        }
-    }
-}
-
-/// Canonical stream identity: a session's stream when there is a session,
-/// otherwise the channel's.
-pub fn stream_of(session_id: Option<&str>, channel: &str) -> Text {
-    match session_id {
-        Some(session) if !session.is_empty() => format!("session:{session}").into(),
-        _ => format!("channel:{channel}").into(),
-    }
-}
-
-/// A unit of work waiting on a queue. One command is taken by one worker; work
-/// for two workers is two commands.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Command {
-    pub event_id: EventId,
-    pub created_at: u64,
-    pub action: Text,
-    /// The idempotency unit. Two commands with the same key are the same
-    /// event sent twice, and it runs once.
-    pub transaction_key: Text,
-    pub channel: Text,
-    pub audience: Audience,
-    pub reply_channel: Option<Text>,
-    pub session_id: Option<Text>,
-    pub run_id: Option<Text>,
-    pub turn_id: Option<Text>,
-    pub correlation_id: Option<Text>,
-    /// Verified identity stamped by the gateway. Never taken from the wire.
-    pub principal: Option<Text>,
-    pub payload: Bytes,
-}
-
-impl Command {
-    pub fn new(action: impl Into<Text>, channel: impl Into<Text>, payload: impl Into<Bytes>) -> Self {
-        let event_id = EventId::random();
-        Self {
-            event_id,
-            created_at: 0,
-            action: action.into(),
-            transaction_key: event_id.to_string().into(),
-            channel: channel.into(),
-            audience: Audience::Client,
-            reply_channel: None,
-            session_id: None,
-            run_id: None,
-            turn_id: None,
-            correlation_id: None,
-            principal: None,
-            payload: payload.into(),
-        }
-    }
-
-    pub fn transaction_key(mut self, key: impl Into<Text>) -> Self {
-        self.transaction_key = key.into();
-        self
-    }
-
-    pub fn session(mut self, session_id: impl Into<Text>) -> Self {
-        self.session_id = Some(session_id.into());
-        self
-    }
-
-    pub fn reply_to(mut self, channel: impl Into<Text>) -> Self {
-        self.reply_channel = Some(channel.into());
-        self
-    }
-}
-
-/// An event with its place in the log.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One event. Cloning copies the head and shares the names and the payload.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Envelope {
-    pub event_id: EventId,
+    pub id: EventId,
+    pub channel: Name,
+    /// The event's type, called `type` in the layout.
+    pub event_type: Name,
     pub kind: Kind,
-    pub stream: Text,
-    /// Position in the whole log, assigned by the engine. Commit order is
-    /// total, so this orders events within a stream, within a channel and
-    /// across all of them, and is the cursor a reader resumes from. Positions
-    /// only ever increase, across restarts too; they are not contiguous.
-    pub position: u64,
-    pub action: Text,
-    pub transaction_key: Text,
-    pub channel: Text,
-    pub reply_channel: Option<Text>,
-    pub session_id: Option<Text>,
-    pub run_id: Option<Text>,
-    pub turn_id: Option<Text>,
-    pub causation: Option<EventId>,
-    pub correlation_id: Text,
-    pub principal: Option<Text>,
-    pub source: Source,
-    pub audience: Audience,
-    pub created_at: u64,
+    /// Times this event was reclaimed after a missed deadline. Saturates at
+    /// 65,535, which then means "65,535 or more".
+    pub retry: u16,
+    /// Set by the server on claimable events.
+    pub key: Option<WorkKey>,
+    /// Set while claimed.
+    pub claim: Option<Claim>,
+    /// Channel for the result.
+    pub reply: Option<Name>,
+    /// Ties one flow together.
+    pub correlation: Option<EventId>,
+    /// The registering connection's service credential. Set by the server only.
+    pub principal: Option<Name>,
+    /// The end user a proxy registered this on behalf of.
+    pub delegate: Option<Name>,
     pub payload: Bytes,
 }
 
 impl Envelope {
-    /// A standalone draft. `position` is assigned on append.
-    pub fn draft(kind: Kind, action: impl Into<Text>, channel: impl Into<Text>, payload: impl Into<Bytes>) -> Self {
-        let event_id = EventId::random();
-        let channel = channel.into();
-        let key: Text = event_id.to_string().into();
-        Self {
-            event_id,
+    fn draft(kind: Kind, channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> Self {
+        Envelope {
+            id: EventId::NIL,
+            channel: channel.into(),
+            event_type: event_type.into(),
             kind,
-            stream: stream_of(None, &channel),
-            position: 0,
-            action: action.into(),
-            transaction_key: key.clone(),
-            channel,
-            reply_channel: None,
-            session_id: None,
-            run_id: None,
-            turn_id: None,
-            causation: None,
-            correlation_id: key,
+            retry: 0,
+            key: None,
+            claim: None,
+            reply: None,
+            correlation: None,
             principal: None,
-            source: Source::Server,
-            audience: Audience::Client,
-            created_at: 0,
+            delegate: None,
             payload: payload.into(),
         }
     }
 
-    /// The command event a queued command becomes when work on it begins.
-    pub fn from_command(command: &Command) -> Self {
-        Self {
-            event_id: command.event_id,
-            kind: Kind::Command,
-            stream: stream_of(command.session_id.as_deref(), &command.channel),
-            position: 0,
-            action: command.action.clone(),
-            transaction_key: command.transaction_key.clone(),
-            channel: command.channel.clone(),
-            reply_channel: command.reply_channel.clone(),
-            session_id: command.session_id.clone(),
-            run_id: command.run_id.clone(),
-            turn_id: command.turn_id.clone(),
-            causation: None,
-            correlation_id: command.correlation_id.clone().unwrap_or_else(|| command.transaction_key.clone()),
-            principal: command.principal.clone(),
-            source: Source::Client,
-            audience: command.audience,
-            created_at: command.created_at,
-            payload: command.payload.clone(),
+    /// A claimable event to register; the server assigns the id unless [`Envelope::with_id`] sets one.
+    pub fn claimable(channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> Self {
+        Self::draft(Kind::Claimable, channel, event_type, payload)
+    }
+
+    /// A dispatch event to register.
+    pub fn dispatch(channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> Self {
+        Self::draft(Kind::Dispatch, channel, event_type, payload)
+    }
+
+    pub fn with_id(mut self, id: EventId) -> Self {
+        self.id = id;
+        self
+    }
+
+    pub fn with_reply(mut self, channel: impl Into<Name>) -> Self {
+        self.reply = Some(channel.into());
+        self
+    }
+
+    pub fn with_correlation(mut self, correlation: EventId) -> Self {
+        self.correlation = Some(correlation);
+        self
+    }
+
+    pub fn with_delegate(mut self, user: impl Into<Name>) -> Self {
+        self.delegate = Some(user.into());
+        self
+    }
+
+    pub fn is_claimed(&self) -> bool {
+        self.claim.is_some()
+    }
+
+    /// The `flags` byte this envelope encodes with, before a layout masks it.
+    pub fn flags(&self) -> u8 {
+        let mut flags = 0;
+        if self.kind == Kind::Dispatch {
+            flags |= codec::KIND;
         }
-    }
-
-    /// A follow-up that stays in the cause's stream and lands on its reply
-    /// channel, inheriting session, run, turn and correlation identity. Every
-    /// inherited field is a shared reference; nothing is copied.
-    pub fn follow(cause: &Envelope, event_id: EventId, kind: Kind, action: Text, payload: Bytes, now: u64) -> Self {
-        Self {
-            event_id,
-            kind,
-            stream: cause.stream.clone(),
-            position: 0,
-            action,
-            transaction_key: cause.transaction_key.clone(),
-            channel: cause.reply_channel.clone().unwrap_or_else(|| cause.channel.clone()),
-            reply_channel: cause.reply_channel.clone(),
-            session_id: cause.session_id.clone(),
-            run_id: cause.run_id.clone(),
-            turn_id: cause.turn_id.clone(),
-            causation: Some(cause.event_id),
-            correlation_id: cause.correlation_id.clone(),
-            principal: cause.principal.clone(),
-            source: Source::Worker,
-            audience: Audience::Client,
-            created_at: now,
-            payload,
+        if self.claim.is_some() {
+            flags |= codec::CLAIMED;
         }
+        if self.reply.is_some() {
+            flags |= codec::REPLY;
+        }
+        if self.correlation.is_some() {
+            flags |= codec::CORRELATION;
+        }
+        if self.principal.is_some() {
+            flags |= codec::PRINCIPAL;
+        }
+        if self.delegate.is_some() {
+            flags |= codec::DELEGATE;
+        }
+        flags
+    }
+
+    /// Every name this envelope carries in `layout`, in encoding order.
+    pub fn names(&self, layout: codec::Layout) -> impl Iterator<Item = &Name> {
+        let optional = layout.has_optional();
+        [Some(&self.channel), Some(&self.event_type)]
+            .into_iter()
+            .chain([self.reply.as_ref(), self.principal.as_ref(), self.delegate.as_ref()].into_iter().map(move |name| if optional { name } else { None }))
+            .flatten()
+    }
+
+    /// The same event as a notice: the head and the work key, nothing else.
+    pub fn notice(&self) -> Envelope {
+        Envelope { claim: None, reply: None, correlation: None, principal: None, delegate: None, payload: Bytes::new(), ..self.clone() }
     }
 }
 
-#[cfg(feature = "json")]
-impl Envelope {
-    /// Reads the payload as JSON. The engine never does this; a handler may.
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_slice(&self.payload)
-    }
-}
-
-/// Serializes a value as a JSON payload.
-#[cfg(feature = "json")]
-pub fn json<T: Serialize>(value: &T) -> Bytes {
-    Bytes::from(serde_json::to_vec(value).expect("payload types serialize without failing"))
-}
-
-/// What a handler says while it runs.
-#[derive(Clone, Debug)]
-pub struct Emit {
-    pub action: Text,
-    pub payload: Bytes,
-    pub kind: Kind,
-    /// What makes this the same event on a re-run. Facts have one; a burst of
-    /// streamed deltas does not and is fenced by ownership instead.
-    pub key: Option<Text>,
-    pub audience: Audience,
-}
+#[cfg(test)]
+mod tests;

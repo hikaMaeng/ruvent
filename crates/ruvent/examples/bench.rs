@@ -1,143 +1,99 @@
-//! Two measurements.
+//! Throughput of the lifecycle through the in-process client, and the cost of
+//! one envelope.
 //!
-//! **round trip** — one command through the engine by hand:
+//! ```text
+//! cargo run --release -p ruvent --example bench
+//! ```
 //!
-//!   submit -> dequeue -> begin (record command + take ownership) -> finish (result event + delete)
+//! What is measured, exactly:
 //!
-//! Four engine operations; what the TypeScript original spends about nineteen
-//! PostgreSQL round trips on.
-//!
-//! **chain** — the framework doing it: a client command handled by one
-//! service, whose fact is reacted to by a second, whose fact is reacted to by
-//! a third. Three executions, three facts, three results and one command
-//! event per submission, through the real worker runtime.
-//!
-//!   cargo run --release --example bench -- [commands] [concurrency]
+//! * `cycles/s` — completed lifecycles per second: register a claimable event,
+//!   claim it, complete it, each call waiting for its answer, from `workers`
+//!   concurrent tasks. The numerator counts completions that returned `Ok`.
+//! * `encode ns` — nanoseconds to encode one envelope body in the given
+//!   layout (names already numbered), averaged over a loop. No framing.
+//! * `bytes` — the encoded size of that body with a 16-byte payload.
 
-// A measurement program reports on the terminal; the library never does.
 #![allow(clippy::print_stdout)]
 
-use ruvent::{App, Audience, Begin, Bytes, Command, Context, Durability, Engine, EngineConfig, Envelope, Failure, From, Identity, Outcome, Proposal, Service};
-use std::sync::Arc;
+use ruvent::envelope::codec::{self, Layout};
+use ruvent::{connect, Bytes, Claim, ClaimToken, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Methods, WorkKey};
 use std::time::{Duration, Instant};
 
-fn scratch(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("ruvent-bench-{}-{name}.journal", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    path
-}
+const WORKERS: usize = 64;
 
-fn report(label: &str, what: &str, done: usize, concurrency: usize, applied: Duration, durable: Duration, engine: &Engine) {
-    let stats = engine.stats();
-    println!(
-        "{label:<34} {what}={done:>8} concurrency={concurrency:>4} done_in={:>8.1}ms per_sec={:>9.0} on_disk_in={:>8.1}ms events={} journal_records={} journal_writes={} compactions={} engine_wakeups={}",
-        applied.as_secs_f64() * 1e3,
-        done as f64 / applied.as_secs_f64(),
-        durable.as_secs_f64() * 1e3,
-        stats.events,
-        stats.journal_records,
-        stats.journal_writes,
-        stats.compactions,
-        stats.wakeups,
-    );
-}
-
-async fn round_trip(label: &str, engine: Engine, commands: usize, concurrency: usize) {
-    let payload = Bytes::from(vec![b'x'; 256]);
+async fn lifecycles(engine: &Engine, total: usize) -> (usize, Duration) {
     let started = Instant::now();
     let mut tasks = Vec::new();
-    for task in 0..concurrency {
-        let (engine, payload) = (engine.clone(), payload.clone());
+    for _ in 0..WORKERS {
+        let (client, _) = connect(engine, "bench", 1024).await.expect("connect");
+        let share = total / WORKERS;
         tasks.push(tokio::spawn(async move {
-            let (queue, reply): (ruvent::Text, ruvent::Text) = ("q".into(), format!("reply-{task}").into());
-            for index in 0..commands / concurrency {
-                let command = Command::new("job.run", "requests", payload.clone()).transaction_key(format!("t{task}-{index}")).reply_to(reply.clone());
-                engine.submit(queue.clone(), command).await.unwrap();
-                let delivery = engine.dequeue(queue.clone(), 1, None, None).await.unwrap().remove(0);
-                let Begin::Claimed { command, attempt, .. } = engine.begin(queue.clone(), delivery.id).await.unwrap() else { panic!("unclaimed") };
-                engine.finish(command, attempt, Outcome::Ok(payload.clone()), queue.clone(), delivery.id).await.unwrap();
+            let mut done = 0;
+            for _ in 0..share {
+                let (id, _) = client.register_claimable(Envelope::claimable("work", "do", Bytes::from_static(&[0; 16]))).await.expect("register");
+                let claimed = client.claim(id, 1, Duration::from_secs(60)).await.expect("claim");
+                if client.complete(id, claimed.claim.expect("claimed").token, Vec::new()).await.is_ok() {
+                    done += 1;
+                }
             }
+            done
         }));
     }
+    let mut done = 0;
     for task in tasks {
-        task.await.unwrap();
+        done += task.await.expect("task");
     }
-    let applied = started.elapsed();
-    engine.flush().await.unwrap();
-    report(label, "round_trips", commands / concurrency * concurrency, concurrency, applied, started.elapsed(), &engine);
-    engine.shutdown().await.unwrap();
+    (done, started.elapsed())
 }
 
-async fn first(cx: Context, command: Arc<Envelope>) -> Result<Bytes, Failure> {
-    cx.fact(format!("first:{}", command.transaction_key), "first.done", command.payload.clone(), Audience::Worker).await?;
-    Ok(Bytes::new())
-}
-
-async fn second(cx: Context, command: Arc<Envelope>) -> Result<Bytes, Failure> {
-    cx.fact(format!("second:{}", command.correlation_id), "second.done", command.payload.clone(), Audience::Worker).await?;
-    Ok(Bytes::new())
-}
-
-async fn third(cx: Context, command: Arc<Envelope>) -> Result<Bytes, Failure> {
-    cx.fact(format!("third:{}", command.correlation_id), "chain.done", command.payload.clone(), Audience::Client).await?;
-    Ok(Bytes::new())
-}
-
-async fn chain(label: &str, app: App, commands: usize, concurrency: usize) {
-    let app = app
-        .service(Service::new("first").accept("chain.run", first).max_in_flight(concurrency))
-        .service(Service::new("second").on("first.done", second).max_in_flight(concurrency))
-        .service(Service::new("third").on("second.done", third).max_in_flight(concurrency))
-        .start()
-        .await
-        .unwrap();
-    let mut done = app.engine().subscribe(vec!["done".to_owned()], From::Now);
-    let payload = Bytes::from(vec![b'x'; 256]);
-    let identity = Identity { user: "bench".to_owned() };
-
+fn encode_cost(event: &Envelope, layout: Layout) -> (usize, f64) {
+    let rounds = 200_000;
+    let mut out = Vec::with_capacity(256);
     let started = Instant::now();
-    let mut tasks = Vec::new();
-    for task in 0..concurrency {
-        let (gateway, payload, identity) = (app.gateway().clone(), payload.clone(), identity.clone());
-        tasks.push(tokio::spawn(async move {
-            for index in 0..commands / concurrency {
-                let proposal = Proposal {
-                    action: "chain.run".into(),
-                    payload: payload.clone(),
-                    transaction_key: Some(format!("c{task}-{index}").into()),
-                    reply_channel: Some("done".into()),
-                    ..Proposal::default()
-                };
-                gateway.submit(&identity, proposal).await.unwrap();
-            }
-        }));
+    for _ in 0..rounds {
+        out.clear();
+        codec::encode(event, layout, &mut |_| 1, &mut out).expect("encodes");
     }
-    let total = commands / concurrency * concurrency;
-    let mut finished = 0;
-    while finished < total {
-        finished += done.next(4096).await.iter().filter(|event| &*event.action == "chain.done").count();
-    }
-    for task in tasks {
-        task.await.unwrap();
-    }
-    let applied = started.elapsed();
-    app.engine().flush().await.unwrap();
-    report(label, "chains", total, concurrency, applied, started.elapsed(), app.engine());
-    app.shutdown().await.unwrap();
+    (out.len(), started.elapsed().as_nanos() as f64 / f64::from(rounds))
 }
 
 #[tokio::main]
 async fn main() {
-    let mut args = std::env::args().skip(1);
-    let commands: usize = args.next().and_then(|value| value.parse().ok()).unwrap_or(200_000);
-    let concurrency: usize = args.next().and_then(|value| value.parse().ok()).unwrap_or(256);
-    let strict = || EngineConfig { durability: Durability::Strict, ..EngineConfig::default() };
+    let directory = std::env::temp_dir().join(format!("ruvent-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("scratch");
 
-    round_trip("round trip, no journal", Engine::volatile(EngineConfig::default()), commands, concurrency).await;
-    round_trip("round trip, file, window 100ms", Engine::open(scratch("rt-scheduled"), EngineConfig::default()).await.unwrap(), commands, concurrency).await;
-    round_trip("round trip, file, strict", Engine::open(scratch("rt-strict"), strict()).await.unwrap(), commands / 10, concurrency).await;
+    println!("workers={WORKERS} payload=16B");
+    let volatile = Engine::volatile(EngineConfig::default()).await;
+    let (done, took) = lifecycles(&volatile, 200_000).await;
+    println!("mode=volatile cycles={done} seconds={:.3} cycles/s={:.0}", took.as_secs_f64(), done as f64 / took.as_secs_f64());
+    volatile.shutdown().await.expect("shutdown");
 
-    chain("chain of 3, no journal", App::volatile(), commands, concurrency).await;
-    chain("chain of 3, file, window 100ms", App::open(scratch("chain-scheduled")), commands, concurrency).await;
-    chain("chain of 3, file, strict", App::open(scratch("chain-strict")).durability(Durability::Strict), commands / 10, concurrency).await;
+    for (name, durability, total) in [("file-scheduled", Durability::Scheduled, 200_000), ("file-strict", Durability::Strict, 20_000)] {
+        let (journal, recovered) = FileJournal::open(directory.join(format!("{name}.journal"))).expect("journal");
+        let engine = Engine::start(EngineConfig { durability, ..EngineConfig::default() }, journal, recovered).await.expect("start");
+        let (done, took) = lifecycles(&engine, total).await;
+        println!("mode={name} cycles={done} seconds={:.3} cycles/s={:.0}", took.as_secs_f64(), done as f64 / took.as_secs_f64());
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    let key = WorkKey { generation: 1, arrival: 1 };
+    let claim = Claim { token: ClaimToken { generation: 1, seq: 1 }, claimer: 1, worker: 1, deadline: 30_000 };
+    let payload = Bytes::from_static(&[0; 16]);
+    let dispatch = Envelope::dispatch("feed", "news", payload.clone()).with_id(EventId::new_v7());
+    let waiting = Envelope { key: Some(key), ..Envelope::claimable("work", "do", payload.clone()).with_id(EventId::new_v7()) };
+    let claimed = Envelope { claim: Some(claim), ..waiting.clone() };
+    for (label, event, layout) in
+        [("dispatch/delivery", &dispatch, Layout::Delivery), ("waiting/journal", &waiting, Layout::Journal), ("claimed/claim-answer", &claimed, Layout::Claimed), ("notice", &waiting, Layout::Notice)]
+    {
+        let (bytes, nanos) = encode_cost(event, layout);
+        println!("envelope={label} bytes={bytes} encode_ns={nanos:.1}");
+    }
+    let started = Instant::now();
+    for _ in 0..1_000_000 {
+        std::hint::black_box(EventId::new_v7());
+    }
+    println!("uuidv7 ns={:.1}", started.elapsed().as_nanos() as f64 / 1_000_000.0);
+    let _ = std::fs::remove_dir_all(&directory);
 }

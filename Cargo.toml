@@ -9,21 +9,21 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 ruvent = { path = "crates/ruvent" }
+ruvent-protocol = { path = "crates/ruvent-protocol" }
+ruvent-client = { path = "crates/ruvent-client" }
+ruvent-proxy = { path = "crates/ruvent-proxy" }
 async-trait = "0.1"
-bincode = "1.3"
-bytes = { version = "1", features = ["serde"] }
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
 crc32fast = "1"
+futures-util = "0.3"
 parking_lot = "0.12"
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
-tokio-util = "0.7"
-uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal", "fs"] }
+uuid = { version = "1", features = ["v7"] }
 # Test-only.
 proptest = "1"
-quote = "1"
-syn = { version = "2", features = ["full"] }
 
 # Decided once, for every crate. `cargo xtask verify` turns warnings into errors,
 # so anything listed here as "warn" is a gate too.

@@ -1,0 +1,30 @@
+{
+  "listen": "127.0.0.1:7400",
+  "journal": "data/ruvent.journal",
+  "durability": "strict",
+  "credentials": [
+    {
+      "name": "workers",
+      "token": "workers-secret-change-me",
+      "methods": ["register_claimable", "register_dispatch", "claim", "complete", "subscribe", "unsubscribe"],
+      "channels": ["orders.*", "jobs.*"]
+    },
+    {
+      "name": "proxy",
+      "token": "proxy-secret-change-me",
+      "methods": ["register_claimable", "register_dispatch", "delete", "subscribe", "unsubscribe"],
+      "channels": ["chat.*", "orders.*", "proxy.*"],
+      "delegate": true
+    }
+  ],
+  "backlog_page": 1024,
+  "outbound": 65536,
+  "compaction": { "min_records": 50000, "ratio": 4 },
+  "snapshot": {
+    "directory": "data/snapshots",
+    "channels": ["orders.*"],
+    "types": [],
+    "max_events": 4096,
+    "max_age_ms": 5000
+  }
+}

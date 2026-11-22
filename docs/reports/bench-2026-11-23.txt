@@ -1,0 +1,15 @@
+# cargo run --release -p ruvent --example bench
+# date: 2026-11-23   tree: rebuilt event server (uncommitted at measurement; see the commit that adds this file)
+# host: Windows-11-10.0.26300-SP0  AMD64 Family 23 Model 49 Stepping 0, AuthenticAMD
+# rustc 1.96.0 (ac68faa20 2026-05-25)
+# workload: 64 tasks, each register_claimable -> claim -> complete, waiting for every answer, in-process client.
+# numerator: completions that returned Ok. Not comparable with bench-2026-11-22.txt (different engine and workload).
+workers=64 payload=16B
+mode=volatile cycles=200000 seconds=0.803 cycles/s=249143
+mode=file-scheduled cycles=200000 seconds=0.797 cycles/s=250815
+mode=file-strict cycles=19968 seconds=0.603 cycles/s=33134
+envelope=dispatch/delivery bytes=47 encode_ns=8.3
+envelope=waiting/journal bytes=55 encode_ns=9.4
+envelope=claimed/claim-answer bytes=79 encode_ns=15.3
+envelope=notice bytes=35 encode_ns=7.0
+uuidv7 ns=139.8

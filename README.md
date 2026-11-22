@@ -1,70 +1,56 @@
 # ruvent
 
-이벤트를 발행하고 수신하는 방식으로 서비스를 작성하는 Rust 프레임워크다.
-요청과 응답이 아니라 **이벤트와 그에 대한 반응**이 서비스의 단위다.
+Rust로 쓴 이벤트 서버와 그 위의 워커·프록시 프레임워크다. `F:\dev\ndx_business`의 `packages/agent`(TypeScript,
+PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
+[재설계 제안서](docs/proposals/event-server-redesign.md)에 있다.
 
-독립 서버가 아니라 라이브러리다. 함수를 등록하면 그 프로세스가 서버가 된다.
+* **이벤트 서버는 일곱 개의 메서드만 제공한다.** 착수용 등록, 발송용 등록, 착수 마킹, 완료 보고, 삭제, 구독,
+  구독 취소다.
+* **이벤트는 두 종류다.** 착수용 이벤트는 완료 보고로 큐에서 지워지고, 발송용 이벤트는 발송하는 순간 지워진다.
+  둘 다 한 가지 엔벨롭을 쓴다(고정 머리 27바이트).
+* **서버는 접속자를 구분하지 않는다.** 워커 서버, 프록시, 내장 워커 모두 같은 메서드를 부른다. 내장 워커는
+  메서드를 함수로 부르고, 나머지는 소켓으로 부른다.
+* **정책은 워커가 갖는다.** 재시도 상한, 실패 처리, 후속 이벤트는 워커 쪽의 일이다.
+* **저널링은 메서드가 아니다.** 서버는 미처리 착수용 이벤트를 저널에 남겨 재기동 때 다시 올린다. 설정이 있으면
+  고른 채널을 운영 스냅샷 파일로 모은다.
 
-```rust
-use ruvent::{App, Audience, Bytes, Context, Envelope, Failure, Service};
-use std::sync::Arc;
-
-async fn open_turn(cx: Context, command: Arc<Envelope>) -> Result<Bytes, Failure> {
-    cx.fact(format!("turn.started:{}", command.transaction_key), "turn.started", "{}", Audience::Client).await?;
-    Ok(Bytes::new())
-}
-
-async fn call_model(cx: Context, _fact: Arc<Envelope>) -> Result<Bytes, Failure> {
-    cx.progress("model.delta", "\"안녕\"");          // 기다리지 않는 스트리밍
-    cx.fact("model.replied:1", "model.replied", "{}", Audience::Worker).await?;
-    Ok(Bytes::new())
-}
-
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    App::open("data/app.journal")
-        .service(Service::new("turn").accept("turn.run", open_turn))
-        .service(Service::new("inference").on("turn.started", call_model).max_in_flight(64))
-        .run()
-        .await
-}
+```text
+일반 클라이언트 ──► 프록시(ruvent-proxy-ws / -http, JSON 설정) ──┐
+                                                               ├──► 이벤트 서버(ruvent-server: 메서드 7개, 단일 작성자)
+                    워커 서버(ruvent-client: App·Service) ─────┘      ├ 착수용 큐: 완료 보고로 제거, 저널 대상
+                    내장 워커 = 같은 메서드를 함수로 호출                └ 발송: 등록 순간 구독 접속에 넘기고 제거
 ```
 
-큐 이름도 리액션 표도 쓰지 않았다. `accept`가 클라이언트 허용 목록과 라우트를,
-`on`이 리액션 표를 만든다. 어떤 함수도 다음 함수를 지목하지 않는다.
+## 크레이트
+
+| 크레이트 | 내용 | 문서 |
+| --- | --- | --- |
+| `ruvent` | 엔벨롭과 코덱, 이름표, 엔진(두 큐, 메서드 일곱 개), 저널 v2, 운영 스냅샷, 메서드 계약과 인프로세스 연결 | [crates/ruvent/README.md](crates/ruvent/README.md) |
+| `ruvent-protocol` | 이진 와이어 프로토콜: 핸드셰이크, 프레임, 접속별 이름 사전, 메서드 레코드 | [crates/ruvent-protocol/README.md](crates/ruvent-protocol/README.md) |
+| `ruvent-server` | 이벤트 서버 바이너리와 수신부. JSON 설정 | [crates/ruvent-server/README.md](crates/ruvent-server/README.md) |
+| `ruvent-client` | 원격 연결과 워커 프레임워크(`App`, `Service`, 실행기, 재시도 정책) | [crates/ruvent-client/README.md](crates/ruvent-client/README.md) |
+| `ruvent-proxy` | 프록시 공통: JSON 설정, 최종 사용자 인증, 채널별 상위 구독 하나 | [crates/ruvent-proxy/README.md](crates/ruvent-proxy/README.md) |
+| `ruvent-proxy-ws` | WebSocket 프록시 바이너리 | [crates/ruvent-proxy-ws/README.md](crates/ruvent-proxy-ws/README.md) |
+| `ruvent-proxy-http` | HTTP 프록시 바이너리(POST 등록, SSE 구독) | [crates/ruvent-proxy-http/README.md](crates/ruvent-proxy-http/README.md) |
+| `xtask` | 검증 관문 `cargo xtask verify` | [docs/testing.md](docs/testing.md) |
 
 ## 문서
 
 | 문서 | 내용 |
 | --- | --- |
-| [docs/overview.md](docs/overview.md) | 무엇이고 무엇이 아닌가, 핵심 개념 |
-| [docs/architecture.md](docs/architecture.md) | 단일 작성자 엔진, 이벤트 구동, 순변화 저널 |
-| [docs/usage.md](docs/usage.md) | 서비스 작성, 핸들러 규칙, 전송 플러그인 |
-| [docs/constraints.md](docs/constraints.md) | 보장하는 것과 보장하지 않는 것 |
-| [docs/origin.md](docs/origin.md) | 원본(ndx_business `packages/agent`) 분석과 대응표 |
-| [docs/testing.md](docs/testing.md) | 정적·런타임·인수 세 수준의 테스트망, 테스트가 찾은 결함, 실측 수치 |
-| [docs/proposals/event-server-redesign.md](docs/proposals/event-server-redesign.md) | 이벤트 서버 재설계 제안 (승인 대기) |
-| [docs/proposals/event-server-redesign.pptx](docs/proposals/event-server-redesign.pptx) | 같은 제안의 다이어그램·개념 설명 덱 (생성기: `docs/proposals/deck/build.py`) |
+| [docs/overview.md](docs/overview.md) | 무엇을 하고 무엇을 하지 않는가, 보장 계약 |
+| [docs/architecture.md](docs/architecture.md) | 엔진 구조, 엔벨롭, 저널, 와이어, 시간과 순서 |
+| [docs/usage.md](docs/usage.md) | 내장 엔진, 서버, 워커, 프록시를 쓰는 법 |
+| [docs/constraints.md](docs/constraints.md) | 결정된 제약과 그 대가 |
+| [docs/testing.md](docs/testing.md) | 관문, 테스트 수준, 요구사항 ↔ 테스트 지도 |
+| [docs/origin.md](docs/origin.md) | 원본(`packages/agent`) 분석과 대응 |
+| [docs/proposals/event-server-redesign.md](docs/proposals/event-server-redesign.md) | 재설계 제안서(승인됨)와 구현 기록 |
 
-## 구성
-
-| 경로 | 책임 |
-| --- | --- |
-| `crates/ruvent/src/app/` | 프레임워크 표면: `App`, `Service`, `Module` |
-| `crates/ruvent/src/engine/` | 단일 작성자 엔진: 큐, 실행, 로그, 보존·영속 정책, 저널 스케줄러 |
-| `crates/ruvent/src/journal/` | 내구성 플러그인과 파일 저널 |
-| `crates/ruvent/src/worker/` | 워커 틀: 소유, 스텝 기한, 펜싱, 종결 기록 |
-| `crates/ruvent/src/gateway/` | 전송 중립 클라이언트 경계: 인증, 정책, 구독 |
-| `crates/ruvent/src/wire/` | 전송 플러그인이 공유하는 JSON 프레임 |
-| `crates/ruvent/src/envelope/` | 고정 엔벨롭 계약 |
-| `crates/ruvent/tests/static/` | 정적 수준: 구조 규칙, 공개 API 고정본, 타입 계약, 문서 일치 |
-| `crates/ruvent/tests/runtime/` | 런타임 수준: 엔진, 저널, 파일 형식, wire, 프레임워크 |
-| `crates/ruvent/tests/acceptance/` | 인수 수준: 요구 원문마다 하나, 프로세스 강제 종료 |
-| `crates/xtask/` | 모든 관문을 한 명령으로: `cargo xtask verify` |
-
-## 확인
+## 검증
 
 ```sh
-cargo xtask verify                      # 포맷, 린트, 정적·런타임·인수 테스트 전부
-cargo run --release --example bench     # 실측
+cargo xtask verify
 ```
+
+마지막 실행 기록은 [docs/reports/test-2026-11-23.txt](docs/reports/test-2026-11-23.txt), 측정은
+[docs/reports/bench-2026-11-23.txt](docs/reports/bench-2026-11-23.txt)에 있다.

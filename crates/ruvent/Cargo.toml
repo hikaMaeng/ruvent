@@ -1,6 +1,6 @@
 [package]
 name = "ruvent"
-description = "Embedded event-sourcing core: durable log, leased work queues, execution claims, a worker runtime and a transport-neutral gateway."
+description = "Event server core: one envelope, a claimable queue and dispatch, seven methods, a journal."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,30 +8,17 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = ["json"]
-# JSON framing shared by the bundled transports. The core never parses a payload.
-json = ["dep:serde_json"]
-
 [dependencies]
 async-trait.workspace = true
-bincode.workspace = true
 bytes.workspace = true
 crc32fast.workspace = true
 parking_lot.workspace = true
-serde.workspace = true
-serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["signal"] }
-tokio-util.workspace = true
+tokio.workspace = true
 uuid.workspace = true
-xxhash-rust.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
-quote.workspace = true
-serde_json.workspace = true
-syn.workspace = true
 
 # Three levels, three binaries. See docs/testing.md.
 [[test]]
@@ -45,4 +32,3 @@ path = "tests/runtime/main.rs"
 [[test]]
 name = "acceptance"
 path = "tests/acceptance/main.rs"
-required-features = ["json"]

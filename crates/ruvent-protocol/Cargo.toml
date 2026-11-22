@@ -1,0 +1,17 @@
+[package]
+name = "ruvent-protocol"
+description = "The event server's binary wire protocol: frames, per-connection name dictionaries, the seven methods as records."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruvent.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

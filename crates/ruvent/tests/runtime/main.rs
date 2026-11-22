@@ -1,8 +1,5 @@
-//! Runtime level: the engine, the journal and the framework surface, run for
-//! real against a clock and a disk the tests control.
+//! Runtime level: the engine task running, through the public API.
 
-mod app;
+mod durability;
 mod engine;
-mod file_format;
-mod journal;
-mod wire;
+mod support;

@@ -1,68 +1,36 @@
+use super::codec::{decode_frames, encode_frame, FrameNames, APPEND, MAGIC, SNAPSHOT};
 use super::{Journal, Record, Recovered};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// The first bytes of every journal: a name and a format version. A file
-/// that does not start with them is not opened, and not touched.
-const MAGIC: &[u8; 8] = b"ruvent\0\x01";
-/// `[len: u32][crc32: u32]` in front of every frame.
-const HEADER: usize = 8;
-/// `[kind: u8][prev: u64][through: u64]` at the start of every frame body.
-const CHAIN: usize = 17;
-const SNAPSHOT: u8 = 0;
-const APPEND: u8 = 1;
+/// Records per frame in a rewrite. A rewrite is one atomic rename, so the
+/// split only bounds the size of one frame.
 const REWRITE_CHUNK: usize = 4096;
 
-/// An append-only file of CRC-framed, chained batches.
-///
-/// ```text
-/// "ruvent\0" 0x01                                       file header, once
-/// [len u32 LE][crc32 u32 LE]  [kind u8][prev u64 LE][through u64 LE][bincode(Vec<Record>)]
-///                             '------------------- covered by crc -------------------'
-/// ```
-///
-/// The header is what lets damage be told from a wrong path. Without it a
-/// file that is not a journal at all would look like a journal whose every
-/// frame is torn, and opening it would cut it to nothing.
+/// An append-only file of CRC-framed, chained batch frames (format in `codec.rs`).
 ///
 /// Three independent things keep one write from damaging another, and none of
 /// them is a clock:
 ///
 /// * **a lock file**, held for the journal's lifetime, so a second process (or
-///   a second engine in this one) cannot open the same journal at all;
+///   a second engine in this one) cannot open the same journal;
 /// * **the chain**: every appended frame names the record number it follows,
-///   `append` refuses a batch that does not follow the last frame written, and
-///   replay stops at the first frame that breaks the chain;
-/// * **append-only writes**: nothing is updated in place, so a crash can only
-///   tear the last frame, which then fails its length or CRC check and is cut
-///   off on open. Compaction writes a new file and renames it over the old.
+///   and replay stops at the first frame that breaks it;
+/// * **append-only writes**: a crash can only tear the last frame, which then
+///   fails its length or CRC check and is cut off on open. A rewrite writes a
+///   new file and renames it over the old one.
+///
+/// A file whose header is not this format's — a version 1 journal, or not a
+/// journal at all — is refused with `InvalidData` and left byte for byte as it was.
 pub struct FileJournal {
     path: PathBuf,
     file: Option<File>,
-    /// Record number the file ends at.
     chain: u64,
+    names: FrameNames,
     _lock: File,
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
-}
-
-fn frame(kind: u8, prev: u64, through: u64, records: &[Record]) -> io::Result<Vec<u8>> {
-    let records = bincode::serialize(records).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let length = u32::try_from(CHAIN + records.len()).map_err(|_| invalid("journal batch exceeds 4 GiB"))?;
-    let mut buffer = Vec::with_capacity(HEADER + CHAIN + records.len());
-    buffer.extend_from_slice(&length.to_le_bytes());
-    buffer.extend_from_slice(&[0; 4]);
-    buffer.push(kind);
-    buffer.extend_from_slice(&prev.to_le_bytes());
-    buffer.extend_from_slice(&through.to_le_bytes());
-    buffer.extend_from_slice(&records);
-    let crc = crc32fast::hash(&buffer[HEADER..]);
-    buffer[4..8].copy_from_slice(&crc.to_le_bytes());
-    Ok(buffer)
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -71,8 +39,6 @@ fn open_append(path: &Path) -> io::Result<File> {
 
 impl FileJournal {
     /// Opens (or creates) a journal and returns every record that survived.
-    ///
-    /// Fails if another engine already holds this journal.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<(Self, Recovered)> {
         let path = path.into();
         let lock = OpenOptions::new().create(true).write(true).truncate(false).open(path.with_extension("journal.lock"))?;
@@ -87,50 +53,25 @@ impl FileJournal {
             Err(error) => return Err(error),
         }
 
-        // Nothing, or a header cut short by a crash while the journal was
-        // being created: an empty journal. Anything else must carry the
-        // header, or it is somebody else's file.
-        let fresh = bytes.len() < MAGIC.len() && MAGIC.starts_with(&bytes);
-        if fresh {
+        // Nothing, or a header cut short while the journal was being created.
+        if bytes.len() < MAGIC.len() && MAGIC.starts_with(&bytes) {
             let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
             file.write_all(MAGIC)?;
             file.sync_all()?;
             bytes = MAGIC.to_vec();
-        } else if !bytes.starts_with(MAGIC) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a ruvent journal of this version; it was left untouched", path.display())));
         }
+        let bytes = Bytes::from(bytes);
+        let frames = decode_frames(&bytes).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
 
-        let mut records = Vec::new();
-        let mut chain = 0u64;
-        let mut good = MAGIC.len();
-        while bytes.len() - good >= HEADER {
-            let length = u32::from_le_bytes(bytes[good..good + 4].try_into().unwrap()) as usize;
-            let crc = u32::from_le_bytes(bytes[good + 4..good + 8].try_into().unwrap());
-            let Some(body) = bytes.get(good + HEADER..good + HEADER + length) else { break };
-            if length < CHAIN || crc32fast::hash(body) != crc {
-                break;
-            }
-            let prev = u64::from_le_bytes(body[1..9].try_into().unwrap());
-            let through = u64::from_le_bytes(body[9..17].try_into().unwrap());
-            // A frame that does not follow its predecessor was written out of
-            // turn. Nothing after it can be trusted.
-            if body[0] == APPEND && prev != chain {
-                break;
-            }
-            let Ok(batch) = bincode::deserialize::<Vec<Record>>(&body[CHAIN..]) else { break };
-            records.extend(batch);
-            chain = through;
-            good += HEADER + length;
-        }
-
-        // Whatever follows the last intact frame is cut off, so the next
-        // append continues the chain from a clean end.
-        if good < bytes.len() {
+        // Whatever follows the last whole frame is cut off, so the next append
+        // continues from a clean end.
+        if frames.good < bytes.len() {
             let file = OpenOptions::new().write(true).open(&path)?;
-            file.set_len(good as u64)?;
+            file.set_len(frames.good as u64)?;
             file.sync_all()?;
         }
-        Ok((Self { file: Some(open_append(&path)?), path, chain, _lock: lock }, Recovered { records, through: chain }))
+        let journal = FileJournal { file: Some(open_append(&path)?), path, chain: frames.through, names: FrameNames::from_defined(&frames.names), _lock: lock };
+        Ok((journal, Recovered { records: frames.records }))
     }
 
     fn take(&mut self) -> io::Result<File> {
@@ -140,17 +81,13 @@ impl FileJournal {
 
 #[async_trait]
 impl Journal for FileJournal {
-    async fn append(&mut self, prev: u64, through: u64, records: &[Record]) -> io::Result<()> {
-        if prev != self.chain {
-            return Err(invalid(format!("journal ends at record {} but the batch follows {prev}; refusing to write out of turn", self.chain)));
-        }
-        let buffer = frame(APPEND, prev, through, records)?;
+    async fn append(&mut self, records: Vec<Record>) -> io::Result<()> {
+        let (frame, through) = encode_frame(APPEND, self.chain, &records, &mut self.names)?;
         let mut file = self.take()?;
-        // The handle is only put back on success: after a failed write or
-        // fsync the file's contents are unknown, and continuing would stack
-        // later batches on top of a hole.
+        // The handle is put back only on success: after a failed write or fsync
+        // the file's contents are unknown.
         let file = tokio::task::spawn_blocking(move || -> io::Result<File> {
-            file.write_all(&buffer)?;
+            file.write_all(&frame)?;
             file.sync_data()?;
             Ok(file)
         })
@@ -161,13 +98,14 @@ impl Journal for FileJournal {
         Ok(())
     }
 
-    async fn rewrite(&mut self, at: u64, records: &[Record]) -> io::Result<()> {
+    async fn rewrite(&mut self, records: Vec<Record>) -> io::Result<()> {
+        let mut names = FrameNames::default();
         let mut buffer = MAGIC.to_vec();
+        let mut chain = 0;
         for chunk in records.chunks(REWRITE_CHUNK) {
-            buffer.extend_from_slice(&frame(SNAPSHOT, at, at, chunk)?);
-        }
-        if records.is_empty() {
-            buffer.extend_from_slice(&frame(SNAPSHOT, at, at, &[])?);
+            let (frame, through) = encode_frame(SNAPSHOT, chain, chunk, &mut names)?;
+            buffer.extend_from_slice(&frame);
+            chain = through;
         }
         // Closed before the rename: Windows will not replace a file that is open.
         drop(self.take()?);
@@ -178,14 +116,14 @@ impl Journal for FileJournal {
             file.write_all(&buffer)?;
             file.sync_all()?;
             drop(file);
-            // Atomic: a crash leaves either the old journal or the new one.
             std::fs::rename(&temporary, &path)?;
             open_append(&path)
         })
         .await
         .map_err(io::Error::other)??;
         self.file = Some(file);
-        self.chain = at;
+        self.chain = chain;
+        self.names = names;
         Ok(())
     }
 }

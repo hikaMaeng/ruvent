@@ -1,108 +1,65 @@
-//! What the engine keeps, for how long, and what of it reaches the disk.
+//! What the engine is told at start. Nothing here is policy about events:
+//! retry limits, failure handling and follow-ups belong to the workers.
 
-use crate::envelope::{Envelope, Kind, Text};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+pub use crate::names::Pattern;
+pub use crate::snapshot::SnapshotConfig;
+use std::collections::HashMap;
 
-/// action → the queues whose reactors should receive their own copy of that fact.
-///
-/// Opaque strings on both sides. The engine never learns what any of them mean.
-pub type ReactionTable = HashMap<String, Vec<String>>;
-
-/// When the journal is written relative to answering the caller.
-#[derive(Clone, Copy, Debug)]
+/// When the journal is written relative to answering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Durability {
-    /// Answer at once; the journal is written behind, at most once per
-    /// `window`. The window is not a timer that fires regardless: it starts
-    /// when the first unwritten change appears and is the time other changes
-    /// have to cancel it out or join it. An idle engine sets no timer at all.
-    ///
-    /// A crash loses at most what changed since the last completed write.
-    Scheduled { window: Duration },
-    /// Write and fsync before answering anyone. Nothing acknowledged is ever
-    /// lost; throughput is bounded by the disk.
+    /// Answer at once and write behind, one write at a time, each carrying
+    /// everything that changed while the previous one was out. Nothing waits
+    /// on a timer. A crash loses what changed since the last completed write.
+    #[default]
+    Scheduled,
+    /// The notices and success answers of a claimable registration, a
+    /// completion with its follow-ups, and a deletion are released only
+    /// after that change is on disk. Claims and reclaims never wait.
     Strict,
 }
 
-impl Default for Durability {
-    fn default() -> Self {
-        Durability::Scheduled { window: Duration::from_millis(100) }
-    }
+/// The seven methods, for grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Method {
+    RegisterClaimable,
+    RegisterDispatch,
+    Claim,
+    Complete,
+    Delete,
+    Subscribe,
+    Unsubscribe,
 }
 
-/// Which events are written to the journal. Progress events never are.
-#[derive(Clone, Default)]
-pub enum Events {
-    /// None. Events live in memory for readers and are gone after a restart.
-    /// The machine does not need them: the work a fact causes is queued.
-    #[default]
-    None,
-    /// Facts, results, failures and commands on every channel.
-    All,
-    /// The same, only on channels with one of these prefixes.
-    Channels(Vec<String>),
-    /// The same, on every channel except those with one of these prefixes.
-    Except(Vec<String>),
-    /// Whatever this says. Progress events are still never written.
-    Custom(Arc<dyn Fn(&Envelope) -> bool + Send + Sync>),
+impl Method {
+    pub const ALL: [Method; 7] = [Method::RegisterClaimable, Method::RegisterDispatch, Method::Claim, Method::Complete, Method::Delete, Method::Subscribe, Method::Unsubscribe];
 }
 
-impl Events {
-    pub(crate) fn wants(&self, event: &Envelope) -> bool {
-        if matches!(event.kind, Kind::Progress | Kind::Control) {
-            return false;
-        }
-        let under = |prefixes: &[String]| prefixes.iter().any(|prefix| event.channel.starts_with(prefix.as_str()));
-        match self {
-            Events::None => false,
-            Events::All => true,
-            Events::Channels(prefixes) => under(prefixes),
-            Events::Except(prefixes) => !under(prefixes),
-            Events::Custom(wants) => wants(event),
-        }
-    }
-}
-
-/// What reaches the disk. The default is the least that lets a restart carry
-/// on: the work still owed, and how many times each piece has been tried.
-#[derive(Clone, Default)]
-pub struct Persist {
-    pub events: Events,
-    /// Also keep settled executions for the deduplication window, so a
-    /// transaction resubmitted across a restart is not run again. Off by
-    /// default: it turns every completed execution into a disk write.
-    pub settled: bool,
-    /// Queues whose work is never journaled. A crash drops whatever was on
-    /// them; use for work a client will simply ask for again.
-    pub transient_queues: HashSet<Text>,
-}
-
-/// Bounds on what is kept in memory. Each is enforced at the moment the thing
-/// it bounds grows; nothing is swept on a timer.
+/// What one service credential may do.
 #[derive(Clone, Debug)]
-pub struct Retention {
-    /// Events held for readers to resume from.
-    pub max_events: usize,
-    /// Approximate bytes those events may occupy.
-    pub max_bytes: usize,
-    /// An event older than this is dropped when the next one is appended.
-    pub max_age: Duration,
-    /// How long a settled execution is remembered, so the same transaction
-    /// sent again is answered instead of rerun.
-    pub settled: Duration,
-    pub max_settled: usize,
-    /// Dead letters kept per queue.
-    pub dead_letters: usize,
+pub struct Grant {
+    pub methods: Vec<Method>,
+    pub channels: Vec<Pattern>,
+    /// Whether this credential may register on behalf of an end user (`delegate`).
+    pub delegate: bool,
 }
 
-impl Default for Retention {
-    fn default() -> Self {
-        Self { max_events: 262_144, max_bytes: 256 << 20, max_age: Duration::from_secs(15 * 60), settled: Duration::from_secs(10 * 60), max_settled: 1_000_000, dead_letters: 1024 }
+impl Grant {
+    /// Every method on every channel, delegation included.
+    pub fn all() -> Self {
+        Grant { methods: Method::ALL.to_vec(), channels: vec![Pattern("*".into())], delegate: true }
+    }
+
+    pub fn allows(&self, method: Method, channel: &str) -> bool {
+        self.methods.contains(&method) && self.channels.iter().any(|pattern| pattern.matches(channel))
     }
 }
 
-/// When the journal is folded into a snapshot: once it holds more than
+/// Grants by credential name. `None` in [`EngineConfig::grants`] means every
+/// credential may do everything (an embedded engine with in-process workers).
+pub type Grants = HashMap<String, Grant>;
+
+/// When the journal is folded into a snapshot: once the file holds more than
 /// `min_records` and more than `ratio` times what a snapshot would.
 #[derive(Clone, Copy, Debug)]
 pub struct Compaction {
@@ -116,33 +73,25 @@ impl Default for Compaction {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
-    pub reactions: ReactionTable,
-    /// How many times an execution may be started before it is failed for good.
-    pub max_attempts: u32,
-    /// Most operations applied between two looks at the journal and the timers.
+    /// Most operations applied between two looks at the journal.
     pub batch_max: usize,
-    /// Capacity of the operation inbox. Callers wait when it is full; progress
-    /// emissions are dropped instead.
+    /// Capacity of the operation inbox. Callers wait when it is full.
     pub inbox: usize,
+    /// Capacity of each connection's send buffer. A connection whose buffer is
+    /// full when the engine hands it something is disconnected.
+    pub outbound: usize,
+    /// Most backlog entries in one subscription answer.
+    pub backlog_page: usize,
     pub durability: Durability,
-    pub persist: Persist,
-    pub retention: Retention,
     pub compaction: Compaction,
+    pub grants: Option<Grants>,
+    pub snapshot: Option<SnapshotConfig>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self {
-            reactions: ReactionTable::new(),
-            max_attempts: 5,
-            batch_max: 2048,
-            inbox: 65_536,
-            durability: Durability::default(),
-            persist: Persist::default(),
-            retention: Retention::default(),
-            compaction: Compaction::default(),
-        }
+        Self { batch_max: 2048, inbox: 65_536, outbound: 65_536, backlog_page: 1024, durability: Durability::default(), compaction: Compaction::default(), grants: None, snapshot: None }
     }
 }

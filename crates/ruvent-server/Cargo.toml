@@ -1,0 +1,23 @@
+[package]
+name = "ruvent-server"
+description = "The event server: listeners for the binary protocol in front of one engine. Library and binary, JSON configuration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruvent.workspace = true
+ruvent-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+ruvent-client.workspace = true
+
+[[bin]]
+name = "ruvent-server"
+path = "src/main.rs"
