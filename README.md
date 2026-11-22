@@ -43,6 +43,8 @@ async fn main() -> std::io::Result<()> {
 | [docs/constraints.md](docs/constraints.md) | 보장하는 것과 보장하지 않는 것 |
 | [docs/origin.md](docs/origin.md) | 원본(ndx_business `packages/agent`) 분석과 대응표 |
 | [docs/testing.md](docs/testing.md) | 정적·런타임·인수 세 수준의 테스트망, 테스트가 찾은 결함, 실측 수치 |
+| [docs/proposals/event-server-redesign.md](docs/proposals/event-server-redesign.md) | 이벤트 서버 재설계 제안 (승인 대기) |
+| [docs/proposals/event-server-redesign.pptx](docs/proposals/event-server-redesign.pptx) | 같은 제안의 다이어그램·개념 설명 덱 (생성기: `docs/proposals/deck/build.py`) |
 
 ## 구성
 

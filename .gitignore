@@ -1,3 +1,4 @@
 /target
 *.journal
 *.journal.tmp
+__pycache__/
