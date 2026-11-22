@@ -127,11 +127,22 @@ fn envelope_dto(event: &Envelope) -> EnvelopeDto<'_> {
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ServerDto<'a> {
     Ready,
-    Subscribed { channels: &'a [String], cursor: String },
-    Event { event: Box<EnvelopeDto<'a>>, cursor: String },
+    Subscribed {
+        channels: &'a [String],
+        cursor: String,
+    },
+    Event {
+        event: Box<EnvelopeDto<'a>>,
+        cursor: String,
+    },
     #[serde(rename_all = "camelCase")]
-    Accepted { event_id: String, transaction_key: &'a str },
-    Rejected { reason: &'static str },
+    Accepted {
+        event_id: String,
+        transaction_key: &'a str,
+    },
+    Rejected {
+        reason: &'static str,
+    },
 }
 
 pub fn encode_server(frame: &ServerFrame) -> String {

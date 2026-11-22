@@ -98,7 +98,13 @@ async fn chain(label: &str, app: App, commands: usize, concurrency: usize) {
         let (gateway, payload, identity) = (app.gateway().clone(), payload.clone(), identity.clone());
         tasks.push(tokio::spawn(async move {
             for index in 0..commands / concurrency {
-                let proposal = Proposal { action: "chain.run".into(), payload: payload.clone(), transaction_key: Some(format!("c{task}-{index}").into()), reply_channel: Some("done".into()), ..Proposal::default() };
+                let proposal = Proposal {
+                    action: "chain.run".into(),
+                    payload: payload.clone(),
+                    transaction_key: Some(format!("c{task}-{index}").into()),
+                    reply_channel: Some("done".into()),
+                    ..Proposal::default()
+                };
                 gateway.submit(&identity, proposal).await.unwrap();
             }
         }));

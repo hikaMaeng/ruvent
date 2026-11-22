@@ -16,9 +16,9 @@ use super::{Begin, Outcome};
 use crate::envelope::{Audience, Command, Emit, Envelope, EventId, Kind, Text};
 use crate::journal::Record;
 use bytes::Bytes;
-use xxhash_rust::xxh3::Xxh3;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3;
 
 /// Positions are `epoch << 40 | counter`.
 ///
@@ -520,7 +520,17 @@ impl State {
         let attempt = self.next_attempt;
         self.next_attempt += 1;
         let transient = self.persist.transient_queues.contains(queue);
-        let execution = self.executions.entry(key.clone()).or_insert_with(|| Execution { request: queued.event_id, fingerprint: print, attempt, attempts, held: true, done: None, transient, dirty: false, on_disk: false });
+        let execution = self.executions.entry(key.clone()).or_insert_with(|| Execution {
+            request: queued.event_id,
+            fingerprint: print,
+            attempt,
+            attempts,
+            held: true,
+            done: None,
+            transient,
+            dirty: false,
+            on_disk: false,
+        });
         execution.attempt = attempt;
         execution.attempts = attempts;
         execution.held = true;

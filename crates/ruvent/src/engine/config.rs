@@ -134,6 +134,15 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { reactions: ReactionTable::new(), max_attempts: 5, batch_max: 2048, inbox: 65_536, durability: Durability::default(), persist: Persist::default(), retention: Retention::default(), compaction: Compaction::default() }
+        Self {
+            reactions: ReactionTable::new(),
+            max_attempts: 5,
+            batch_max: 2048,
+            inbox: 65_536,
+            durability: Durability::default(),
+            persist: Persist::default(),
+            retention: Retention::default(),
+            compaction: Compaction::default(),
+        }
     }
 }

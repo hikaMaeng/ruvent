@@ -21,20 +21,17 @@ pub mod engine;
 pub mod envelope;
 pub mod gateway;
 pub mod journal;
-pub mod worker;
 #[cfg(feature = "json")]
 pub mod wire;
+pub mod worker;
 
+pub use app::{App, Module, Service, Started};
 pub use bytes::Bytes;
 pub use engine::{Begin, Closed, Compaction, Delivery, Durability, Engine, EngineConfig, Events, From, Outcome, Persist, ReactionTable, Retention, Stats, Subscription};
 #[cfg(feature = "json")]
 pub use envelope::json;
 pub use envelope::{stream_of, Audience, Command, Emit, Envelope, EventId, Kind, Source, Text};
-pub use app::{App, Module, Service, Started};
-pub use gateway::{
-    Anonymous, Authenticator, ClientFrame, Connection, Credentials, Gateway, Identity, Open, OwnedSessions, Policy, Proposal, Rejected,
-    ServerFrame, Transport,
-};
+pub use gateway::{Anonymous, Authenticator, ClientFrame, Connection, Credentials, Gateway, Identity, Open, OwnedSessions, Policy, Proposal, Rejected, ServerFrame, Transport};
 pub use journal::{FileJournal, Journal, Record, Recovered, Volatile};
 pub use tokio_util::sync::CancellationToken;
 pub use worker::{Backoff, Context, Failure, Handler, Lost, Running, Worker, WorkerConfig};

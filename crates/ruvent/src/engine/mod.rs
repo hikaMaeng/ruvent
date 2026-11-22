@@ -157,7 +157,8 @@ impl Engine {
     /// Starts an engine on any journal, from what it recovered.
     pub fn start<J: Journal>(config: EngineConfig, journal: J, recovered: Recovered) -> Self {
         let shared = Arc::new(Shared::new());
-        let reactions: HashMap<Text, Vec<Text>> = config.reactions.iter().map(|(action, queues)| (Text::from(action.as_str()), queues.iter().map(|queue| Text::from(queue.as_str())).collect())).collect();
+        let reactions: HashMap<Text, Vec<Text>> =
+            config.reactions.iter().map(|(action, queues)| (Text::from(action.as_str()), queues.iter().map(|queue| Text::from(queue.as_str())).collect())).collect();
         let mut state = State::new(Arc::new(reactions), config.max_attempts, config.retention, config.persist);
         let now = shared.now();
         for record in &recovered.records {

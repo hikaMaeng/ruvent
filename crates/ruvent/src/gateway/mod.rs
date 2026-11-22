@@ -106,10 +106,18 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     Ready,
     /// `cursor` is where reading starts; each event's `position` is the next cursor.
-    Subscribed { channels: Vec<String>, cursor: u64 },
+    Subscribed {
+        channels: Vec<String>,
+        cursor: u64,
+    },
     Event(Arc<Envelope>),
-    Accepted { event_id: EventId, transaction_key: Text },
-    Rejected { reason: Rejected },
+    Accepted {
+        event_id: EventId,
+        transaction_key: Text,
+    },
+    Rejected {
+        reason: Rejected,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
