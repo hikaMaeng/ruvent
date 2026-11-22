@@ -169,3 +169,30 @@ fn runtime_dependencies_are_the_declared_set() {
     assert!(json[0].contains("optional = true"), "serde_json stays optional: {json:?}");
     assert_eq!(section(&manifest, "[lints]"), ["workspace = true"], "the crate takes the workspace's lint decisions");
 }
+
+/// Source files are UTF-8 with LF line ends and no control characters. A
+/// stray NUL or CR in a string literal compiles and changes what the program
+/// does; an editor will not show it.
+#[test]
+fn source_files_are_plain_utf8_text() {
+    let root = crate::source::crate_root();
+    let mut violations = Vec::new();
+    let mut stack = vec![root.join("src"), root.join("tests"), root.join("examples")];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let bytes = std::fs::read(&path).unwrap();
+                if std::str::from_utf8(&bytes).is_err() {
+                    violations.push(format!("{} is not UTF-8", path.display()));
+                }
+                if let Some(at) = bytes.iter().position(|byte| (*byte < 0x20 && *byte != b'\n' && *byte != b'\t') || *byte == 0x7f) {
+                    violations.push(format!("{} has control byte {:#04x} at offset {at}", path.display(), bytes[at]));
+                }
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}

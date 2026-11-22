@@ -163,3 +163,15 @@ impl Queue {
         pending
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+impl Queue {
+    /// Messages handed out with no deadline: they come back only when whoever
+    /// holds them says so. A test checks each one still has a holder.
+    pub(crate) fn held(&self) -> Vec<u64> {
+        self.messages.iter().filter(|(_, message)| message.in_flight && message.deadline == 0).map(|(id, _)| *id).collect()
+    }
+}

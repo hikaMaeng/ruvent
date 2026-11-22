@@ -23,7 +23,9 @@ struct ClientDto<'a> {
     cursor: Option<&'a str>,
     from: Option<&'a str>,
     action: Option<String>,
-    #[serde(borrow)]
+    /// Absent means no payload was sent, and the frame is refused. A JSON
+    /// `null` is a payload like any other.
+    #[serde(borrow, default, deserialize_with = "present")]
     payload: Option<&'a RawValue>,
     transaction_key: Option<String>,
     channel: Option<String>,
@@ -31,6 +33,12 @@ struct ClientDto<'a> {
     session_id: Option<String>,
     run_id: Option<String>,
     turn_id: Option<String>,
+}
+
+/// Called only when the field is there, so `null` stays a value instead of
+/// collapsing into "absent" the way a plain `Option` would make it.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<&'de RawValue>, D::Error> {
+    <&RawValue>::deserialize(deserializer).map(Some)
 }
 
 /// Reads a start position: a cursor wins, then `"start"`, otherwise now.

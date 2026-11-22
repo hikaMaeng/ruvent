@@ -4,6 +4,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// The first bytes of every journal: a name and a format version. A file
+/// that does not start with them is not opened, and not touched.
+const MAGIC: &[u8; 8] = b"ruvent\0\x01";
 /// `[len: u32][crc32: u32]` in front of every frame.
 const HEADER: usize = 8;
 /// `[kind: u8][prev: u64][through: u64]` at the start of every frame body.
@@ -15,9 +18,14 @@ const REWRITE_CHUNK: usize = 4096;
 /// An append-only file of CRC-framed, chained batches.
 ///
 /// ```text
+/// "ruvent\0" 0x01                                       file header, once
 /// [len u32 LE][crc32 u32 LE]  [kind u8][prev u64 LE][through u64 LE][bincode(Vec<Record>)]
 ///                             '------------------- covered by crc -------------------'
 /// ```
+///
+/// The header is what lets damage be told from a wrong path. Without it a
+/// file that is not a journal at all would look like a journal whose every
+/// frame is torn, and opening it would cut it to nothing.
 ///
 /// Three independent things keep one write from damaging another, and none of
 /// them is a clock:
@@ -79,9 +87,22 @@ impl FileJournal {
             Err(error) => return Err(error),
         }
 
+        // Nothing, or a header cut short by a crash while the journal was
+        // being created: an empty journal. Anything else must carry the
+        // header, or it is somebody else's file.
+        let fresh = bytes.len() < MAGIC.len() && MAGIC.starts_with(&bytes);
+        if fresh {
+            let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&path)?;
+            file.write_all(MAGIC)?;
+            file.sync_all()?;
+            bytes = MAGIC.to_vec();
+        } else if !bytes.starts_with(MAGIC) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a ruvent journal of this version; it was left untouched", path.display())));
+        }
+
         let mut records = Vec::new();
         let mut chain = 0u64;
-        let mut good = 0usize;
+        let mut good = MAGIC.len();
         while bytes.len() - good >= HEADER {
             let length = u32::from_le_bytes(bytes[good..good + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(bytes[good + 4..good + 8].try_into().unwrap());
@@ -141,7 +162,7 @@ impl Journal for FileJournal {
     }
 
     async fn rewrite(&mut self, at: u64, records: &[Record]) -> io::Result<()> {
-        let mut buffer = Vec::new();
+        let mut buffer = MAGIC.to_vec();
         for chunk in records.chunks(REWRITE_CHUNK) {
             buffer.extend_from_slice(&frame(SNAPSHOT, at, at, chunk)?);
         }

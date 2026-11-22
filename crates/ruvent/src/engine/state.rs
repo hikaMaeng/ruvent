@@ -37,9 +37,10 @@ struct Execution {
     fingerprint: u128,
     attempt: u64,
     attempts: u32,
-    /// Someone is running it right now. Volatile: false after a restart, so
-    /// every unfinished execution can be taken up again.
-    held: bool,
+    /// The message being run right now, if anyone is running it. Volatile:
+    /// empty after a restart, so every unfinished execution can be taken up
+    /// again.
+    held: Option<(Text, u64)>,
     done: Option<(bool, Bytes, u64)>,
     /// Its message is on a queue that is configured not to be journaled.
     transient: bool,
@@ -175,13 +176,25 @@ impl State {
                 self.next_attempt = self.next_attempt.max(attempt + 1);
                 self.executions.insert(
                     key.clone(),
-                    Execution { request: *request, fingerprint: *fingerprint, attempt: *attempt, attempts: *attempts, held: false, done: done.clone(), transient: false, dirty: false, on_disk: true },
+                    Execution { request: *request, fingerprint: *fingerprint, attempt: *attempt, attempts: *attempts, held: None, done: done.clone(), transient: false, dirty: false, on_disk: true },
                 );
             }
             Record::Forget { key } => {
                 self.executions.remove(key);
             }
-            Record::Event(event) => self.remember(event.clone(), now, false),
+            Record::Event(event) => {
+                // Retention dropped this event from memory, it was appended
+                // again under the same id, and the journal holds both. The
+                // later statement wins: the log never holds one event twice.
+                if let Some(earlier) = self.ids.get(&event.event_id).map(|earlier| earlier.position) {
+                    if let Some(at) = self.order.iter().position(|kept| kept.position == earlier) {
+                        let superseded = self.order.remove(at).expect("index was just found");
+                        self.bytes -= cost(&superseded);
+                    }
+                    self.staged.retain(|staged| staged.position != earlier);
+                }
+                self.remember(event.clone(), now, false);
+            }
         }
     }
 
@@ -239,6 +252,12 @@ impl State {
         for (queue, id, command) in std::mem::take(&mut self.buried) {
             records.push(Record::Dead { queue, id, command });
         }
+        // Forgetting comes first. A key forgotten when its dedup window ran
+        // out may have been started again since, and that new execution is
+        // what the journal must end up saying.
+        for key in std::mem::take(&mut self.forgotten) {
+            records.push(Record::Forget { key });
+        }
         for key in std::mem::take(&mut self.touched) {
             let Some(execution) = self.executions.get_mut(&key) else { continue };
             let wanted = Self::wanted(&self.persist, execution);
@@ -249,9 +268,6 @@ impl State {
             }
             execution.dirty = false;
             execution.on_disk = wanted;
-        }
-        for key in std::mem::take(&mut self.forgotten) {
-            records.push(Record::Forget { key });
         }
         let dropped = self.drop_through;
         records.extend(std::mem::take(&mut self.unwritten).into_iter().filter(|event| event.position > dropped).map(Record::Event));
@@ -436,7 +452,7 @@ impl State {
         let key = &command.transaction_key;
         let Some(execution) = self.executions.get_mut(key) else { return };
         execution.done = Some((ok, payload.clone(), now));
-        execution.held = false;
+        execution.held = None;
         self.touch(key);
         self.append(result_event(command, ok, payload, now), now);
 
@@ -471,14 +487,14 @@ impl State {
             Conflict,
             Done(bool, Bytes),
             Idle(u32),
-            Held(EventId),
+            Held(Option<(Text, u64)>),
         }
         let seen = match self.executions.get(&key) {
             None => Seen::New,
             Some(execution) if execution.fingerprint != print => Seen::Conflict,
             Some(execution) => match &execution.done {
                 Some((ok, payload, _)) => Seen::Done(*ok, payload.clone()),
-                None if execution.held => Seen::Held(execution.request),
+                None if execution.held.is_some() => Seen::Held(execution.held.clone()),
                 None => Seen::Idle(execution.attempts),
             },
         };
@@ -505,12 +521,17 @@ impl State {
                 self.remove(queue, id);
                 return Begin::Settled;
             }
-            Seen::Held(request) => {
+            Seen::Held(holder) => {
                 // One event, one worker. A second submission of a running
                 // transaction is the same event sent again, so it is dropped:
-                // it does not attach itself to the execution. The source
-                // command is kept — it is what a later attempt would run.
-                if request != queued.event_id {
+                // it does not attach itself to the execution.
+                //
+                // Only the message being run is kept — it is what a later
+                // attempt would run, and it can come back here when a consumer
+                // asked for a visibility deadline. Any other message is
+                // dropped, even one carrying the very same event: nobody
+                // would ever finish or return it.
+                if holder.as_ref() != Some(&(queue.clone(), id)) {
                     self.remove(queue, id);
                 }
                 return Begin::Duplicate;
@@ -525,7 +546,7 @@ impl State {
             fingerprint: print,
             attempt,
             attempts,
-            held: true,
+            held: Some((queue.clone(), id)),
             done: None,
             transient,
             dirty: false,
@@ -533,24 +554,28 @@ impl State {
         });
         execution.attempt = attempt;
         execution.attempts = attempts;
-        execution.held = true;
+        execution.held = Some((queue.clone(), id));
         self.touch(&key);
         Begin::Claimed { command, attempt, attempts }
     }
 
+    fn running(execution: &Execution, attempt: u64) -> bool {
+        execution.done.is_none() && execution.held.is_some() && execution.attempt == attempt
+    }
+
     fn owned(&mut self, key: &str, attempt: u64) -> Option<&mut Execution> {
-        self.executions.get_mut(key).filter(|execution| execution.done.is_none() && execution.held && execution.attempt == attempt)
+        self.executions.get_mut(key).filter(|execution| Self::running(execution, attempt))
     }
 
     /// Whether this attempt is still the one running the execution.
-    pub fn owns(&mut self, key: &str, attempt: u64) -> bool {
-        self.owned(key, attempt).is_some()
+    pub fn owns(&self, key: &str, attempt: u64) -> bool {
+        self.executions.get(key).is_some_and(|execution| Self::running(execution, attempt))
     }
 
     /// Gives the execution up so another attempt may run it after `retry` ms.
     pub fn release(&mut self, key: &str, attempt: u64, queue: &Text, id: u64, retry: u64, now: u64) -> bool {
         let Some(execution) = self.owned(key, attempt) else { return false };
-        execution.held = false;
+        execution.held = None;
         if let Some(queue) = self.queues.get_mut(queue) {
             queue.give_back(id, retry, now);
         }
@@ -591,3 +616,6 @@ impl State {
         true
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -3,4 +3,6 @@
 
 mod app;
 mod engine;
+mod file_format;
 mod journal;
+mod wire;
