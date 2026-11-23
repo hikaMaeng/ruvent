@@ -1,6 +1,6 @@
 # 제안: ruvent 위의 apibond, 그리고 그에 필요한 라이브러리 변경
 
-상태: **승인 대기** (2026-11-23). 승인 전에는 코드를 바꾸지 않는다.
+상태: **라이브러리 부분(3장 L1~L3)은 [library-overhaul.md](library-overhaul.md)로 대체됨** (2026-11-23). 사용자 지시에 따라 apibond는 라이브러리 개편을 실제 적용에서 검증하는 프로젝트로 두고, 4장 이후는 개편이 끝난 뒤 그 계획에 맞춰 다시 쓴다. 1장의 원문 인용은 유효하다.
 
 `F:\dev\apibond`(Rust, 약 2,300줄)는 OpenAI·Anthropic·Responses·Embeddings 요청을 여러 추론 서버로 나누는
 중계기다. 공개 모델 별칭 하나, 세션 고정, 부하 기반 배정, 스트리밍 중계, Responses·파일 ID 소유 추적을 한다.
