@@ -1,10 +1,9 @@
-//! The HTTP binary's router over real TCP, upstream in-process.
+//! The HTTP protocol over real TCP, upstream in-process.
 
 use ruvent::{Engine, EngineConfig};
 use ruvent_proxy::config::{AuthMode, StaticToken};
-use ruvent_proxy::{InProcess, Proxy, ProxyConfig};
+use ruvent_proxy::{InProcess, ProxyConfig, Server};
 use serde_json::Value;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -14,11 +13,10 @@ async fn start() -> std::net::SocketAddr {
     let mut config = ProxyConfig::open("127.0.0.1:0", "in-process");
     config.auth.mode = AuthMode::Static;
     config.auth.tokens = vec![StaticToken { token: "t".into(), user: "u".into(), channels: vec!["room*".into()] }];
-    let proxy = Proxy::start(config, Arc::new(InProcess { engine, credential: "proxy".into() }));
-    proxy.ready().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(ruvent_proxy_http::serve(listener, proxy));
+    let bound = Server::new().config(config).upstream(InProcess { engine, credential: "proxy".into() }).bind().await.unwrap();
+    bound.proxy().ready().await;
+    let address = bound.local_addr().unwrap();
+    tokio::spawn(bound.serve());
     address
 }
 

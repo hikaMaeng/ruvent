@@ -132,7 +132,7 @@ async fn dispatch(peer: &ruvent::Client, channel: &str, n: u64) {
 }
 
 async fn user(proxy: &Proxy, name: &str) -> (ruvent_proxy::UserHandle, mpsc::Receiver<Arc<str>>) {
-    proxy.attach(Arc::new(User { name: name.into(), scope: vec![ruvent::Pattern("*".into())] })).await.unwrap()
+    proxy.attach(Arc::new(User::new(name, ["*"]))).await.unwrap()
 }
 
 /// Publishes a marker event and returns once a user receives it: everything before it has been fanned out.
@@ -261,7 +261,7 @@ async fn a_slow_user_is_disconnected_and_nobody_else_is() {
 async fn a_publish_outside_the_users_channels_is_refused() {
     let setup = setup(open()).await;
     setup.proxy.ready().await;
-    let user = User { name: "u".into(), scope: vec![ruvent::Pattern("public.*".into())] };
+    let user = User::new("u", ["public.*"]);
     let refused: Publish = serde_json::from_str(r#"{"kind":"dispatch","channel":"private.x","type":"t","payload":1}"#).unwrap();
     let outcome = setup.proxy.publish(&user, refused).await;
     assert!(!outcome.ok);
@@ -275,7 +275,7 @@ async fn a_publish_outside_the_users_channels_is_refused() {
 async fn a_registration_carries_the_end_user_as_delegate() {
     let setup = setup(open()).await;
     setup.proxy.ready().await;
-    let user = User { name: "alice".into(), scope: vec![ruvent::Pattern("*".into())] };
+    let user = User::new("alice", ["*"]);
     let publish: Publish = serde_json::from_str(r#"{"kind":"claimable","channel":"jobs","type":"run","payload":{"n":1}}"#).unwrap();
     let outcome = setup.proxy.publish(&user, publish).await;
     let id: EventId = outcome.id.unwrap().parse().unwrap();
@@ -285,18 +285,18 @@ async fn a_registration_carries_the_end_user_as_delegate() {
     assert_eq!(&claimed.payload[..], br#"{"n":1}"#);
 }
 
-/// Static tokens: a listed token is the listed user with the listed channels; anything else is rejected.
+/// Static tokens: a listed token is the listed user with the listed channels; another token is rejected, none is missing.
 #[tokio::test]
 async fn static_tokens_let_in_listed_users_only() {
     let mut config = open();
     config.auth.mode = AuthMode::Static;
     config.auth.tokens = vec![StaticToken { token: "t1".into(), user: "bob".into(), channels: vec!["chat.*".into()] }];
     let setup = setup(config).await;
-    let bob = setup.proxy.authenticate(Some("t1")).await.unwrap();
+    let bob = setup.proxy.authenticate_by_config(Some("t1")).await.unwrap();
     assert_eq!(bob.name, "bob");
     assert!(bob.may_use("chat.x") && !bob.may_use("admin"));
-    assert_eq!(setup.proxy.authenticate(Some("nope")).await.unwrap_err(), Denied::Rejected);
-    assert_eq!(setup.proxy.authenticate(None).await.unwrap_err(), Denied::Rejected);
+    assert_eq!(setup.proxy.authenticate_by_config(Some("nope")).await.unwrap_err(), Denied::Rejected);
+    assert_eq!(setup.proxy.authenticate_by_config(None).await.unwrap_err(), Denied::Missing, "no token: a protocol may ask for one");
 }
 
 fn worker_config(timeout_ms: u64) -> ProxyConfig {
@@ -327,10 +327,10 @@ async fn an_authentication_worker_lets_in_and_turns_away() {
     let (worker, worker_inbox) = ruvent::connect(&setup.engine, "auth-worker", 1024).await.unwrap();
     tokio::spawn(run_auth_worker(worker, worker_inbox));
     setup.proxy.ready().await;
-    let carol = setup.proxy.authenticate(Some("good")).await.unwrap();
+    let carol = setup.proxy.authenticate_by_config(Some("good")).await.unwrap();
     assert_eq!(carol.name, "carol");
     assert!(carol.may_use("carol.inbox") && !carol.may_use("other"));
-    assert_eq!(setup.proxy.authenticate(Some("bad")).await.unwrap_err(), Denied::Rejected);
+    assert_eq!(setup.proxy.authenticate_by_config(Some("bad")).await.unwrap_err(), Denied::Rejected);
 }
 
 /// Worker authentication with no worker running: the user is turned away after the timeout.
@@ -338,7 +338,7 @@ async fn an_authentication_worker_lets_in_and_turns_away() {
 async fn an_authentication_nobody_answers_times_out() {
     let setup = setup(worker_config(200)).await;
     setup.proxy.ready().await;
-    assert_eq!(setup.proxy.authenticate(Some("good")).await.unwrap_err(), Denied::Timeout);
+    assert_eq!(setup.proxy.authenticate_by_config(Some("good")).await.unwrap_err(), Denied::Timeout);
     drop(setup.peer_inbox);
 }
 

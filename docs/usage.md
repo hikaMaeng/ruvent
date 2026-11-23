@@ -48,15 +48,27 @@ running.wait().await.ok();
 
 ## 프록시
 
+프록시는 배포용 바이너리가 없다. `ruvent-proxy`에 의존하는 프로그램을 만든다. 프로토콜은 feature(`ws`, `http`,
+기본은 둘 다)로 고르고, 켠 프로토콜은 한 `listen` 주소에서 함께 열린다.
+
+```rust,ignore
+#[tokio::main]
+async fn main() -> Result<(), ruvent_proxy::LaunchError> {
+    ruvent_proxy::Server::new().run().await              // 설정대로
+    // ruvent_proxy::Server::new().hooks(Domain).run().await   // 도메인 훅을 붙여서
+}
+```
+
 ```sh
-cargo run --release -p ruvent-proxy-ws -- crates/ruvent-proxy-ws/proxy-ws.example.json
-cargo run --release -p ruvent-proxy-http -- crates/ruvent-proxy-http/proxy-http.example.json
+cargo run --release -p ruvent-proxy --example plain -- crates/ruvent-proxy/proxy.example.json
+cargo run --release -p ruvent-proxy --example custom -- crates/ruvent-proxy/proxy.example.json
 ```
 
 * WS: `GET /v1/ws?token=…` 뒤에 JSON 메시지(`publish`, `subscribe`, `unsubscribe`)를 주고받는다.
 * HTTP: `POST /v1/events`(Bearer 토큰)로 등록, `GET /v1/stream?channel=…`(SSE)로 받는다.
-* 인증 모드: `none`, `static`(JSON의 토큰 목록), `worker`(인증 착수 이벤트를 인증 워커가 처리). 메시지 형식과
-  설정은 [crates/ruvent-proxy/README.md](../crates/ruvent-proxy/README.md).
+* 훅: `authenticate`, `subscribe`, `publish`, `deliver` 중 필요한 것만 쓴다. 쓰지 않은 훅은 설정의 인증 모드
+  (`none`, `static`, `worker`)와 채널 범위를 따른다. 훅, 메시지 형식, 설정은
+  [crates/ruvent-proxy/README.md](../crates/ruvent-proxy/README.md).
 
 ## 워커가 정하는 것
 

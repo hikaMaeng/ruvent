@@ -1,5 +1,5 @@
-//! The proxy's JSON configuration. A proxy carries no user code: everything
-//! it decides is in this file.
+//! The proxy's JSON configuration. A proxy built with no hooks decides
+//! everything from this file; hooks replace the parts they override.
 
 use ruvent::Pattern;
 use serde::Deserialize;

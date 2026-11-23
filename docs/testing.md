@@ -11,7 +11,8 @@ cargo xtask mutants           # 코어 핵심 파일의 변이 테스트 (cargo-
 cargo run --release -p ruvent --example bench   # 측정
 ```
 
-마지막 실행 기록: [reports/test-2026-11-23.txt](reports/test-2026-11-23.txt). 측정:
+마지막 실행 기록: [reports/test-2026-11-23-proxy.txt](reports/test-2026-11-23-proxy.txt) (프록시를 라이브러리 하나로 합친 뒤).
+그 전 기록: [reports/test-2026-11-23.txt](reports/test-2026-11-23.txt). 측정:
 [reports/bench-2026-11-23.txt](reports/bench-2026-11-23.txt).
 
 `verify`는 아래 순서로 돌고, 처음 실패한 관문에서 멈춘다. 관문마다 `gate name=… status=ok|failed` 한 줄을 남긴다.
@@ -28,7 +29,8 @@ cargo run --release -p ruvent --example bench   # 측정
 | protocol | `-p ruvent-protocol` | 와이어 형식 |
 | server | `-p ruvent-server` | 실제 TCP 서버 |
 | client and workers | `-p ruvent-client` | 워커 프레임워크 |
-| proxies | `-p ruvent-proxy -p ruvent-proxy-ws -p ruvent-proxy-http` | 집약·인증·바이너리 라우터 |
+| proxy | `-p ruvent-proxy` | 집약·인증·훅·두 프로토콜(실제 TCP) |
+| proxy: ws only / http only / no protocol | `clippy -p ruvent-proxy --no-default-features [--features ws\|http] --all-targets -D warnings` | 한 프로토콜만, 또는 프로토콜 없이 빌드할 때 깨지는 cfg |
 
 ## 수준
 
@@ -143,13 +145,17 @@ cargo run --release -p ruvent --example bench   # 측정
 | 별도 예산 | `a_saturated_executor_does_not_slow_the_event_workers` |
 | 장애 표면화(D8) | `the_app_ends_with_an_error_when_the_engine_stops`, `a_refused_subscription_fails_start` |
 
-## 프록시 (`crates/ruvent-proxy*/`)
+## 프록시 (`crates/ruvent-proxy/`)
 
 | 영역 | 테스트 |
 | --- | --- |
-| 설정·메시지 | `the_example_configuration_parses`, `worker_mode_without_its_section_is_refused`, `a_publish_request_parses_with_its_raw_payload`, `an_event_carries_json_payloads_as_json_and_others_as_strings`, `channel_values_are_collected_and_unescaped` |
+| 설정·메시지 | `the_example_configuration_parses`, `worker_mode_without_its_section_is_refused`, `a_publish_request_parses_with_its_raw_payload`, `an_event_carries_json_payloads_as_json_and_others_as_strings`, `channel_values_are_collected_and_unescaped`, `headers_cookies_and_bearer_tokens_are_read` |
 | 구독 집약 | `three_users_on_one_channel_cost_one_upstream_delivery`, `a_late_joiner_gets_only_events_after_it_joined`, `resubscribing_never_shows_events_from_the_gap`, `the_last_user_leaving_cancels_the_upstream_subscription`, `after_the_upstream_drops_the_proxy_resubscribes` |
 | 사용자 범위·위임 | `a_publish_outside_the_users_channels_is_refused`, `a_registration_carries_the_end_user_as_delegate`, `requests_are_answered_in_the_users_stream` |
 | 인증 | `static_tokens_let_in_listed_users_only`, `an_authentication_worker_lets_in_and_turns_away`, `an_authentication_nobody_answers_times_out` |
-| WS 바이너리(실제 TCP) | `a_websocket_user_subscribes_receives_and_publishes`, `a_websocket_with_a_wrong_token_is_turned_away`, `health_is_ok_while_the_upstream_is_up` |
-| HTTP 바이너리(실제 TCP) | `a_post_reaches_an_sse_subscriber`, `a_post_is_refused_for_a_bad_token_or_a_foreign_channel` |
+| WS 프로토콜(실제 TCP) | `a_websocket_user_subscribes_receives_and_publishes`, `a_websocket_with_a_wrong_token_is_turned_away`, `health_is_ok_while_the_upstream_is_up` |
+| HTTP 프로토콜(실제 TCP) | `a_post_reaches_an_sse_subscriber`, `a_post_is_refused_for_a_bad_token_or_a_foreign_channel` |
+| `Server`로 만든 프록시: 설정만으로 실행, 두 프로토콜이 한 주소 | `a_configuration_file_and_nothing_else_is_a_running_proxy_for_both_protocols` |
+| 훅: 인증·사용자 데이터·구독 판단 | `custom_hooks_decide_who_comes_in_and_carry_the_domains_data` |
+| 훅: 등록 거절 원인(HTTP 상태)과 재작성 | `a_publish_hook_refuses_with_its_own_cause_and_rewrites_what_it_allows` |
+| 훅: 사용자별 전달 | `a_deliver_hook_picks_which_users_see_an_event` |

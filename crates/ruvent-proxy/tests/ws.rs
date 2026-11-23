@@ -1,22 +1,20 @@
-//! The WebSocket binary's router over real TCP, upstream in-process.
+//! The WebSocket protocol over real TCP, upstream in-process.
 
 use futures_util::{SinkExt, StreamExt};
 use ruvent::{Bytes, Engine, EngineConfig, Envelope, Methods};
 use ruvent_proxy::config::{AuthMode, StaticToken};
-use ruvent_proxy::{InProcess, Proxy, ProxyConfig};
+use ruvent_proxy::{InProcess, ProxyConfig, Server};
 use serde_json::Value;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
 async fn start(config: ProxyConfig) -> (Engine, std::net::SocketAddr) {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let proxy = Proxy::start(config, Arc::new(InProcess { engine: engine.clone(), credential: "proxy".into() }));
-    proxy.ready().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(ruvent_proxy_ws::serve(listener, proxy));
+    let bound = Server::new().config(config).upstream(InProcess { engine: engine.clone(), credential: "proxy".into() }).bind().await.unwrap();
+    bound.proxy().ready().await;
+    let address = bound.local_addr().unwrap();
+    tokio::spawn(bound.serve());
     (engine, address)
 }
 

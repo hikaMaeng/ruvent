@@ -1,4 +1,4 @@
-//! The user-facing JSON, shared by every protocol binary.
+//! The user-facing JSON, shared by every protocol.
 //!
 //! User → proxy:
 //!
@@ -20,10 +20,11 @@
 //! A payload travels as the JSON bytes the user sent. An event payload that
 //! is not JSON is shown as a JSON string of its bytes, decoded lossily.
 
-use ruvent::Envelope;
+use ruvent::{Envelope, Refusal};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
+use std::fmt;
 use std::sync::Arc;
 
 /// One message from a user.
@@ -82,6 +83,8 @@ pub enum PublishKind {
 }
 
 /// A registration a user asks for. Also the body of `POST /v1/events`.
+///
+/// A publish hook may change it before it is registered.
 #[derive(Debug, Deserialize)]
 pub struct Publish {
     pub kind: PublishKind,
@@ -99,6 +102,64 @@ pub struct Publish {
     pub reference: Option<Value>,
 }
 
+/// Why a request was turned down. A protocol picks its status from it
+/// (HTTP: 400, 403, 409, 503); the user sees the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// The request is wrong in itself.
+    Invalid,
+    /// The user may not do this.
+    Forbidden,
+    /// It clashes with what is there (an event with this id is waiting).
+    Conflict,
+    /// The proxy or the event server cannot take it now.
+    Unavailable,
+}
+
+/// A request turned down: by a hook, by the proxy, or by the event server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub cause: Cause,
+    pub message: String,
+}
+
+impl Rejection {
+    pub fn new(cause: Cause, message: impl Into<String>) -> Self {
+        Rejection { cause, message: message.into() }
+    }
+
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Rejection::new(Cause::Invalid, message)
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Rejection::new(Cause::Forbidden, message)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Rejection::new(Cause::Unavailable, message)
+    }
+
+    /// What the event server's refusal means to a user.
+    pub fn from_refusal(refusal: Refusal) -> Self {
+        let cause = match refusal {
+            Refusal::Duplicate => Cause::Conflict,
+            Refusal::Forbidden | Refusal::WrongCredential => Cause::Forbidden,
+            Refusal::Closed => Cause::Unavailable,
+            _ => Cause::Invalid,
+        };
+        Rejection::new(cause, refusal.to_string().to_lowercase())
+    }
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Rejection {}
+
 /// The answer to one request.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Outcome {
@@ -110,15 +171,23 @@ pub struct Outcome {
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why it failed; not sent to the user.
+    #[serde(skip)]
+    pub cause: Option<Cause>,
 }
 
 impl Outcome {
     pub fn ok(reference: Option<Value>, id: Option<String>) -> Self {
-        Outcome { op: "result", reference, ok: true, id, error: None }
+        Outcome { op: "result", reference, ok: true, id, error: None, cause: None }
     }
 
+    /// A failure of the request itself ([`Cause::Invalid`]).
     pub fn failed(reference: Option<Value>, error: impl Into<String>) -> Self {
-        Outcome { op: "result", reference, ok: false, id: None, error: Some(error.into()) }
+        Outcome::rejected(reference, Rejection::invalid(error))
+    }
+
+    pub fn rejected(reference: Option<Value>, rejection: Rejection) -> Self {
+        Outcome { op: "result", reference, ok: false, id: None, error: Some(rejection.message), cause: Some(rejection.cause) }
     }
 
     /// The JSON text sent to the user.

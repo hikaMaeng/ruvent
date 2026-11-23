@@ -21,10 +21,16 @@
 //! never receives an event sent before its subscription took effect — in
 //! particular after `0 → 1 → 0 → 1`, nothing of the first subscription leaks
 //! into the second.
+//!
+//! **Hooks.** Authentication, subscribe and publish decisions run on the
+//! caller's task before anything reaches the hub; only [`crate::Hooks::deliver`]
+//! runs inside it, once per event and user.
 
 use crate::auth::{self, AuthAnswer, AuthRequest, Denied, User};
 use crate::config::ProxyConfig;
-use crate::message::{event_text, Outcome, Publish, PublishKind, Request};
+use crate::handshake::Handshake;
+use crate::hooks::{Context, Defaults, Hooks};
+use crate::message::{event_text, Outcome, Publish, PublishKind, Rejection, Request};
 use crate::upstream::Connector;
 use parking_lot::RwLock;
 use ruvent::{Bytes, Envelope, EventId, Inbox, Incoming, Methods, Name, Refusal};
@@ -40,13 +46,14 @@ pub type UserId = u64;
 /// Commands the hub accepts from users and from itself.
 enum Command {
     Attach {
+        user: Arc<User>,
         out: mpsc::Sender<Arc<str>>,
         reply: oneshot::Sender<UserId>,
     },
     Join {
         user: UserId,
         channel: Name,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), Rejection>>,
     },
     Leave {
         user: UserId,
@@ -87,7 +94,7 @@ struct Waiter {
     /// The subscribe whose marker activates this user: the channel's `issued` when it joined.
     target: u64,
     user: UserId,
-    reply: oneshot::Sender<Result<(), String>>,
+    reply: oneshot::Sender<Result<(), Rejection>>,
 }
 
 /// One channel's upstream subscription and its users.
@@ -111,6 +118,7 @@ struct Channel {
 }
 
 struct Attached {
+    user: Arc<User>,
     out: mpsc::Sender<Arc<str>>,
     channels: HashSet<Name>,
 }
@@ -119,6 +127,7 @@ struct Shared {
     commands: mpsc::Sender<Command>,
     upstream: RwLock<Option<Arc<dyn Methods>>>,
     config: ProxyConfig,
+    hooks: Arc<dyn Hooks>,
     ready: watch::Receiver<bool>,
 }
 
@@ -132,11 +141,16 @@ pub struct Proxy {
 const COMMANDS: usize = 4096;
 
 impl Proxy {
-    /// Starts the hub and connects upstream in the background (retrying with backoff).
+    /// Starts the hub with the configured behaviour ([`Defaults`]).
     pub fn start(config: ProxyConfig, connector: Arc<dyn Connector>) -> Proxy {
+        Proxy::start_with(config, connector, Arc::new(Defaults))
+    }
+
+    /// Starts the hub and connects upstream in the background (retrying with backoff).
+    pub fn start_with(config: ProxyConfig, connector: Arc<dyn Connector>, hooks: Arc<dyn Hooks>) -> Proxy {
         let (commands, receiver) = mpsc::channel(COMMANDS);
         let (ready_tx, ready) = watch::channel(false);
-        let shared = Arc::new(Shared { commands: commands.clone(), upstream: RwLock::new(None), config: config.clone(), ready });
+        let shared = Arc::new(Shared { commands: commands.clone(), upstream: RwLock::new(None), config: config.clone(), hooks, ready });
         let hub = Hub {
             shared: shared.clone(),
             commands: receiver,
@@ -171,18 +185,27 @@ impl Proxy {
         *self.shared.ready.borrow()
     }
 
-    fn upstream(&self) -> Result<Arc<dyn Methods>, String> {
-        self.shared.upstream.read().clone().ok_or_else(|| "upstream unavailable".to_owned())
+    pub(crate) fn upstream(&self) -> Result<Arc<dyn Methods>, Rejection> {
+        self.shared.upstream.read().clone().ok_or_else(|| Rejection::unavailable("upstream unavailable"))
     }
 
-    /// Authenticates a token according to `auth.mode`.
-    pub async fn authenticate(&self, token: Option<&str>) -> Result<Arc<User>, Denied> {
+    fn context(&self) -> Context<'_> {
+        Context::new(self)
+    }
+
+    /// Who the user of this handshake is: [`Hooks::authenticate`].
+    pub async fn authenticate(&self, handshake: &Handshake) -> Result<Arc<User>, Denied> {
+        self.shared.hooks.authenticate(self.context(), handshake).await.map(Arc::new)
+    }
+
+    /// Authenticates a token according to `auth.mode`: the default hook.
+    pub async fn authenticate_by_config(&self, token: Option<&str>) -> Result<User, Denied> {
         let config = &self.shared.config;
         if let Some(result) = auth::local(config, token) {
-            return result.map(Arc::new);
+            return result;
         }
         let Some(worker) = config.auth.worker.clone() else { return Err(Denied::Unavailable("auth.worker missing".into())) };
-        let Some(token) = token else { return Err(Denied::Rejected) };
+        let Some(token) = token else { return Err(Denied::Missing) };
         let correlation = EventId::new_v7();
         let (reply, answer) = oneshot::channel();
         self.shared.commands.send(Command::AuthWait { correlation, reply }).await.map_err(|_| Denied::Unavailable("proxy stopped".into()))?;
@@ -190,7 +213,7 @@ impl Proxy {
         let event = Envelope::claimable(worker.channel.as_str(), worker.event_type.as_str(), Bytes::from(request)).with_correlation(correlation).with_reply(worker.reply_channel.as_str());
         let registered = match self.upstream() {
             Ok(upstream) => upstream.register_claimable(event).await.map_err(|refusal| Denied::Unavailable(refusal.to_string())),
-            Err(reason) => Err(Denied::Unavailable(reason)),
+            Err(rejection) => Err(Denied::Unavailable(rejection.message)),
         };
         if let Err(denied) = registered {
             let _ = self.shared.commands.send(Command::AuthCancel { correlation }).await;
@@ -198,7 +221,7 @@ impl Proxy {
         }
         // The answer's deadline: one of the two timers this crate declares.
         match tokio::time::timeout(Duration::from_millis(worker.timeout_ms), answer).await {
-            Ok(Ok(answer)) => auth::from_answer(config, answer).map(Arc::new),
+            Ok(Ok(answer)) => auth::from_answer(config, answer),
             Ok(Err(_)) => Err(Denied::Unavailable("proxy stopped".into())),
             Err(_) => {
                 let _ = self.shared.commands.send(Command::AuthCancel { correlation }).await;
@@ -212,39 +235,37 @@ impl Proxy {
     pub async fn attach(&self, user: Arc<User>) -> Result<(UserHandle, mpsc::Receiver<Arc<str>>), String> {
         let (out, events) = mpsc::channel(self.shared.config.user_buffer.max(1));
         let (reply, id) = oneshot::channel();
-        self.shared.commands.send(Command::Attach { out, reply }).await.map_err(|_| "proxy stopped".to_owned())?;
+        self.shared.commands.send(Command::Attach { user: user.clone(), out, reply }).await.map_err(|_| "proxy stopped".to_owned())?;
         let id = id.await.map_err(|_| "proxy stopped".to_owned())?;
         Ok((UserHandle { id, user, proxy: self.clone() }, events))
     }
 
-    /// Registers what a user asked for, within the user's channels.
-    pub async fn publish(&self, user: &User, publish: Publish) -> Outcome {
+    /// Registers what a user asked for, once [`Hooks::publish`] allows it.
+    pub async fn publish(&self, user: &User, mut publish: Publish) -> Outcome {
         let reference = publish.reference.clone();
-        match self.try_publish(user, publish).await {
+        let registered = match self.shared.hooks.publish(self.context(), user, &mut publish).await {
+            Ok(()) => self.register(user, publish).await,
+            Err(rejection) => Err(rejection),
+        };
+        match registered {
             Ok(id) => Outcome::ok(reference, Some(id.to_string())),
-            Err(error) => Outcome::failed(reference, error),
+            Err(rejection) => Outcome::rejected(reference, rejection),
         }
     }
 
-    async fn try_publish(&self, user: &User, publish: Publish) -> Result<EventId, String> {
-        if !user.may_use(&publish.channel) {
-            return Err("forbidden channel".into());
-        }
+    async fn register(&self, user: &User, publish: Publish) -> Result<EventId, Rejection> {
         let payload = Bytes::from(publish.payload.get().as_bytes().to_vec());
         let mut event = match publish.kind {
             PublishKind::Claimable => Envelope::claimable(publish.channel.as_str(), publish.event_type.as_str(), payload),
             PublishKind::Dispatch => Envelope::dispatch(publish.channel.as_str(), publish.event_type.as_str(), payload),
         };
         if let Some(id) = &publish.id {
-            event = event.with_id(id.parse().map_err(|_| "id is not a UUID".to_owned())?);
+            event = event.with_id(id.parse().map_err(|_| Rejection::invalid("id is not a UUID"))?);
         }
         if let Some(correlation) = &publish.correlation {
-            event = event.with_correlation(correlation.parse().map_err(|_| "correlation is not a UUID".to_owned())?);
+            event = event.with_correlation(correlation.parse().map_err(|_| Rejection::invalid("correlation is not a UUID"))?);
         }
         if let Some(reply) = &publish.reply {
-            if !user.may_use(reply) {
-                return Err("forbidden reply channel".into());
-            }
             event = event.with_reply(reply.as_str());
         }
         if self.shared.config.delegate {
@@ -255,7 +276,7 @@ impl Proxy {
             PublishKind::Claimable => upstream.register_claimable(event).await.map(|(id, _)| id),
             PublishKind::Dispatch => upstream.register_dispatch(event).await,
         }
-        .map_err(|refusal| refusal.to_string().to_lowercase())
+        .map_err(Rejection::from_refusal)
     }
 }
 
@@ -267,14 +288,13 @@ pub struct UserHandle {
 }
 
 impl UserHandle {
-    /// Subscribes, and returns once the subscription has taken effect.
-    pub async fn subscribe(&self, channel: &str) -> Result<(), String> {
-        if !self.user.may_use(channel) {
-            return Err("forbidden channel".into());
-        }
+    /// Subscribes once [`Hooks::subscribe`] allows it, and returns once the subscription has taken effect.
+    pub async fn subscribe(&self, channel: &str) -> Result<(), Rejection> {
+        self.proxy.shared.hooks.subscribe(self.proxy.context(), &self.user, channel).await?;
+        let stopped = || Rejection::unavailable("proxy stopped");
         let (reply, done) = oneshot::channel();
-        self.proxy.shared.commands.send(Command::Join { user: self.id, channel: Name::new(channel), reply }).await.map_err(|_| "proxy stopped".to_owned())?;
-        done.await.map_err(|_| "proxy stopped".to_owned())?
+        self.proxy.shared.commands.send(Command::Join { user: self.id, channel: Name::new(channel), reply }).await.map_err(|_| stopped())?;
+        done.await.map_err(|_| stopped())?
     }
 
     pub async fn unsubscribe(&self, channel: &str) {
@@ -293,7 +313,7 @@ impl UserHandle {
             Request::Publish(publish) => self.proxy.publish(&self.user, publish).await,
             Request::Subscribe { channel, reference } => match self.subscribe(&channel).await {
                 Ok(()) => Outcome::ok(reference, None),
-                Err(error) => Outcome::failed(reference, error),
+                Err(rejection) => Outcome::rejected(reference, rejection),
             },
             Request::Unsubscribe { channel, reference } => {
                 self.unsubscribe(&channel).await;
@@ -487,10 +507,10 @@ impl Hub {
 
     fn command(&mut self, command: Command) {
         match command {
-            Command::Attach { out, reply } => {
+            Command::Attach { user, out, reply } => {
                 let id = self.next_user;
                 self.next_user += 1;
-                self.users.insert(id, Attached { out, channels: HashSet::new() });
+                self.users.insert(id, Attached { user, out, channels: HashSet::new() });
                 let _ = reply.send(id);
             }
             Command::Join { user, channel, reply } => self.join(user, channel, reply),
@@ -512,9 +532,9 @@ impl Hub {
         }
     }
 
-    fn join(&mut self, user: UserId, name: Name, reply: oneshot::Sender<Result<(), String>>) {
+    fn join(&mut self, user: UserId, name: Name, reply: oneshot::Sender<Result<(), Rejection>>) {
         let Some(attached) = self.users.get_mut(&user) else {
-            let _ = reply.send(Err("user detached".into()));
+            let _ = reply.send(Err(Rejection::unavailable("user detached")));
             return;
         };
         attached.channels.insert(name.clone());
@@ -596,7 +616,8 @@ impl Hub {
         let (failed, still): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut channel.waiting).into_iter().partition(|waiter| waiter.target <= seen);
         channel.waiting = still;
         for waiter in failed {
-            let _ = waiter.reply.send(Err(format!("upstream refused: {}", refusal.to_string().to_lowercase())));
+            let rejection = Rejection::from_refusal(refusal);
+            let _ = waiter.reply.send(Err(Rejection { message: format!("upstream refused: {}", rejection.message), ..rejection }));
         }
         self.tidy(name);
     }
@@ -614,9 +635,13 @@ impl Hub {
             return;
         }
         let text = event_text(event);
+        let hooks = &self.shared.hooks;
         let mut full = Vec::new();
         for user in &channel.active {
             if let Some(attached) = self.users.get(user) {
+                if !hooks.deliver(&attached.user, event) {
+                    continue;
+                }
                 if attached.out.try_send(text.clone()).is_err() {
                     full.push(*user);
                 }

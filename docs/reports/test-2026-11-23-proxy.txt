@@ -1,0 +1,312 @@
+# cargo xtask verify  (2026-11-23, proxy rebuilt as one library: protocol features and hooks; working tree as committed with this file)
+# host: Windows-11-10.0.26300-SP0
+# rustc 1.96.0 (ac68faa20 2026-05-25)
+# totals copied from the "test result" lines below: static 18, core lib 40, runtime 14, acceptance 11,
+# protocol 12, server 2 + 9, client/workers 11, proxy lib 6 + hooks 4 + http 2 + hub 12 + ws 3 = 144 tests, 0 failed;
+# plus 2 proxy doc tests (compile only). Previous run with the per-protocol proxy crates: test-2026-11-23.txt (139).
+
+── format : cargo fmt --all -- --check
+gate name=format status=ok seconds=0.4
+── lint : cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.47s
+gate name=lint status=ok seconds=0.6
+── api docs : cargo doc --workspace --no-deps
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
+   Generated F:\dev\ruvent\target\doc\ruvent\index.html and 5 other files
+gate name=api docs status=ok seconds=0.5
+── static : cargo test -p ruvent --test static
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running tests\static\main.rs (target\debug\deps\static-59f4426eaba09e81.exe)
+
+running 18 tests
+test architecture::the_comment_stripper_is_used_on_code ... ok
+test source::the_comment_stripper_keeps_code_and_strings ... ok
+test docs::documents_are_plain_utf8_text ... ok
+test architecture::runtime_dependencies_are_the_declared_set ... ok
+test architecture::every_crate_is_documented_and_linked ... ok
+test docs::document_links_resolve ... ok
+test architecture::every_module_is_in_the_layer_table_and_no_layer_is_stale ... ok
+test architecture::the_core_knows_no_json ... ok
+test docs::every_acceptance_test_quotes_its_requirement ... ok
+test architecture::the_wall_clock_is_read_once_in_the_core ... ok
+test architecture::the_engine_state_has_one_owner ... ok
+test architecture::source_files_are_plain_utf8_text ... ok
+test architecture::modules_depend_only_downward ... ok
+test architecture::the_journal_is_written_from_one_place ... ok
+test architecture::the_server_keeps_no_event_policy ... ok
+test docs::every_test_is_on_the_map_and_the_map_names_only_tests ... ok
+test architecture::no_library_has_unsafe_or_writes_to_the_terminal ... ok
+test architecture::nothing_polls_and_every_timer_is_declared ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+gate name=static status=ok seconds=0.5
+── state machine : cargo test -p ruvent --lib
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src\lib.rs (target\debug\deps\ruvent-982b375ed5451917.exe)
+
+running 40 tests
+test engine::state::tests::dispatch_reaches_exactly_the_subscribers_at_the_moment_it_is_registered ... ok
+test engine::state::tests::completion_from_another_credential_is_refused_and_the_same_credential_on_a_new_connection_succeeds ... ok
+test engine::state::tests::delete_then_claim_and_claim_then_delete ... ok
+test engine::state::tests::an_id_in_the_claimable_queue_refuses_every_kind_of_registration ... ok
+test engine::state::tests::a_thirty_second_claim_expires_after_exactly_thirty_seconds_across_the_u32_millisecond_boundary ... ok
+test engine::state::tests::a_completion_that_arrives_before_the_reclaim_is_accepted_and_after_it_is_refused ... ok
+test engine::state::tests::a_claim_answer_carries_the_whole_envelope_with_key_and_claim_block ... ok
+test engine::state::tests::exhausted_sequences_advance_the_generation_and_gate_the_batch ... ok
+test engine::state::tests::deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_with_one_notice ... ok
+test engine::state::tests::grants_limit_methods_and_channels_and_delegation ... ok
+test engine::state::tests::the_backlog_comes_in_pages_in_work_key_order ... ok
+test engine::state::tests::only_an_external_registration_reclaims_and_only_once_per_batch ... ok
+test envelope::tests::retry_saturates_at_65535 ... ok
+test envelope::tests::the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers ... ok
+test engine::state::tests::recovery_restores_order_and_reissues_what_was_claimed_with_one_more_retry ... ok
+test envelope::tests::the_three_sizes_are_31_39_and_63_bytes_plus_payload ... ok
+test engine::state::tests::of_two_claims_on_one_waiting_event_exactly_one_wins ... ok
+test envelope::tests::a_claim_response_has_these_exact_bytes ... ok
+test names::tests::equal_texts_share_one_handle ... ok
+test engine::state::tests::a_full_snapshot_replays_to_the_same_queue_as_the_records_it_replaced ... ok
+test engine::state::tests::reclaim_keeps_the_work_key_and_a_new_registration_under_the_old_id_gets_another ... ok
+test envelope::tests::layouts_refuse_what_they_must_not_carry ... ok
+test engine::state::tests::reissued_ids_skip_the_old_id_and_every_live_id ... ok
+test engine::state::tests::requests_carrying_server_fields_or_the_wrong_kind_are_malformed ... ok
+test envelope::tests::a_dispatch_delivery_has_these_exact_bytes ... ok
+test envelope::tests::ids_are_uuids_and_nil_means_unassigned ... ok
+test snapshot::tests::the_configuration_picks_channels_and_types ... ok
+test names::tests::a_name_held_elsewhere_survives_a_sweep ... ok
+test snapshot::tests::a_snapshot_file_holds_both_kinds_and_reads_back ... ok
+test journal::tests::a_second_engine_cannot_open_a_journal_in_use ... ok
+test journal::tests::a_version_1_journal_is_refused_and_left_byte_for_byte ... ok
+test envelope::tests::arbitrary_bytes_never_panic_the_decoder ... ok
+test journal::tests::every_record_kind_survives_a_reopen ... ok
+test journal::tests::a_rewritten_journal_decodes_on_its_own_and_accepts_appends ... ok
+test journal::tests::a_torn_last_frame_is_cut_and_everything_before_it_recovered ... ok
+test envelope::tests::every_envelope_round_trips_through_every_layout_that_accepts_it ... ok
+test engine::state::tests::one_off_reply_channels_leave_nothing_behind ... ok
+test names::tests::one_off_names_do_not_grow_the_dictionary_without_bound ... ok
+test engine::state::tests::the_state_machine_agrees_with_the_reference_model ... ok
+test journal::tests::a_completion_frame_cut_at_any_byte_recovers_all_or_nothing ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
+
+gate name=state machine status=ok seconds=2.0
+── runtime : cargo test -p ruvent --test runtime
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running tests\runtime\main.rs (target\debug\deps\runtime-56c6872cfc85e560.exe)
+
+running 14 tests
+test engine::after_shutdown_calls_fail_as_closed ... ok
+test engine::the_subscription_marker_precedes_the_answer ... ok
+test durability::a_failed_write_stops_the_engine_and_releases_nothing_it_carried ... ok
+test engine::subscriptions_take_effect_in_processing_order_within_a_batch ... ok
+test engine::a_claim_answer_keeps_the_values_it_had_when_it_was_made ... ok
+test engine::a_missed_deadline_is_reclaimed_by_the_next_registration ... ok
+test durability::a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on ... ok
+test durability::chosen_channels_are_collected_into_snapshot_files ... ok
+test durability::under_strict_an_answered_registration_survives_a_crash ... ok
+test durability::a_restart_reloads_the_queue_in_order_and_reissues_claimed_events ... ok
+test durability::the_journal_is_compacted_and_the_compacted_file_restarts ... ok
+test engine::the_seven_methods_work_through_the_in_process_client ... ok
+test durability::under_strict_one_connection_receives_in_processing_order ... ok
+test durability::under_strict_registration_waits_for_the_disk_and_a_claim_does_not ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+gate name=runtime status=ok seconds=0.4
+── acceptance : cargo test -p ruvent --test acceptance
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running tests\acceptance\main.rs (target\debug\deps\acceptance-95a8dd94e1a3a1d3.exe)
+
+running 11 tests
+test requirements::a_claim_records_the_worker_and_its_deadline_in_the_event_and_completion_removes_it ... ok
+test requirements::one_small_envelope_carries_id_channel_retry_and_the_claim_for_both_kinds ... ok
+test requirements::a_failure_is_a_completion_and_what_follows_is_new_events_the_worker_chose ... ok
+test requirements::an_id_in_the_queue_cannot_be_registered_again_ids_are_uuidv7_and_a_departed_id_may_return ... ok
+test requirements::every_connection_gets_the_same_methods_and_the_server_never_asks_what_it_is ... ok
+test requirements::a_timed_out_claim_is_returned_to_waiting_at_the_next_registration_with_a_new_id_and_the_late_report_is_ignored ... ok
+test requirements::of_many_workers_racing_for_one_event_exactly_one_takes_it ... ok
+test requirements::unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash ... ok
+test requirements::the_server_offers_exactly_seven_methods_and_deletion_always_announces_its_outcome ... ok
+test requirements::a_dispatch_event_goes_to_whoever_is_connected_at_that_moment_and_is_gone ... ok
+test requirements::a_claim_does_not_wait_for_the_disk_even_under_strict ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+gate name=acceptance status=ok seconds=0.4
+── protocol : cargo test -p ruvent-protocol
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src\lib.rs (target\debug\deps\ruvent_protocol-ef52b805e85bfb6f.exe)
+
+running 12 tests
+test tests::a_claim_call_has_these_exact_bytes ... ok
+test tests::a_hello_frame_has_these_exact_bytes ... ok
+test tests::a_delivery_defines_its_names_first ... ok
+test tests::a_record_from_the_wrong_direction_refuses_the_frame ... ok
+test tests::a_frame_over_the_bound_is_refused_on_both_ends ... ok
+test tests::the_receiver_holds_the_same_bound ... ok
+test tests::after_a_reset_an_old_number_is_never_read_as_a_new_name ... ok
+test tests::unknown_tags_leftover_bytes_and_forbidden_bodies_refuse_the_frame ... ok
+test tests::messages_are_split_across_frames_under_the_bound ... ok
+test tests::every_method_and_every_reply_round_trips ... ok
+test tests::arbitrary_bytes_never_panic_the_decoder ... ok
+test tests::calls_round_trip_through_small_dictionaries ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+   Doc-tests ruvent_protocol
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+gate name=protocol status=ok seconds=0.7
+── server : cargo test -p ruvent-server
+   Compiling ruvent-server v0.1.0 (F:\dev\ruvent\crates\ruvent-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.73s
+     Running unittests src\lib.rs (target\debug\deps\ruvent_server-2fc71395d161c29c.exe)
+
+running 2 tests
+test config::tests::bad_configurations_are_refused_with_a_reason ... ok
+test config::tests::the_example_configuration_parses_into_grants ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\ruvent_server-a141b00b5e9395c7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\remote.rs (target\debug\deps\remote-87a8b925be90a0bb.exe)
+
+running 9 tests
+test a_wrong_token_is_refused_with_its_reason ... ok
+test when_the_server_goes_away_the_inbox_closes_and_calls_fail_closed ... ok
+test a_credential_may_use_only_its_granted_methods_and_channels ... ok
+test a_resent_completion_after_a_lost_reply_has_no_effect_and_no_follow_ups ... ok
+test all_seven_methods_work_over_tcp ... ok
+test local_and_remote_connections_see_the_same_results_in_the_same_order ... ok
+test a_backlog_larger_than_one_page_is_read_to_the_end_by_subscribing_again ... ok
+test after_a_server_restart_a_surviving_workers_old_completion_is_void ... ok
+test a_claim_held_by_a_disconnected_remote_worker_is_reclaimed_by_the_next_registration ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+   Doc-tests ruvent_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+gate name=server status=ok seconds=3.3
+── client and workers : cargo test -p ruvent-client
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src\lib.rs (target\debug\deps\ruvent_client-5d0048c28bc7e705.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\worker.rs (target\debug\deps\worker-0d49393c64699e3e.exe)
+
+running 11 tests
+test a_refused_subscription_fails_start ... ok
+test the_app_ends_with_an_error_when_the_engine_stops ... ok
+test a_handled_event_is_completed_and_its_follow_ups_registered ... ok
+test a_listener_receives_dispatch_events_in_order ... ok
+test a_panicking_handler_is_a_failure_not_a_dead_worker ... ok
+test an_event_past_its_retry_limit_is_completed_without_running_the_handler ... ok
+test a_failed_handler_completes_the_event_and_reports_only_when_asked ... ok
+test a_handler_that_outlives_its_lease_is_reclaimed_and_run_again_with_retry_plus_one ... ok
+test a_worker_with_every_permit_taken_still_runs_work_noticed_meanwhile_once_a_permit_returns ... ok
+test work_reclaimed_ahead_of_the_read_position_and_dropped_by_the_local_limit_is_still_run ... ok
+test a_saturated_executor_does_not_slow_the_event_workers ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests ruvent_client
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+gate name=client and workers status=ok seconds=0.4
+── proxy : cargo test -p ruvent-proxy
+   Compiling ruvent-proxy v0.1.0 (F:\dev\ruvent\crates\ruvent-proxy)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.02s
+     Running unittests src\lib.rs (target\debug\deps\ruvent_proxy-098797a724e57911.exe)
+
+running 6 tests
+test handshake::tests::channel_values_are_collected_and_unescaped ... ok
+test config::tests::worker_mode_without_its_section_is_refused ... ok
+test config::tests::the_example_configuration_parses ... ok
+test handshake::tests::headers_cookies_and_bearer_tokens_are_read ... ok
+test message::tests::a_publish_request_parses_with_its_raw_payload ... ok
+test message::tests::an_event_carries_json_payloads_as_json_and_others_as_strings ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\hooks.rs (target\debug\deps\hooks-3e9b64c9dc544553.exe)
+
+running 4 tests
+test a_publish_hook_refuses_with_its_own_cause_and_rewrites_what_it_allows ... ok
+test custom_hooks_decide_who_comes_in_and_carry_the_domains_data ... ok
+test a_deliver_hook_picks_which_users_see_an_event ... ok
+test a_configuration_file_and_nothing_else_is_a_running_proxy_for_both_protocols ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\http.rs (target\debug\deps\http-a1e3d15015c492a2.exe)
+
+running 2 tests
+test a_post_is_refused_for_a_bad_token_or_a_foreign_channel ... ok
+test a_post_reaches_an_sse_subscriber ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\hub.rs (target\debug\deps\hub-41954c30a8f21ece.exe)
+
+running 12 tests
+test static_tokens_let_in_listed_users_only ... ok
+test a_publish_outside_the_users_channels_is_refused ... ok
+test a_registration_carries_the_end_user_as_delegate ... ok
+test the_last_user_leaving_cancels_the_upstream_subscription ... ok
+test three_users_on_one_channel_cost_one_upstream_delivery ... ok
+test requests_are_answered_in_the_users_stream ... ok
+test an_authentication_worker_lets_in_and_turns_away ... ok
+test after_the_upstream_drops_the_proxy_resubscribes ... ok
+test a_late_joiner_gets_only_events_after_it_joined ... ok
+test resubscribing_never_shows_events_from_the_gap ... ok
+test a_slow_user_is_disconnected_and_nobody_else_is ... ok
+test an_authentication_nobody_answers_times_out ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests\ws.rs (target\debug\deps\ws-e1366b08f0c737e9.exe)
+
+running 3 tests
+test health_is_ok_while_the_upstream_is_up ... ok
+test a_websocket_with_a_wrong_token_is_turned_away ... ok
+test a_websocket_user_subscribes_receives_and_publishes ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests ruvent_proxy
+
+running 2 tests
+test crates\ruvent-proxy\src\lib.rs - (line 10) - compile ... ok
+test crates\ruvent-proxy\src\lib.rs - (line 24) - compile ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+gate name=proxy status=ok seconds=3.8
+── proxy: ws only : cargo clippy -p ruvent-proxy --no-default-features --features ws --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
+gate name=proxy: ws only status=ok seconds=0.5
+── proxy: http only : cargo clippy -p ruvent-proxy --no-default-features --features http --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
+gate name=proxy: http only status=ok seconds=0.4
+── proxy: no protocol : cargo clippy -p ruvent-proxy --no-default-features --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+gate name=proxy: no protocol status=ok seconds=0.4
+verify status=ok

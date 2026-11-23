@@ -15,7 +15,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
   고른 채널을 운영 스냅샷 파일로 모은다.
 
 ```text
-일반 클라이언트 ──► 프록시(ruvent-proxy-ws / -http, JSON 설정) ──┐
+일반 클라이언트 ──► 프록시(ruvent-proxy로 빌드: WS·HTTP, 훅) ───┐
                                                                ├──► 이벤트 서버(ruvent-server: 메서드 7개, 단일 작성자)
                     워커 서버(ruvent-client: App·Service) ─────┘      ├ 착수용 큐: 완료 보고로 제거, 저널 대상
                     내장 워커 = 같은 메서드를 함수로 호출                └ 발송: 등록 순간 구독 접속에 넘기고 제거
@@ -29,9 +29,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 | `ruvent-protocol` | 이진 와이어 프로토콜: 핸드셰이크, 프레임, 접속별 이름 사전, 메서드 레코드 | [crates/ruvent-protocol/README.md](crates/ruvent-protocol/README.md) |
 | `ruvent-server` | 이벤트 서버 바이너리와 수신부. JSON 설정 | [crates/ruvent-server/README.md](crates/ruvent-server/README.md) |
 | `ruvent-client` | 원격 연결과 워커 프레임워크(`App`, `Service`, 실행기, 재시도 정책) | [crates/ruvent-client/README.md](crates/ruvent-client/README.md) |
-| `ruvent-proxy` | 프록시 공통: JSON 설정, 최종 사용자 인증, 채널별 상위 구독 하나 | [crates/ruvent-proxy/README.md](crates/ruvent-proxy/README.md) |
-| `ruvent-proxy-ws` | WebSocket 프록시 바이너리 | [crates/ruvent-proxy-ws/README.md](crates/ruvent-proxy-ws/README.md) |
-| `ruvent-proxy-http` | HTTP 프록시 바이너리(POST 등록, SSE 구독) | [crates/ruvent-proxy-http/README.md](crates/ruvent-proxy-http/README.md) |
+| `ruvent-proxy` | 프록시 서버를 만드는 라이브러리: 프로토콜은 feature(`ws`, `http`), 도메인 규칙은 훅(인증, 구독, 등록, 전달), 채널별 상위 구독 하나. 세 줄 `main`이면 설정대로 도는 서버 | [crates/ruvent-proxy/README.md](crates/ruvent-proxy/README.md) |
 | `xtask` | 검증 관문 `cargo xtask verify` | [docs/testing.md](docs/testing.md) |
 
 ## 문서
