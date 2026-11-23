@@ -132,12 +132,30 @@ impl ProxyConfig {
         Self::parse(&text)
     }
 
+    /// Reads and checks a configuration text.
     pub fn parse(text: &str) -> io::Result<ProxyConfig> {
         let config: ProxyConfig = serde_json::from_str(text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if config.auth.mode == AuthMode::Worker && config.auth.worker.is_none() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "auth.mode is \"worker\" but auth.worker is missing"));
-        }
+        config.check()?;
         Ok(config)
+    }
+
+    /// The rules a configuration must meet beyond its JSON shape. The file
+    /// path and a configuration built in code go through the same check.
+    pub fn check(&self) -> io::Result<()> {
+        let invalid = |message: &str| Err(io::Error::new(io::ErrorKind::InvalidData, message.to_owned()));
+        if self.auth.mode == AuthMode::Worker && self.auth.worker.is_none() {
+            return invalid("auth.mode is \"worker\" but auth.worker is missing");
+        }
+        if self.auth.worker.as_ref().is_some_and(|worker| worker.timeout_ms == 0) {
+            return invalid("auth.worker.timeout_ms must be at least 1");
+        }
+        if self.user_buffer == 0 {
+            return invalid("user_buffer must be at least 1");
+        }
+        if self.reconnect.initial_ms == 0 || self.reconnect.initial_ms > self.reconnect.max_ms {
+            return invalid("reconnect needs 1 <= initial_ms <= max_ms");
+        }
+        Ok(())
     }
 
     /// A configuration for tests and embedding: no auth, every channel.
@@ -160,20 +178,4 @@ pub fn patterns(channels: &[String]) -> Vec<Pattern> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_example_configuration_parses() {
-        let text = include_str!("../../proxy.example.json");
-        let config = ProxyConfig::parse(text).unwrap();
-        assert_eq!(config.auth.mode, AuthMode::Worker);
-        assert!(config.auth.worker.is_some());
-    }
-
-    #[test]
-    fn worker_mode_without_its_section_is_refused() {
-        let text = r#"{"listen":"127.0.0.1:0","upstream":{"address":"a","token":"t"},"auth":{"mode":"worker"}}"#;
-        assert!(ProxyConfig::parse(text).is_err());
-    }
-}
+mod tests;

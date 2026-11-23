@@ -8,7 +8,12 @@
 //! `ruvent-proxy` (features `ws`, `http`, or both) and has this `main` is a
 //! proxy server.
 
+#[cfg(any(feature = "ws", feature = "http"))]
 #[tokio::main]
 async fn main() -> Result<(), ruvent_proxy::LaunchError> {
     ruvent_proxy::Server::new().run().await
 }
+
+/// Built with no protocol there is no server to run.
+#[cfg(not(any(feature = "ws", feature = "http")))]
+fn main() {}

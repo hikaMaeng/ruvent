@@ -18,6 +18,7 @@ http = ["dep:axum", "dep:futures-util"]
 [dependencies]
 ruvent.workspace = true
 ruvent-client.workspace = true
+form_urlencoded.workspace = true
 http.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -29,6 +30,8 @@ futures-util = { workspace = true, optional = true }
 [dev-dependencies]
 # Already in the lock file through axum's `ws` feature; only the tests use it directly.
 tokio-tungstenite = "0.29"
+# The acceptance tests run a real event server over TCP.
+ruvent-server = { path = "../ruvent-server" }
 
 [[test]]
 name = "ws"
@@ -42,10 +45,6 @@ required-features = ["http"]
 name = "hooks"
 required-features = ["ws", "http"]
 
-[[example]]
-name = "plain"
-required-features = ["ws"]
-
-[[example]]
-name = "custom"
-required-features = ["ws"]
+[[test]]
+name = "acceptance"
+required-features = ["ws", "http"]

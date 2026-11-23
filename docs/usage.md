@@ -69,6 +69,8 @@ cargo run --release -p ruvent-proxy --example custom -- crates/ruvent-proxy/prox
 * 훅: `authenticate`, `subscribe`, `publish`, `deliver` 중 필요한 것만 쓴다. 쓰지 않은 훅은 설정의 인증 모드
   (`none`, `static`, `worker`)와 채널 범위를 따른다. 훅, 메시지 형식, 설정은
   [crates/ruvent-proxy/README.md](../crates/ruvent-proxy/README.md).
+* 멈추기: `run()`은 Ctrl-C에, `run_until(신호)`는 그 신호에 끝난다. 끝나면 사용자 연결이 모두 닫히고 상위 연결도
+  놓는다. 바인드만 하고 직접 서비스하려면 `bind()` 뒤 `Bound::serve_until(신호)`.
 
 ## 워커가 정하는 것
 

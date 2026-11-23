@@ -68,3 +68,6 @@ fn denied_status(denied: &Denied) -> StatusCode {
         Denied::Timeout | Denied::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
+
+#[cfg(test)]
+mod tests;

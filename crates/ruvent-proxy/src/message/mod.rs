@@ -20,7 +20,8 @@
 //! A payload travels as the JSON bytes the user sent. An event payload that
 //! is not JSON is shown as a JSON string of its bytes, decoded lossily.
 
-use ruvent::{Envelope, Refusal};
+use ruvent::{Bytes, Envelope, EventId, Refusal};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -84,7 +85,8 @@ pub enum PublishKind {
 
 /// A registration a user asks for. Also the body of `POST /v1/events`.
 ///
-/// A publish hook may change it before it is registered.
+/// A publish hook may change it before it is registered: the fields are
+/// public, and [`Publish::set_payload`] replaces the payload.
 #[derive(Debug, Deserialize)]
 pub struct Publish {
     pub kind: PublishKind,
@@ -100,6 +102,53 @@ pub struct Publish {
     pub correlation: Option<String>,
     #[serde(rename = "ref", default)]
     pub reference: Option<Value>,
+}
+
+impl Publish {
+    /// The request's own shape: `id` and `correlation`, when present, are UUIDs.
+    pub fn check(&self) -> Result<(), Rejection> {
+        self.ids().map(drop)
+    }
+
+    fn ids(&self) -> Result<(Option<EventId>, Option<EventId>), Rejection> {
+        let parse = |field: &Option<String>, what: &str| field.as_deref().map(str::parse::<EventId>).transpose().map_err(|_| Rejection::invalid(format!("{what} is not a UUID")));
+        Ok((parse(&self.id, "id")?, parse(&self.correlation, "correlation")?))
+    }
+
+    /// The event this registration becomes, carrying `delegate` when given.
+    pub fn envelope(&self, delegate: Option<&str>) -> Result<Envelope, Rejection> {
+        let (id, correlation) = self.ids()?;
+        let payload = Bytes::from(self.payload.get().as_bytes().to_vec());
+        let mut event = match self.kind {
+            PublishKind::Claimable => Envelope::claimable(self.channel.as_str(), self.event_type.as_str(), payload),
+            PublishKind::Dispatch => Envelope::dispatch(self.channel.as_str(), self.event_type.as_str(), payload),
+        };
+        if let Some(id) = id {
+            event = event.with_id(id);
+        }
+        if let Some(correlation) = correlation {
+            event = event.with_correlation(correlation);
+        }
+        if let Some(reply) = &self.reply {
+            event = event.with_reply(reply.as_str());
+        }
+        if let Some(delegate) = delegate {
+            event = event.with_delegate(delegate);
+        }
+        Ok(event)
+    }
+
+    /// The payload read as `T`.
+    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<T, Rejection> {
+        serde_json::from_str(self.payload.get()).map_err(|error| Rejection::invalid(format!("payload: {error}")))
+    }
+
+    /// Replaces the payload with `value` as JSON.
+    pub fn set_payload<T: Serialize>(&mut self, value: &T) -> Result<(), Rejection> {
+        let text = serde_json::to_string(value).map_err(|error| Rejection::invalid(format!("payload: {error}")))?;
+        self.payload = RawValue::from_string(text).map_err(|error| Rejection::invalid(format!("payload: {error}")))?;
+        Ok(())
+    }
 }
 
 /// Why a request was turned down. A protocol picks its status from it
@@ -142,11 +191,12 @@ impl Rejection {
 
     /// What the event server's refusal means to a user.
     pub fn from_refusal(refusal: Refusal) -> Self {
+        // No wildcard: a new refusal is a decision about its status.
         let cause = match refusal {
-            Refusal::Duplicate => Cause::Conflict,
+            Refusal::Duplicate | Refusal::AlreadyClaimed | Refusal::NotClaimed | Refusal::StaleToken => Cause::Conflict,
             Refusal::Forbidden | Refusal::WrongCredential => Cause::Forbidden,
             Refusal::Closed => Cause::Unavailable,
-            _ => Cause::Invalid,
+            Refusal::InvalidId | Refusal::Malformed | Refusal::Missing => Cause::Invalid,
         };
         Rejection::new(cause, refusal.to_string().to_lowercase())
     }
@@ -220,26 +270,4 @@ pub fn event_text(event: &Envelope) -> Arc<str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ruvent::Bytes;
-
-    #[test]
-    fn a_publish_request_parses_with_its_raw_payload() {
-        let request = Request::parse(r#"{"op":"publish","kind":"dispatch","channel":"c","type":"t","payload":{"a":[1,2]},"ref":7}"#).unwrap();
-        let Request::Publish(publish) = request else { panic!("not a publish") };
-        assert_eq!(publish.payload.get(), r#"{"a":[1,2]}"#);
-        assert_eq!(publish.reference, Some(Value::from(7)));
-        assert!(Request::parse(r#"{"op":"jump"}"#).is_err());
-    }
-
-    #[test]
-    fn an_event_carries_json_payloads_as_json_and_others_as_strings() {
-        let json = Envelope::dispatch("c", "t", Bytes::from_static(br#"{"x":1}"#));
-        let text: Value = serde_json::from_str(&event_text(&json)).unwrap();
-        assert_eq!(text["payload"]["x"], 1);
-        let binary = Envelope::dispatch("c", "t", Bytes::from_static(b"\xffraw"));
-        let text: Value = serde_json::from_str(&event_text(&binary)).unwrap();
-        assert!(text["payload"].is_string());
-    }
-}
+mod tests;

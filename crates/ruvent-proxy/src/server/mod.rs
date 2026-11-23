@@ -5,17 +5,23 @@
 //!   .hooks(H)              optional; every hook not written keeps the configured behaviour
 //!   .upstream(C)           optional; default is the event server named in the configuration
 //!   .run()                 bind `listen`, start the hub, serve every compiled-in protocol, stop on Ctrl-C
+//!   .run_until(signal)     the same, stopping when `signal` resolves
 //! ```
 //!
 //! [`Server::bind`] stops before serving and hands back the listener and the
 //! hub, for tests and for programs that serve it their own way.
+//!
+//! Stopping stops the hub too: every user's stream ends, WebSocket users see
+//! their socket close, and the upstream connection is dropped.
 
 use crate::config::ProxyConfig;
 use crate::hooks::{Defaults, Hooks};
 use crate::hub::Proxy;
 use crate::protocol::router;
 use crate::upstream::{Connector, Remote};
+use std::ffi::OsString;
 use std::fmt;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -33,6 +39,23 @@ enum Source {
     Arguments,
     File(PathBuf),
     Given(Box<ProxyConfig>),
+}
+
+impl Source {
+    /// The configuration, read and checked. `arguments` are the program's, name first.
+    fn resolve(self, arguments: impl IntoIterator<Item = OsString>) -> Result<ProxyConfig, LaunchError> {
+        let path = match self {
+            Source::Given(config) => return config.check().map(|()| *config).map_err(LaunchError::Invalid),
+            Source::File(path) => path,
+            Source::Arguments => config_path(arguments)?,
+        };
+        ProxyConfig::load(&path).map_err(|error| LaunchError::Config { path, error })
+    }
+}
+
+/// The configuration file a program names as its first argument.
+fn config_path(arguments: impl IntoIterator<Item = OsString>) -> Result<PathBuf, LaunchError> {
+    arguments.into_iter().nth(1).map(PathBuf::from).ok_or(LaunchError::Usage)
 }
 
 impl Default for Server {
@@ -53,7 +76,7 @@ impl Server {
         self
     }
 
-    /// Takes this configuration instead.
+    /// Takes this configuration instead. It is checked as a file would be.
     pub fn config(mut self, config: ProxyConfig) -> Server {
         self.config = Source::Given(Box::new(config));
         self
@@ -71,16 +94,9 @@ impl Server {
         self
     }
 
-    /// Reads the configuration, binds `listen` and starts the hub; serves nothing yet.
+    /// Reads and checks the configuration, binds `listen` and starts the hub; serves nothing yet.
     pub async fn bind(self) -> Result<Bound, LaunchError> {
-        let config = match self.config {
-            Source::Given(config) => *config,
-            Source::File(path) => ProxyConfig::load(&path).map_err(|error| LaunchError::Config { path, error })?,
-            Source::Arguments => {
-                let path = std::env::args_os().nth(1).map(PathBuf::from).ok_or(LaunchError::Usage)?;
-                ProxyConfig::load(&path).map_err(|error| LaunchError::Config { path, error })?
-            }
-        };
+        let config = self.config.resolve(std::env::args_os())?;
         let listener = TcpListener::bind(&config.listen).await.map_err(|error| LaunchError::Listen { address: config.listen.clone(), error })?;
         let upstream = self.upstream.unwrap_or_else(|| Arc::new(Remote { address: config.upstream.address.clone(), token: config.upstream.token.clone() }));
         Ok(Bound { proxy: Proxy::start_with(config, upstream, self.hooks), listener })
@@ -88,11 +104,13 @@ impl Server {
 
     /// Binds and serves until the listener fails or the process gets Ctrl-C.
     pub async fn run(self) -> Result<(), LaunchError> {
-        let bound = self.bind().await?;
-        tokio::select! {
-            served = bound.serve() => served,
-            _ = tokio::signal::ctrl_c() => Ok(()),
-        }
+        self.run_until(tokio::signal::ctrl_c()).await
+    }
+
+    /// Binds and serves until the listener fails or `shutdown` resolves.
+    /// `shutdown` failing (Ctrl-C could not be listened for) is an error too.
+    pub async fn run_until(self, shutdown: impl Future<Output = io::Result<()>>) -> Result<(), LaunchError> {
+        self.bind().await?.serve_until(shutdown).await
     }
 }
 
@@ -113,7 +131,19 @@ impl Bound {
 
     /// Serves every compiled-in protocol until the listener fails.
     pub async fn serve(self) -> Result<(), LaunchError> {
-        axum::serve(self.listener, router(self.proxy).into_make_service_with_connect_info::<SocketAddr>()).await.map_err(LaunchError::Serve)
+        self.serve_until(std::future::pending()).await
+    }
+
+    /// Serves until the listener fails or `shutdown` resolves, then stops the hub.
+    pub async fn serve_until(self, shutdown: impl Future<Output = io::Result<()>>) -> Result<(), LaunchError> {
+        let proxy = self.proxy.clone();
+        let service = router(self.proxy).into_make_service_with_connect_info::<SocketAddr>();
+        let result = tokio::select! {
+            served = axum::serve(self.listener, service).into_future() => served.map_err(LaunchError::Serve),
+            signal = shutdown => signal.map_err(LaunchError::Signal),
+        };
+        proxy.stop().await;
+        result
     }
 }
 
@@ -121,15 +151,20 @@ impl Bound {
 pub enum LaunchError {
     /// No configuration was given and the program has no first argument.
     Usage,
+    /// The configuration file could not be read, or is not a valid configuration.
     Config {
         path: PathBuf,
         error: io::Error,
     },
+    /// A configuration given in code breaks a rule of [`ProxyConfig::check`].
+    Invalid(io::Error),
     Listen {
         address: String,
         error: io::Error,
     },
     Serve(io::Error),
+    /// The shutdown signal could not be listened for.
+    Signal(io::Error),
 }
 
 impl fmt::Display for LaunchError {
@@ -137,8 +172,10 @@ impl fmt::Display for LaunchError {
         match self {
             LaunchError::Usage => f.write_str("usage: <program> <config.json>"),
             LaunchError::Config { path, error } => write!(f, "{}: {error}", path.display()),
+            LaunchError::Invalid(error) => write!(f, "invalid configuration: {error}"),
             LaunchError::Listen { address, error } => write!(f, "cannot listen on {address}: {error}"),
             LaunchError::Serve(error) => write!(f, "proxy stopped: {error}"),
+            LaunchError::Signal(error) => write!(f, "cannot listen for the shutdown signal: {error}"),
         }
     }
 }
@@ -151,3 +188,6 @@ impl fmt::Debug for LaunchError {
 }
 
 impl std::error::Error for LaunchError {}
+
+#[cfg(test)]
+mod tests;

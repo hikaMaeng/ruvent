@@ -8,38 +8,41 @@
 //! `main`:
 //!
 //! ```no_run
-//! # #[cfg(feature = "ws")]
+//! # #[cfg(any(feature = "ws", feature = "http"))]
 //! #[tokio::main]
 //! async fn main() -> Result<(), ruvent_proxy::LaunchError> {
 //!     // `my-proxy proxy.json`: everything it decides comes from the JSON file.
 //!     ruvent_proxy::Server::new().run().await
 //! }
-//! # #[cfg(not(feature = "ws"))]
+//! # #[cfg(not(any(feature = "ws", feature = "http")))]
 //! # fn main() {}
 //! ```
 //!
 //! Your own rules are hooks: implement only the methods of [`Hooks`] you
-//! need, and the rest keep the configured behaviour.
+//! need, and the rest keep the configured behaviour. A hook trusts nothing
+//! the client sent until it has checked it — here a session cookie is
+//! looked up in the program's own session table:
 //!
 //! ```no_run
-//! # #[cfg(feature = "ws")]
+//! # #[cfg(any(feature = "ws", feature = "http"))]
 //! # mod example {
 //! use ruvent_proxy::{async_trait, Context, Denied, Handshake, Hooks, User};
+//! use std::collections::HashMap;
 //!
-//! struct Sessions;
+//! /// session id → user name. A real program asks its session store.
+//! struct Sessions(HashMap<String, String>);
 //!
 //! #[async_trait]
 //! impl Hooks for Sessions {
 //!     async fn authenticate(&self, _cx: Context<'_>, handshake: &Handshake) -> Result<User, Denied> {
-//!         match handshake.cookie("session") {
-//!             Some(session) => Ok(User::new(session, ["chat.*"])),
-//!             None => Err(Denied::Missing),
-//!         }
+//!         let session = handshake.cookie("session").ok_or(Denied::Missing)?;
+//!         let name = self.0.get(session).ok_or(Denied::Rejected)?;
+//!         Ok(User::new(name.as_str(), [format!("chat.{name}.*")]))
 //!     }
 //! }
 //!
-//! # async fn run() -> Result<(), ruvent_proxy::LaunchError> {
-//! ruvent_proxy::Server::new().hooks(Sessions).run().await
+//! # async fn run(sessions: HashMap<String, String>) -> Result<(), ruvent_proxy::LaunchError> {
+//! ruvent_proxy::Server::new().hooks(Sessions(sessions)).run().await
 //! # }
 //! # }
 //! ```
@@ -75,7 +78,7 @@ pub mod server;
 pub use auth::{Denied, User};
 pub use config::ProxyConfig;
 pub use handshake::Handshake;
-pub use hooks::{Context, Defaults, Hooks};
+pub use hooks::{Context, Defaults, Hooks, UpstreamCalls};
 pub use hub::{bad_request, Proxy, UserHandle, UserId};
 pub use message::{Cause, Outcome, Publish, PublishKind, Rejection, Request};
 #[cfg(any(feature = "ws", feature = "http"))]

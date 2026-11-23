@@ -3,9 +3,12 @@
 
 use futures_util::{SinkExt, StreamExt};
 use ruvent::{Bytes, Engine, EngineConfig, Envelope, Incoming, Methods};
+use ruvent_proxy::hooks::publish_within_scope;
 use ruvent_proxy::{async_trait, Context, Denied, Handshake, Hooks, InProcess, Publish, Rejection, Server, User};
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -93,15 +96,16 @@ async fn a_configuration_file_and_nothing_else_is_a_running_proxy_for_both_proto
 /// What a domain knows about a user.
 struct Tenant(&'static str);
 
-/// Sessions in a cookie, tenants on the user, channels named after the tenant.
+/// Sessions in a cookie (looked up, never trusted as they are), tenants on the
+/// user, channels named after the tenant.
 struct Domain;
 
 #[async_trait]
 impl Hooks for Domain {
     async fn authenticate(&self, _cx: Context<'_>, handshake: &Handshake) -> Result<User, Denied> {
         match handshake.cookie("session") {
-            Some("s-alice") => Ok(User::new("alice", ["*"]).with_data(Tenant("acme"))),
-            Some("s-bob") => Ok(User::new("bob", ["*"]).with_data(Tenant("acme"))),
+            Some("s-alice") => Ok(User::new("alice", ["tenant.acme.*"]).with_data(Tenant("acme"))),
+            Some("s-bob") => Ok(User::new("bob", ["tenant.acme.*"]).with_data(Tenant("acme"))),
             Some(_) => Err(Denied::Rejected),
             None => Err(Denied::Missing),
         }
@@ -122,7 +126,8 @@ impl Hooks for Domain {
         }
         let tenant = user.data::<Tenant>().map(|tenant| tenant.0).unwrap_or_default();
         publish.channel = format!("tenant.{tenant}.{}", publish.channel);
-        Ok(())
+        // What the hook leaves is registered as it is: check the result, reply channel included.
+        publish_within_scope(user, publish)
     }
 
     fn deliver(&self, user: &User, event: &Envelope) -> bool {
@@ -195,4 +200,60 @@ async fn a_deliver_hook_picks_which_users_see_an_event() {
     assert_eq!(read_json(&mut alice[0]).await["payload"]["n"], 1);
     assert_eq!(read_json(&mut alice[0]).await["payload"]["n"], 2);
     assert_eq!(read_json(&mut bob[0]).await["payload"]["n"], 2, "the event addressed to alice never reached bob");
+}
+
+/// A publish hook that rewrites the channel still checks the reply channel afterwards:
+/// a reply into another tenant is refused, a reply into one's own is registered.
+#[tokio::test]
+async fn a_rewriting_publish_hook_still_checks_the_reply_channel() {
+    let (engine, address) = domain().await;
+    let (peer, mut inbox) = ruvent::connect(&engine, "peer", 64).await.unwrap();
+    peer.subscribe("tenant.acme.room".into(), None).await.unwrap();
+    let foreign = r#"{"kind":"dispatch","channel":"room","type":"ask","payload":1,"reply":"tenant.other.inbox"}"#;
+    let (status, result) = http(address, "POST", "/v1/events", "Cookie: session=s-bob", foreign).await;
+    assert_eq!((status, result["error"].clone()), (403, Value::from("forbidden reply channel")));
+    let own = r#"{"kind":"dispatch","channel":"room","type":"ask","payload":2,"reply":"tenant.acme.inbox"}"#;
+    assert_eq!(http(address, "POST", "/v1/events", "Cookie: session=s-bob", own).await.0, 200);
+    let delivered = loop {
+        match tokio::time::timeout(WAIT, inbox.recv()).await.expect("timed out").expect("closed") {
+            Incoming::Delivery(event) => break event,
+            _ => continue,
+        }
+    };
+    assert_eq!((&*delivered.channel, delivered.reply.as_deref()), ("tenant.acme.room", Some("tenant.acme.inbox")));
+    assert_eq!(&delivered.payload[..], b"2", "only the allowed registration reached the event server");
+}
+
+/// An authenticate hook that never finds credentials, and counts how often it was asked.
+#[derive(Default)]
+struct NeverSure(AtomicUsize);
+
+#[async_trait]
+impl Hooks for NeverSure {
+    async fn authenticate(&self, _cx: Context<'_>, _handshake: &Handshake) -> Result<User, Denied> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(Denied::Missing)
+    }
+}
+
+/// A WebSocket asks the authenticate hook at most twice: with the handshake, and once more with an in-band token.
+#[tokio::test]
+async fn the_authenticate_hook_is_asked_at_most_twice_per_websocket() {
+    let engine = Engine::volatile(EngineConfig::default()).await;
+    let hooks = Arc::new(NeverSure::default());
+    let address = serve(Server::new().config(listen_anywhere()).hooks(Shared(hooks.clone())).upstream(in_process(&engine))).await;
+    let mut socket = socket(address, "", None).await;
+    send(&mut socket, r#"{"op":"auth","token":"anything"}"#).await;
+    assert_eq!(read_json(&mut socket).await["error"], "authentication required");
+    assert_eq!(hooks.0.load(Ordering::SeqCst), 2);
+}
+
+/// Lends shared hooks to the server, so the test can read what they counted.
+struct Shared<H>(Arc<H>);
+
+#[async_trait]
+impl<H: Hooks> Hooks for Shared<H> {
+    async fn authenticate(&self, cx: Context<'_>, handshake: &Handshake) -> Result<User, Denied> {
+        self.0.authenticate(cx, handshake).await
+    }
 }

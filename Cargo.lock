@@ -784,11 +784,13 @@ name = "ruvent-proxy"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "form_urlencoded",
  "futures-util",
  "http",
  "parking_lot",
  "ruvent",
  "ruvent-client",
+ "ruvent-server",
  "serde",
  "serde_json",
  "tokio",

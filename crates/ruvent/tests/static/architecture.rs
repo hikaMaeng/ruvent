@@ -91,13 +91,13 @@ fn workspace_library() -> Vec<Source> {
 /// | `ruvent-client/worker/lane.rs` `time::timeout(` | a handler's lease: past it the run is abandoned |
 /// | `ruvent-server/connection/mod.rs` `time::timeout(` | how long a new connection has to say hello |
 /// | `ruvent-proxy/hub/mod.rs` `time::timeout(` | how long an authentication worker has to answer |
-/// | `ruvent-proxy/hub/mod.rs` `time::sleep(` | back-off before reconnecting to the upstream server |
+/// | `ruvent-proxy/hub/task.rs` `time::sleep(` | back-off before reconnecting to the upstream server |
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
     ("ruvent-client/worker/lane.rs", "time::timeout(", 1),
     ("ruvent-server/connection/mod.rs", "time::timeout(", 1),
     ("ruvent-proxy/hub/mod.rs", "time::timeout(", 1),
-    ("ruvent-proxy/hub/mod.rs", "time::sleep(", 1),
+    ("ruvent-proxy/hub/task.rs", "time::sleep(", 1),
 ];
 
 /// Ways of finding out by asking again. None may appear in a library.
@@ -130,6 +130,32 @@ fn nothing_polls_and_every_timer_is_declared() {
         violations.push(format!("timers in the source {found:?} are not the declared set {declared:?}"));
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// The proxy's roles stay apart, so each can change and be tested alone:
+///
+/// * the subscription book (`hub/channels`) is pure state: no task, no queue,
+///   no clock, nothing awaited;
+/// * a hook's upstream handle cannot subscribe or unsubscribe on the hub's
+///   connection, whose markers decide when a user's subscription takes effect;
+/// * the deliver hook is called in one place, behind a panic guard, so a
+///   failing hook cannot end the hub task.
+#[test]
+fn the_proxy_keeps_its_roles_apart() {
+    let sources = workspace_library();
+    let file = |path: &str| sources.iter().find(|source| source.path == path).unwrap_or_else(|| panic!("{path} is gone; update this rule with the move")).code();
+    let book = file("ruvent-proxy/hub/channels/mod.rs");
+    for needle in ["tokio", "mpsc", "oneshot", "Instant", "time::", "async ", ".await", "spawn"] {
+        assert!(!book.contains(needle), "the subscription book uses `{needle}`; it must stay pure state");
+    }
+    let context = file("ruvent-proxy/hooks/context.rs");
+    for needle in ["fn subscribe", "fn unsubscribe", "pub methods", "-> Option<Arc<dyn Methods>>"] {
+        assert!(!context.contains(needle), "the hooks' upstream handle exposes `{needle}`");
+    }
+    let calls: Vec<(&str, usize)> =
+        sources.iter().filter(|source| source.path.starts_with("ruvent-proxy/")).map(|source| (source.path.as_str(), source.count(".deliver("))).filter(|(_, count)| *count > 0).collect();
+    assert_eq!(calls, [("ruvent-proxy/hub/task.rs", 1)], "the deliver hook is called from one place");
+    assert!(file("ruvent-proxy/hub/task.rs").contains("catch_unwind(AssertUnwindSafe(|| hooks.deliver("), "the deliver hook runs behind a panic guard");
 }
 
 fn only<'a>(sources: &'a [Source], needle: &str) -> Vec<(&'a str, usize)> {

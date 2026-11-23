@@ -131,3 +131,6 @@ pub fn from_answer(config: &ProxyConfig, answer: AuthAnswer) -> Result<User, Den
         _ => Err(Denied::Rejected),
     }
 }
+
+#[cfg(test)]
+mod tests;

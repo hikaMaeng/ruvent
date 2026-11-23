@@ -589,5 +589,25 @@
 | 프록시 형태 | 프로토콜별 완성품 바이너리, 사용자 로직 없음(4.3, 7장) | 라이브러리 `ruvent-proxy` 하나. 프로토콜은 feature `ws`·`http`(기본 둘 다), 한 `listen`에서 함께 열림. `Server::new().run()` 세 줄 `main`이 설정대로 도는 서버. `Hooks`의 `authenticate`·`subscribe`·`publish`·`deliver` 중 필요한 것만 구현하고, 나머지는 설정대로(`Defaults`) | 13장 "프록시 형태 변경" |
 | 프록시 훅의 실행 위치 | — | `deliver`만 허브의 단일 태스크에서 동기로 불림(이벤트당 사용자 수만큼). 나머지는 사용자 태스크에서 비동기 | 전달 훅이 기다리면 그 프록시의 모든 사용자가 기다린다 |
 | 프록시 채널 범위 검사 | 허브가 직접 | 기본 훅의 일(`within_scope`, `publish_within_scope`). 거절은 `Rejection { cause, message }`, HTTP 상태는 `cause`로 | 도메인이 범위 규칙 자체를 바꿀 수 있게. 문자열 접두사로 상태를 고르던 것을 없앴다 |
+| 훅의 상위 접근 | — | `Context::upstream()`은 `UpstreamCalls`(등록·착수·완료·삭제)만 준다. 구독·취소는 없다 | 허브는 자기 연결의 `Subscribed` 표지를 세어 가입 효력 시점을 정한다. 훅이 같은 연결로 구독하면 남의 표지를 자기 것으로 세고, 취소하면 채널 사용자 전체의 구독이 사라진다 |
+| `deliver` 패닉 | — | 허브가 잡는다. 그 사용자는 이벤트를 놓친 것이므로 연결을 끊고, 허브와 다른 사용자는 계속 돈다. 허브 태스크가 어떻게 끝나든 `Drop`이 준비 상태를 내려 `/health`가 503이 된다 | 훅 하나가 허브 전체를 죽이고도 `/health`가 200을 내던 결함(리뷰 지적) |
+| 프록시 허브 구조 | — | `hub/channels`(구독 장부: 순수 상태, 태스크·시계 없음, 입력마다 상위 호출과 답을 돌려줌), `hub/task.rs`(허브 태스크), `hub/mod.rs`(핸들). 정적 검사 `the_proxy_keeps_its_roles_apart`가 분리를 지킨다 | 효력 시점 규칙을 태스크 없이 단위 테스트한다. 분리하며 상위 연결 전에 들어온 가입이 영원히 기다리던 잠복 결함을 찾았다(아래) |
+| 프록시 정지 | — | `Proxy::stop()`, 또는 모든 핸들이 사라지면 허브가 끝난다(허브는 자기 명령 송신자를 약하게만 쥔다). `Server::run_until(신호)`, `run()` = `run_until(Ctrl-C)`. 신호 등록 실패는 `LaunchError::Signal` | 정지 수단이 없었고, Ctrl-C 등록 실패가 정상 종료로 보였다 |
+| 등록 순서 | — | 요청 자체의 모양(`id`·`correlation`이 UUID인지) → `publish` 훅 → 훅이 남긴 대로 등록. 재작성하는 훅은 결과를 다시 검사해야 한다(문서·테스트가 `publish_within_scope`를 재작성 뒤에 부른다) | 모양 오류(400)를 권한 판단(403)보다 먼저. 옛 코드는 채널 범위 → id → reply 범위 순이었다 |
+| 설정 검증 | 파일만 `parse`가 검사 | `ProxyConfig::check`를 파일과 코드로 만든 설정이 같이 거친다. `user_buffer`·`reconnect`·`timeout_ms`의 0이나 역전은 거절 | `.config()`로 준 설정이 검증을 건너뛰었다 |
 
-검증: [testing.md](../testing.md)의 지도, [reports/test-2026-11-23.txt](../reports/test-2026-11-23.txt).
+**옛 동작과 달라진 것(의도한 것).** 리뷰가 "기본 동작 = 옛 동작" 주장이 틀렸다고 지적했고, 맞다. 다음은 바꾼 채로 둔다.
+
+* SSE 범위 밖 구독: 400 → 403. 원인(`Forbidden`)에 맞는 상태다.
+* 토큰이 없을 때: HTTP는 401 그대로이고 문구가 "authentication rejected" → "authentication required"다(`Denied::Missing`).
+* 잘못된 `id`와 금지된 `reply`가 함께 오면: 옛 코드는 400, 지금도 400이다. 잘못된 `id`와 금지된 채널이 함께 오면 옛 코드는 403, 지금은 400이다(모양 먼저).
+* WS 쿼리: 키도 디코딩하고, 같은 키가 여럿이면 첫 값을 쓴다(옛 `Query<Login>`은 중복 키에서 업그레이드를 400으로 거절했다). 빈 `?token=`은 옛 코드처럼 빈 토큰이다.
+* HTTP Bearer: 방식 이름을 대소문자 없이 읽고, 빈 토큰은 토큰 없음(`Missing`, 401)이다.
+* 인증 훅은 WS 하나에 최대 두 번 불린다(첫 답이 `Missing`이고 토큰이 첫 메시지로 올 때).
+
+**찾은 잠복 결함.** 옛 허브는 상위가 연결되기 전에 들어온 가입도 `issued`를 올렸다. 연결 뒤 다시 구독하면서
+목표를 `issued`(2)로 잡았지만 실제로 보낸 구독은 하나라 표지도 하나(1)만 오므로, 그 사용자는 영원히 기다렸다.
+지금은 보낸 구독만 센다. 장부를 옛 방식으로 되돌리면 `a_join_before_the_upstream_connects_takes_effect_after_it_connects`와
+`a_subscription_made_before_the_upstream_is_up_takes_effect_when_it_is`가 실패하는 것을 확인했다.
+
+검증: [testing.md](../testing.md)의 지도, [reports/test-2026-11-23-proxy-review.txt](../reports/test-2026-11-23-proxy-review.txt).

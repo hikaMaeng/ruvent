@@ -3,10 +3,11 @@
 use parking_lot::Mutex;
 use ruvent::{async_trait, Backlog, Bytes, ClaimToken, Engine, EngineConfig, Envelope, EventId, Inbox, Incoming, Methods, Name, Refusal, WorkKey};
 use ruvent_proxy::config::{AuthMode, StaticToken, WorkerAuth};
-use ruvent_proxy::{Connector, Denied, Proxy, ProxyConfig, Publish, Request, User};
+use ruvent_proxy::{Connector, Context, Denied, Hooks, Proxy, ProxyConfig, Publish, Rejection, Request, User};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -21,6 +22,8 @@ struct Tap {
     call_feed: Mutex<Option<mpsc::UnboundedSender<String>>>,
     /// Cuts the current upstream connection's inbox, as a dropped socket would.
     kill: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Told when the proxy lets go of its upstream connection.
+    released: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Tap {
@@ -39,6 +42,14 @@ impl Tap {
 struct Tapped {
     inner: Arc<dyn Methods>,
     tap: Arc<Tap>,
+}
+
+impl Drop for Tapped {
+    fn drop(&mut self) {
+        if let Some(released) = self.tap.released.lock().take() {
+            let _ = released.send(());
+        }
+    }
 }
 
 #[async_trait]
@@ -112,9 +123,13 @@ struct Setup {
 }
 
 async fn setup(config: ProxyConfig) -> Setup {
+    setup_with(config, Arc::new(ruvent_proxy::Defaults)).await
+}
+
+async fn setup_with(config: ProxyConfig, hooks: Arc<dyn Hooks>) -> Setup {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let tap = Arc::new(Tap::default());
-    let proxy = Proxy::start(config, Arc::new(TapConnector { engine: engine.clone(), tap: tap.clone() }));
+    let proxy = Proxy::start_with(config, Arc::new(TapConnector { engine: engine.clone(), tap: tap.clone() }), hooks);
     let (peer, peer_inbox) = ruvent::connect(&engine, "peer", 1024).await.unwrap();
     Setup { engine, proxy, tap, peer, peer_inbox }
 }
@@ -153,7 +168,7 @@ async fn drain_to_marker(peer: &ruvent::Client, channel: &str, events: &mut mpsc
 #[tokio::test]
 async fn three_users_on_one_channel_cost_one_upstream_delivery() {
     let setup = setup(open()).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let mut users = Vec::new();
     for name in ["a", "b", "c"] {
         let (handle, events) = user(&setup.proxy, name).await;
@@ -171,7 +186,7 @@ async fn three_users_on_one_channel_cost_one_upstream_delivery() {
 #[tokio::test]
 async fn a_late_joiner_gets_only_events_after_it_joined() {
     let setup = setup(open()).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let (a, mut a_events) = user(&setup.proxy, "a").await;
     a.subscribe("room").await.unwrap();
     dispatch(&setup.peer, "room", 1).await;
@@ -187,7 +202,7 @@ async fn a_late_joiner_gets_only_events_after_it_joined() {
 #[tokio::test]
 async fn resubscribing_never_shows_events_from_the_gap() {
     let setup = setup(open()).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let (a, mut events) = user(&setup.proxy, "a").await;
     a.subscribe("room").await.unwrap();
     dispatch(&setup.peer, "room", 1).await;
@@ -207,7 +222,7 @@ async fn the_last_user_leaving_cancels_the_upstream_subscription() {
     let setup = setup(open()).await;
     let (feed, mut calls) = mpsc::unbounded_channel();
     *setup.tap.call_feed.lock() = Some(feed);
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let (a, _a_events) = user(&setup.proxy, "a").await;
     let (b, _b_events) = user(&setup.proxy, "b").await;
     a.subscribe("room").await.unwrap();
@@ -231,7 +246,7 @@ async fn a_slow_user_is_disconnected_and_nobody_else_is() {
     let mut config = open();
     config.user_buffer = 4;
     let setup = setup(config).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let (slow, mut slow_events) = user(&setup.proxy, "slow").await;
     let (fast, mut fast_events) = user(&setup.proxy, "fast").await;
     slow.subscribe("room").await.unwrap();
@@ -260,7 +275,7 @@ async fn a_slow_user_is_disconnected_and_nobody_else_is() {
 #[tokio::test]
 async fn a_publish_outside_the_users_channels_is_refused() {
     let setup = setup(open()).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let user = User::new("u", ["public.*"]);
     let refused: Publish = serde_json::from_str(r#"{"kind":"dispatch","channel":"private.x","type":"t","payload":1}"#).unwrap();
     let outcome = setup.proxy.publish(&user, refused).await;
@@ -274,7 +289,7 @@ async fn a_publish_outside_the_users_channels_is_refused() {
 #[tokio::test]
 async fn a_registration_carries_the_end_user_as_delegate() {
     let setup = setup(open()).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let user = User::new("alice", ["*"]);
     let publish: Publish = serde_json::from_str(r#"{"kind":"claimable","channel":"jobs","type":"run","payload":{"n":1}}"#).unwrap();
     let outcome = setup.proxy.publish(&user, publish).await;
@@ -326,7 +341,7 @@ async fn an_authentication_worker_lets_in_and_turns_away() {
     let setup = setup(worker_config(5_000)).await;
     let (worker, worker_inbox) = ruvent::connect(&setup.engine, "auth-worker", 1024).await.unwrap();
     tokio::spawn(run_auth_worker(worker, worker_inbox));
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let carol = setup.proxy.authenticate_by_config(Some("good")).await.unwrap();
     assert_eq!(carol.name, "carol");
     assert!(carol.may_use("carol.inbox") && !carol.may_use("other"));
@@ -337,7 +352,7 @@ async fn an_authentication_worker_lets_in_and_turns_away() {
 #[tokio::test]
 async fn an_authentication_nobody_answers_times_out() {
     let setup = setup(worker_config(200)).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     assert_eq!(setup.proxy.authenticate_by_config(Some("good")).await.unwrap_err(), Denied::Timeout);
     drop(setup.peer_inbox);
 }
@@ -346,7 +361,7 @@ async fn an_authentication_nobody_answers_times_out() {
 #[tokio::test]
 async fn requests_are_answered_in_the_users_stream() {
     let setup = setup(open()).await;
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let (handle, mut events) = user(&setup.proxy, "u").await;
     let request = Request::parse(r#"{"op":"subscribe","channel":"room","ref":"s1"}"#).unwrap();
     handle.handle(request).await;
@@ -370,18 +385,222 @@ async fn after_the_upstream_drops_the_proxy_resubscribes() {
     let setup = setup(open()).await;
     let (feed, mut calls) = mpsc::unbounded_channel();
     *setup.tap.call_feed.lock() = Some(feed);
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     let (handle, mut events) = user(&setup.proxy, "a").await;
     handle.subscribe("room").await.unwrap();
     assert_eq!(tokio::time::timeout(WAIT, calls.recv()).await.unwrap().unwrap(), "subscribe room");
     let kill = setup.tap.kill.lock().take().unwrap();
     let _ = kill.send(());
     assert_eq!(tokio::time::timeout(WAIT, calls.recv()).await.expect("no resubscribe").unwrap(), "subscribe room");
-    setup.proxy.ready().await;
+    assert!(setup.proxy.ready().await);
     // The resubscribe has been answered, so its marker is already ahead of anything published now.
     dispatch(&setup.peer, "room", 5).await;
     let got = next(&mut events).await.expect("stream ended");
     assert_eq!(got["payload"], 5);
     assert_eq!(got["op"], "event");
     drop(handle);
+}
+
+// ── hooks inside the hub ─────────────────────────────────────────────────
+
+/// A deliver hook that panics for one user; lets everyone else through.
+struct PanicsFor(&'static str);
+
+#[ruvent_proxy::async_trait]
+impl Hooks for PanicsFor {
+    fn deliver(&self, user: &User, _event: &Envelope) -> bool {
+        assert!(user.name != self.0, "deliver hook failed for {}", self.0);
+        true
+    }
+}
+
+/// A deliver hook that panics costs that user the event and its stream; the hub and every other user carry on.
+#[tokio::test]
+async fn a_deliver_hook_that_panics_costs_that_user_its_stream_and_nobody_else() {
+    let setup = setup_with(open(), Arc::new(PanicsFor("mallory"))).await;
+    assert!(setup.proxy.ready().await);
+    let (mallory, mut mallory_events) = user(&setup.proxy, "mallory").await;
+    let (alice, mut alice_events) = user(&setup.proxy, "alice").await;
+    mallory.subscribe("room").await.unwrap();
+    alice.subscribe("room").await.unwrap();
+    dispatch(&setup.peer, "room", 1).await;
+    assert_eq!(next(&mut alice_events).await.unwrap()["payload"], 1);
+    assert!(next(&mut mallory_events).await.is_none(), "the user the hook failed for is disconnected");
+    assert!(setup.proxy.is_ready(), "the hub is still running");
+    let (carol, mut carol_events) = user(&setup.proxy, "carol").await;
+    carol.subscribe("room").await.unwrap();
+    dispatch(&setup.peer, "room", 2).await;
+    assert_eq!(next(&mut alice_events).await.unwrap()["payload"], 2);
+    assert_eq!(next(&mut carol_events).await.unwrap()["payload"], 2, "new users still join and receive");
+    drop((mallory, alice, carol));
+}
+
+/// A deliver hook that lets nothing through.
+struct Silent;
+
+#[ruvent_proxy::async_trait]
+impl Hooks for Silent {
+    fn deliver(&self, _user: &User, _event: &Envelope) -> bool {
+        false
+    }
+}
+
+/// A user whose stream was dropped is cleaned up at the next delivery even when the hook filters it out,
+/// so the last such user still cancels the upstream subscription.
+#[tokio::test]
+async fn a_user_that_went_away_is_dropped_even_when_the_hook_filters_it_out() {
+    let setup = setup_with(open(), Arc::new(Silent)).await;
+    let (feed, mut calls) = mpsc::unbounded_channel();
+    *setup.tap.call_feed.lock() = Some(feed);
+    assert!(setup.proxy.ready().await);
+    let (handle, events) = user(&setup.proxy, "gone").await;
+    handle.subscribe("room").await.unwrap();
+    assert_eq!(tokio::time::timeout(WAIT, calls.recv()).await.unwrap().unwrap(), "subscribe room");
+    // The reading side goes away while the handle (and so no Detach) stays.
+    drop(events);
+    dispatch(&setup.peer, "room", 1).await;
+    assert_eq!(tokio::time::timeout(WAIT, calls.recv()).await.expect("no unsubscribe").unwrap(), "unsubscribe room");
+    drop(handle);
+}
+
+/// Counts publish hook calls and allows everything.
+#[derive(Default)]
+struct CountsPublishes(AtomicUsize);
+
+#[ruvent_proxy::async_trait]
+impl Hooks for CountsPublishes {
+    async fn publish(&self, _cx: Context<'_>, _user: &User, _publish: &mut Publish) -> Result<(), Rejection> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A request's own shape is checked before the publish hook runs: a malformed id never reaches the hook.
+#[tokio::test]
+async fn a_publish_is_checked_for_shape_before_the_hook_runs() {
+    let hooks = Arc::new(CountsPublishes::default());
+    let setup = setup_with(open(), hooks.clone()).await;
+    assert!(setup.proxy.ready().await);
+    let user = User::new("u", ["*"]);
+    let malformed: Publish = serde_json::from_str(r#"{"kind":"dispatch","channel":"c","type":"t","payload":1,"id":"nope"}"#).unwrap();
+    let outcome = setup.proxy.publish(&user, malformed).await;
+    assert_eq!((outcome.ok, outcome.error.as_deref(), outcome.cause), (false, Some("id is not a UUID"), Some(ruvent_proxy::Cause::Invalid)));
+    assert_eq!(hooks.0.load(Ordering::SeqCst), 0, "the hook never saw a malformed request");
+    let fine: Publish = serde_json::from_str(r#"{"kind":"dispatch","channel":"c","type":"t","payload":1}"#).unwrap();
+    assert!(setup.proxy.publish(&user, fine).await.ok);
+    assert_eq!(hooks.0.load(Ordering::SeqCst), 1);
+}
+
+/// A subscribe hook that writes an audit event through the hook's upstream calls before every subscription.
+struct Audits;
+
+#[ruvent_proxy::async_trait]
+impl Hooks for Audits {
+    async fn subscribe(&self, cx: Context<'_>, user: &User, channel: &str) -> Result<(), Rejection> {
+        let upstream = cx.upstream().ok_or_else(|| Rejection::unavailable("upstream unavailable"))?;
+        let audit = Envelope::dispatch("audit", "subscribed", Bytes::from(format!("{} {channel}", user.name)));
+        upstream.register_dispatch(audit).await.map_err(Rejection::from_refusal)?;
+        Ok(())
+    }
+}
+
+/// A hook calls the event server through the proxy's connection, and the subscription rule still holds:
+/// a late joiner gets only events after its own join took effect.
+#[tokio::test]
+async fn a_hooks_upstream_calls_leave_the_subscription_rule_intact() {
+    let mut setup = setup_with(open(), Arc::new(Audits)).await;
+    setup.peer.subscribe("audit".into(), None).await.unwrap();
+    assert!(setup.proxy.ready().await);
+    let (a, mut a_events) = user(&setup.proxy, "a").await;
+    a.subscribe("room").await.unwrap();
+    dispatch(&setup.peer, "room", 1).await;
+    let (b, mut b_events) = user(&setup.proxy, "b").await;
+    b.subscribe("room").await.unwrap();
+    dispatch(&setup.peer, "room", 2).await;
+    assert_eq!(drain_to_marker(&setup.peer, "room", &mut a_events).await, vec![1, 2]);
+    assert_eq!(drain_to_marker(&setup.peer, "room", &mut b_events).await, vec![2]);
+    let mut audits = Vec::new();
+    while audits.len() < 2 {
+        if let Incoming::Delivery(event) = tokio::time::timeout(WAIT, setup.peer_inbox.recv()).await.expect("no audit").unwrap() {
+            if &*event.channel == "audit" {
+                audits.push(String::from_utf8(event.payload.to_vec()).unwrap());
+            }
+        }
+    }
+    assert_eq!(audits, vec!["a room", "b room"]);
+    drop((a, b));
+}
+
+// ── the hub's lifetime ───────────────────────────────────────────────────
+
+/// Stopping the hub ends every user's stream, makes it not ready, refuses new users and lets go of the upstream.
+#[tokio::test]
+async fn stopping_the_hub_ends_every_stream_and_lets_go_of_the_upstream() {
+    let setup = setup(open()).await;
+    let (released, upstream_released) = tokio::sync::oneshot::channel();
+    *setup.tap.released.lock() = Some(released);
+    assert!(setup.proxy.ready().await);
+    let (handle, mut events) = user(&setup.proxy, "a").await;
+    handle.subscribe("room").await.unwrap();
+    setup.proxy.stop().await;
+    assert!(next(&mut events).await.is_none(), "the user's stream ended");
+    assert!(!setup.proxy.is_ready());
+    assert!(!setup.proxy.ready().await, "waiting for readiness returns at once once stopped");
+    assert_eq!(setup.proxy.attach(Arc::new(User::new("late", ["*"]))).await.err().as_deref(), Some("proxy stopped"));
+    assert_eq!(handle.subscribe("other").await.unwrap_err().message, "proxy stopped");
+    tokio::time::timeout(WAIT, upstream_released).await.expect("the upstream connection was kept").unwrap();
+}
+
+/// When every handle is gone the hub ends by itself and lets go of the upstream.
+#[tokio::test]
+async fn dropping_every_handle_stops_the_hub() {
+    let setup = setup(open()).await;
+    let (released, upstream_released) = tokio::sync::oneshot::channel();
+    *setup.tap.released.lock() = Some(released);
+    assert!(setup.proxy.ready().await);
+    let (handle, _events) = user(&setup.proxy, "a").await;
+    handle.subscribe("room").await.unwrap();
+    drop(handle);
+    drop(setup.proxy);
+    tokio::time::timeout(WAIT, upstream_released).await.expect("the hub kept running with no handle").unwrap();
+}
+
+/// Connects only once the test opens the gate.
+struct Gated {
+    engine: Engine,
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl Connector for Gated {
+    async fn connect(&self) -> io::Result<(Arc<dyn Methods>, Inbox)> {
+        let gate = self.gate.lock().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        let (client, inbox) = ruvent::connect(&self.engine, "proxy", 1024).await.map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))?;
+        Ok((Arc::new(client), inbox))
+    }
+}
+
+/// A user who subscribes before the upstream connection is up is subscribed when it comes up, and receives.
+#[tokio::test]
+async fn a_subscription_made_before_the_upstream_is_up_takes_effect_when_it_is() {
+    let engine = Engine::volatile(EngineConfig::default()).await;
+    let (open_gate, gate) = tokio::sync::oneshot::channel();
+    let proxy = Proxy::start(open(), Arc::new(Gated { engine: engine.clone(), gate: Mutex::new(Some(gate)) }));
+    assert!(!proxy.is_ready());
+    let (handle, mut events) = proxy.attach(Arc::new(User::new("early", ["*"]))).await.unwrap();
+    let handle = Arc::new(handle);
+    let joining = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.subscribe("room").await }
+    });
+    // Let the join reach the hub while it is still disconnected.
+    tokio::task::yield_now().await;
+    let _ = open_gate.send(());
+    tokio::time::timeout(WAIT, joining).await.expect("the early subscription never took effect").unwrap().unwrap();
+    let (peer, _inbox) = ruvent::connect(&engine, "peer", 64).await.unwrap();
+    dispatch(&peer, "room", 3).await;
+    assert_eq!(next(&mut events).await.unwrap()["payload"], 3);
 }

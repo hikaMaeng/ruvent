@@ -11,7 +11,11 @@
 //!   every subscription took effect; it ends when the user's buffer fills.
 //!
 //! Every request authenticates on its own; with the `worker` mode that is
-//! one event round trip per request.
+//! one event round trip per request. A missing or empty bearer token is
+//! [`Denied::Missing`] and answers 401 like a rejected one.
+//!
+//! A request's own shape is checked before the publish hook: a malformed
+//! `id` answers 400 even when the hook would also forbid the request.
 
 use super::{denied_status, status};
 use crate::auth::Denied;
@@ -65,7 +69,8 @@ async fn subscribe(State(proxy): State<Proxy>, parts: Parts) -> Response {
         Ok(user) => user,
         Err(error) => return denied(error),
     };
-    let wanted = query_values(parts.uri.query().unwrap_or_default(), "channel");
+    // An empty `channel=` names nothing and is skipped.
+    let wanted: Vec<String> = query_values(parts.uri.query().unwrap_or_default(), "channel").into_iter().filter(|channel| !channel.is_empty()).collect();
     if wanted.is_empty() {
         return answer(Outcome::failed(None, "name at least one channel: ?channel=…"));
     }
