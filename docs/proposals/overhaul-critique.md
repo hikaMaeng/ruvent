@@ -1,6 +1,6 @@
 # 개편 계획 v3.3 비판 검토
 
-상태: 검토 1회차 (2026-11-24). 대상: [library-overhaul.md](library-overhaul.md) v3.3(`05f7ec1`). 작성자 검토와 코덱스 독립 리뷰(7장)를 합쳤다.
+상태: 검토 1회차 (2026-11-24). 사용자 결정으로 K1(복제)·K8(파티션)은 채택하지 않았다(5a). 대상: [library-overhaul.md](library-overhaul.md) v3.3(`05f7ec1`). 작성자 검토와 코덱스 독립 리뷰(7장)를 합쳤다.
 
 ## 0. 목적과 기준
 
@@ -271,6 +271,54 @@
 | K7 | 채널 설정형 영속 격리(DLQ). D11과 정적 시험 변경 | 넣는다 |
 | K8 | 파티션 단위 단일 작성자 | 설계는 파티션 단위로, 구현은 파티션 1개부터 |
 
+## 5a. 사용자 결정(검토 1회차 이후, 2026-11-24)
+
+> 하지만 굳이 그런 병렬화된 이벤트서버의 필요성을 느끼진 않아. 이벤트 특성상 차라리 여러 독립된 이벤트 서버를 부하에 맞게 운영하는게 낫기 때문이야. 이벤트 서버가 굳이 트랜젝션 단위의 부하를 책임질 이유는 없고 부하분산 자체도 독립된 이벤트서버에게 알아서 할당하는 라우터는 별도 작성이라는 입장이다
+
+> 중요한건 하나의 단일 이벤트서버가 엄청나게 자원효율적으로 이벤트를 처리하고 발송하는 것이다
+> 유일한 약점인 발송부하는 프록시를 이용해 몇개의 프록시에게만 전가하는 것으로 갈음할 수 있기 때문이다
+
+**정리.**
+* 서버 안의 파티션·복제는 하지 않는다. 독립 서버를 부하에 맞게 여러 대 둔다. 서버 선택은 별도 라우터가 한다.
+* 목표는 **단일 서버의 자원 효율**이다.
+* 발송 팬아웃은 프록시 몇 대에 넘긴다. 서버의 발송 비용은 클라이언트 수가 아니라 프록시 수에 비례한다. 저장소의 `ruvent-proxy` 허브가 이미 이 형태다(서버에 상향 연결 하나로 붙는다, `ruvent-proxy/src/hub/mod.rs:70`).
+
+**검토 판정: 이 방향은 성립한다. 선례도 있다.** NSQ가 같은 구조다.
+* 브로커 사이 복제가 없다. 노드는 서로 독립이다.
+* 소비자는 그 토픽을 가진 모든 노드에 TCP로 붙는다.
+* 메모리 큐가 문턱(`--mem-queue-size`)을 넘으면 디스크로 넘긴다. 계획 2.5의 페이징과 같은 생각이다.
+* 문서가 "메시지가 두 번 전달될 수 있다", "깨끗하지 않은 종료 때 메모리의 메시지는 잃는다"를 계약으로 밝힌다.
+
+**이 결정으로 바뀌는 것.**
+
+| 항목 | 바뀐 판정 |
+| --- | --- |
+| K1 복제 | **하지 않는다(사용자 결정).** 그 대가를 계약에 적는다(아래) |
+| K8 파티션 | **하지 않는다.** 서버 하나에 단일 장부 하나. 용량은 서버 수로 늘린다 |
+| C1 | 서버 안의 문제가 아니라 **계약 문제**가 된다. 죽은 서버의 대기 이벤트는 재기동까지 기다리고, 디스크를 잃으면 잃는다. 클라이언트가 시간 초과 뒤 라우터를 통해 다른 서버로 새 키를 보내는 것이 복구 수단이다 |
+| C11 | **라우터·클라이언트 계약**이 된다(아래) |
+| C12 | 해당 없음 |
+| C2~C10, C13~C15 | 단일 서버 안의 문제라서 그대로 남는다. 다수가 **자원 효율 개선**이기도 하다(아래 순위) |
+
+**그대로 남는 비판(정상 운영에서 생기는 것만).**
+1. **재기동 뒤 업무가 두 번 실행된다.** S1이 대기 이벤트 17을 쥔 채 죽는다. 클라이언트는 B를 기다리다 18을 S2로 보내고, S2가 처리한다. S1이 재기동하면 17이 저널에서 돌아와 다시 실행된다. 대기 이벤트가 있는 상태에서 재기동할 때마다 생긴다. 그래서 워커의 업무 멱등(업무 키의 유일 제약, C9)이 선택이 아니라 **필수 계약**이다. NSQ도 같은 계약을 쓴다.
+2. **라우터·클라이언트 계약(C11).**
+   * 결과 B는 A를 처리한 서버에서 나온다. 완료의 후속은 그 서버에 등록되기 때문이다. 그래서 요청자는 A를 보낸 서버에서 B를 들어야 한다. 그러려면 둘 중 하나가 필요하다: 라우터가 요청자가 듣는 서버로 A를 보내거나, 요청자가 모든 서버를 듣는다(NSQ 소비자 방식).
+   * 워커는 라우터를 거치지 않고 **모든 서버에 직접** 붙는다. 그래야 착수와 완료가 같은 서버로 가고, 재접속도 같은 서버로 간다. 라우터는 생산자(등록) 경로에만 둔다.
+3. **프록시는 느린 수신자 하나가 아니라 수천 클라이언트의 대표다.** 프록시 하나가 느려지면 그 뒤의 클라이언트 전체가 밀린다. 그래서 서버의 연결별 미송신 처리(계획 2.5의 스왑 큐, C7)가 프록시 연결에서는 특히 중요하다. 프록시가 죽으면 그 프록시로 가던 발송은 잃는다. 발송은 1회성이라는 사용자 정책(0.4)과 같으므로 계약에 적기만 하면 된다.
+
+**단일 서버 자원 효율 기준으로 다시 매긴 순위.**
+
+| 순위 | 지적 | 자원 효과 |
+| --- | --- | --- |
+| 1 | C3 생산자 순번 | 멱등 메모리가 처리량 × 창(100만/초·1시간 약 148 GB)에서 생산자 수 × 수십 B로 준다 |
+| 2 | C8 영속 채널 로그 우선 | 언로드 때 이중 쓰기가 없어진다. 복구가 파일 전체 로드에서 체크포인트 + 꼬리 스트리밍으로 바뀐다 |
+| 3 | C6 credit | 이벤트마다 Offer·Accept 왕복과 그 프레임, 재순회 제안이 없어진다 |
+| 4 | C2 누적 확인 | 건별 응답 대신 256건당 한 번(0.4%). 무응답보다 서버 비용은 조금 늘지만, 클라이언트 재전송 버퍼와 불필요한 재전송이 준다 |
+| 5 | C7 데이터·제어 분리 | 효율보다 진행 보장. 메모리가 찬 순간에도 해제 경로가 산다 |
+| 6 | C10, C13 | 정확성 결함. 효율과 무관하게 고친다 |
+| 7 | C4, C5, C9, C15 | 클라이언트·저장소 계약. 서버 비용이 거의 없다 |
+
 ## 6. 출처
 
 * Amazon SQS 중복 제거 창 5분: [Using the Amazon SQS message deduplication ID](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagededuplicationid-property.html), [Exactly-once processing in Amazon SQS](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html)
@@ -280,6 +328,7 @@
 * RabbitMQ: [Lazy Queues](https://www.rabbitmq.com/docs/lazy-queues), [3.12 performance improvements](https://www.rabbitmq.com/blog/2023/05/17/rabbitmq-3.12-performance-improvements), [Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues), [Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms), [Memory and Disk Alarms](https://www.rabbitmq.com/docs/alarms)
 * AWS: [Timeouts, retries and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/), [Transactional outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html), [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 * 논문: [Raft](https://raft.github.io/raft.pdf), [Metastable Failures in Distributed Systems](https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf), [Chubby](https://research.google.com/archive/chubby-osdi06.pdf), [LMAX Disruptor](https://lmax-exchange.github.io/disruptor/disruptor.html)
+* NSQ: [Design](https://nsq.io/overview/design.html), [Features & Guarantees](https://nsq.io/overview/features_and_guarantees.html), [nsqd](https://nsq.io/components/nsqd.html)
 * 웹으로 재확인하지 않은 문헌(저자·제목·연도만): Saltzer·Reed·Clark, "End-to-End Arguments in System Design"(1984). Martin Kleppmann, "How to do distributed locking"(2016). Marc Brooker, "Exponential Backoff And Jitter"(2015)
 * 코덱스 출처 URL은 코덱스 보고서에서 옮겼다. 이 회차에 작성자가 모두 열어 보지는 않았다.
 
