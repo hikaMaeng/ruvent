@@ -11,21 +11,28 @@
 //! * A result is a claimable event (it waits while the requester is away);
 //!   it is handed to its waiter by `correlation` and completed. A result
 //!   nobody waits for is completed too.
-//! * A waiter ends with its result, a cancel (dropping the [`Stream`]) or its
-//!   deadline. **Losing a connection does not end it**: the result is
-//!   assigned again once the requester is back. If the work connection to
-//!   the request's server changed meanwhile, the fragments in between are
-//!   lost and the stream says so ([`Stream::fragments_lost`]).
-//! * At the deadline the request may be sent again with the same id and
-//!   correlation (within [`RequestOptions::retries`] and the retry budget,
-//!   S9): an active original swallows the resend and only a new waiter
-//!   stands, so nothing runs twice.
+//! * A waiter ends with its result or a cancel (dropping the [`Stream`]).
+//!   **Losing a connection does not end it**: the result is assigned again
+//!   once the requester is back. If the work connection to the request's
+//!   server changed meanwhile, the fragments in between are lost and the
+//!   stream says so ([`Stream::fragments_lost`]).
+//! * **The requester decides no policy.** It sets no deadline: what to
+//!   measure (the whole call, the gap between fragments, a type of event)
+//!   and when to give up is the caller's, around [`Stream::next`]. A request
+//!   that should leave the server's queue unclaimed carries its own
+//!   `expires` ([`Envelope::with_expires`]). Fragments are handed over as
+//!   they arrive and never dropped: back-pressure toward the caller's own
+//!   client is the caller's, measured with [`Stream::backlog`].
+//! * [`Stream::resend`] sends the request again with the same id and
+//!   correlation (within the retry budget, S9): an active original swallows
+//!   the resend, so nothing runs twice.
 //!
 //! State (2.10, SDK):
 //!
 //! | state | key | scope | lifetime | bound | cleared by |
 //! | --- | --- | --- | --- | --- | --- |
-//! | reply waiters | `correlation` → waiter, fragment-loss mark | requester | request ~ result, cancel or deadline | requests in progress | SDK ([`Stream`] drop, result) |
+//! | reply waiters | `correlation` → waiter, fragment-loss mark | requester | request ~ result or cancel | requests in progress | SDK ([`Stream`] drop, result) |
+//! | unread fragments | one request | its [`Stream`] | arrival ~ read | not bounded by the SDK: the stream's holder reads them or drops the stream ([`Stream::backlog`] measures) | the holder |
 //! | reply joins | server | requester | `Joined` ~ disconnection | servers | SDK |
 //! | completion buffer | (server, seq) | work line | handed over ~ `Committed` | S8 | SDK |
 //! | retry budget | requester | process | the requester's | one counter | SDK (its producer's [`crate::producer::RetryBudget`]) |
@@ -45,7 +52,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 /// Every value is a field with its default (chapter 8).
 #[derive(Clone)]
@@ -59,46 +65,18 @@ pub struct RequesterConfig {
     pub window: u32,
     /// S8 for the work lines.
     pub unacked_bytes: u64,
-    /// Fragments kept per request before the oldest unread are dropped (and the loss marked).
-    pub fragments: usize,
     /// The producer requests go out through.
     pub producer: ProducerConfig,
 }
 
 impl Default for RequesterConfig {
     fn default() -> Self {
-        RequesterConfig {
-            credential: String::new(),
-            reconnect: Reconnect::default(),
-            lease: Duration::from_secs(5),
-            window: 1024,
-            unacked_bytes: 64 << 20,
-            fragments: 1024,
-            producer: ProducerConfig::default(),
-        }
-    }
-}
-
-/// One request's limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RequestOptions {
-    /// The call deadline: how long to wait for the result. Also the
-    /// request's `expires` unless it carries one (2.9 "재시도 계약").
-    pub deadline: Duration,
-    /// Resends at the deadline with the same id and correlation.
-    pub retries: u32,
-}
-
-impl Default for RequestOptions {
-    fn default() -> Self {
-        RequestOptions { deadline: Duration::from_secs(30), retries: 0 }
+        RequesterConfig { credential: String::new(), reconnect: Reconnect::default(), lease: Duration::from_secs(5), window: 1024, unacked_bytes: 64 << 20, producer: ProducerConfig::default() }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestError {
-    /// The deadline passed (after any retries).
-    Timeout,
     Producer(ProducerError),
     Closed,
 }
@@ -106,7 +84,6 @@ pub enum RequestError {
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RequestError::Timeout => f.write_str("the request's deadline passed"),
             RequestError::Producer(error) => write!(f, "{error}"),
             RequestError::Closed => f.write_str("the requester is closed"),
         }
@@ -138,7 +115,7 @@ pub struct Response {
 }
 
 struct Waiter {
-    fragments: mpsc::Sender<Envelope>,
+    fragments: mpsc::UnboundedSender<Envelope>,
     result: Option<oneshot::Sender<Envelope>>,
     lost: Arc<AtomicBool>,
     /// The server the request went to, once known.
@@ -149,7 +126,7 @@ struct Shared {
     /// | key | `correlation` |
     /// | --- | --- |
     /// | scope | this requester |
-    /// | lifetime | request ~ result, cancel or deadline |
+    /// | lifetime | request ~ result or cancel |
     /// | bound | requests in progress |
     /// | cleared by | the result, [`Stream`]'s drop |
     waiters: Mutex<HashMap<EventId, Waiter>>,
@@ -166,7 +143,6 @@ struct Inner {
     shared: Arc<Shared>,
     producer: Producer,
     reply: Name,
-    fragments: usize,
     task: JoinHandle<()>,
 }
 
@@ -189,7 +165,7 @@ impl Requester {
         let shared = Arc::new(Shared { waiters: Mutex::default(), joined: watch::channel(BTreeSet::new()).0 });
         let actor = Actor { shared: shared.clone(), connector, hello: Hello::worker(&config.credential), reply: reply.clone(), config: config.clone(), lines: HashMap::new() };
         let task = tokio::spawn(actor.run(servers.watch()));
-        Requester { inner: Arc::new(Inner { shared, producer, reply, fragments: config.fragments, task }) }
+        Requester { inner: Arc::new(Inner { shared, producer, reply, task }) }
     }
 
     /// This instance's reply channel.
@@ -213,9 +189,9 @@ impl Requester {
         &self.inner.producer
     }
 
-    /// Sends a request and waits for the whole answer.
-    pub async fn request(&self, event: Envelope, options: RequestOptions) -> Result<Response, RequestError> {
-        let mut stream = self.stream(event, options).await?;
+    /// Sends a request and waits for the whole answer, however long it takes.
+    pub async fn request(&self, event: Envelope) -> Result<Response, RequestError> {
+        let mut stream = self.stream(event).await?;
         let mut fragments = Vec::new();
         loop {
             match stream.next().await? {
@@ -227,31 +203,17 @@ impl Requester {
     }
 
     /// Sends a request and returns its stream of fragments and result.
-    pub async fn stream(&self, mut event: Envelope, options: RequestOptions) -> Result<Stream, RequestError> {
+    pub async fn stream(&self, mut event: Envelope) -> Result<Stream, RequestError> {
         if event.id.is_nil() {
             event.id = EventId::new_v7();
         }
         let correlation = *event.correlation.get_or_insert_with(EventId::new_v7);
         event.reply = Some(self.inner.reply.clone());
-        if event.expires.is_none() {
-            event = event.with_expires(options.deadline);
-        }
-        let (fragment_tx, fragments) = mpsc::channel(self.inner.fragments.max(1));
+        let (fragment_tx, fragments) = mpsc::unbounded_channel();
         let (result_tx, result) = oneshot::channel();
         let lost = Arc::new(AtomicBool::new(false));
         self.inner.shared.waiters.lock().insert(correlation, Waiter { fragments: fragment_tx, result: Some(result_tx), lost: lost.clone(), server: None });
-        let mut stream = Stream {
-            inner: self.inner.clone(),
-            event: event.clone(),
-            correlation,
-            fragments,
-            result,
-            lost,
-            options,
-            deadline: Instant::now() + options.deadline,
-            retries: options.retries,
-            done: false,
-        };
+        let mut stream = Stream { inner: self.inner.clone(), event: event.clone(), correlation, fragments, result, lost, done: false };
         let sent = self.inner.producer.send_gated(event, self.gate()).await?;
         stream.sent_to(sent.server);
         Ok(stream)
@@ -267,12 +229,9 @@ pub struct Stream {
     inner: Arc<Inner>,
     event: Envelope,
     correlation: EventId,
-    fragments: mpsc::Receiver<Envelope>,
+    fragments: mpsc::UnboundedReceiver<Envelope>,
     result: oneshot::Receiver<Envelope>,
     lost: Arc<AtomicBool>,
-    options: RequestOptions,
-    deadline: Instant,
-    retries: u32,
     done: bool,
 }
 
@@ -296,42 +255,39 @@ impl Stream {
         }
     }
 
-    /// The next fragment, or the result (then `None` after it). Waits until
-    /// the deadline; at the deadline sends again if retries are left.
+    /// Fragments that arrived and were not read yet. The SDK keeps all of
+    /// them; a caller relaying to a slower client decides here when to give up.
+    pub fn backlog(&self) -> usize {
+        self.fragments.len()
+    }
+
+    /// The next fragment, or the result (then `None` after it). Waits with no
+    /// deadline: bound it from outside (`tokio::time::timeout`) by whatever
+    /// the caller measures.
     pub async fn next(&mut self) -> Result<Option<Part>, RequestError> {
         if self.done {
             return Ok(None);
         }
-        loop {
-            let left = self.deadline.saturating_duration_since(Instant::now());
-            let waited = tokio::time::timeout(left, async {
-                tokio::select! {
-                    biased;
-                    Some(fragment) = self.fragments.recv() => Ok(Part::Fragment(fragment)),
-                    result = &mut self.result => result.map(Part::Result).map_err(|_| RequestError::Closed),
-                }
-            })
-            .await;
-            match waited {
-                Ok(Ok(part)) => {
-                    if matches!(part, Part::Result(_)) {
-                        self.done = true;
-                    }
-                    return Ok(Some(part));
-                }
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    if self.retries == 0 {
-                        return Err(RequestError::Timeout);
-                    }
-                    self.retries -= 1;
-                    let gate = self.inner.shared.joined.subscribe();
-                    let sent = self.inner.producer.retry_gated(self.event.clone(), gate).await?;
-                    self.sent_to(sent.server);
-                    self.deadline = Instant::now() + self.options.deadline;
-                }
-            }
+        let part = tokio::select! {
+            biased;
+            Some(fragment) = self.fragments.recv() => Part::Fragment(fragment),
+            result = &mut self.result => result.map(Part::Result).map_err(|_| RequestError::Closed)?,
+        };
+        if matches!(part, Part::Result(_)) {
+            self.done = true;
         }
+        Ok(Some(part))
+    }
+
+    /// Sends the request again under the same id and correlation (2.9
+    /// "재시도 계약", within the retry budget S9). An original still in the
+    /// server's ledger swallows it; one that expired or was lost runs again.
+    /// This waiter stays the one that gets the answer.
+    pub async fn resend(&mut self) -> Result<(), RequestError> {
+        let gate = self.inner.shared.joined.subscribe();
+        let sent = self.inner.producer.retry_gated(self.event.clone(), gate).await?;
+        self.sent_to(sent.server);
+        Ok(())
     }
 }
 
@@ -448,9 +404,8 @@ impl Actor {
                 let Some(correlation) = fragment.correlation else { return };
                 let waiters = self.shared.waiters.lock();
                 if let Some(waiter) = waiters.get(&correlation) {
-                    if waiter.fragments.try_send(fragment).is_err() {
-                        waiter.lost.store(true, Ordering::Relaxed);
-                    }
+                    // Fails only when the stream was dropped: nobody to tell.
+                    let _ = waiter.fragments.send(fragment);
                 }
             }
             Outbound::Pending { .. } => {

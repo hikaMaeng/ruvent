@@ -132,14 +132,11 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 
 * 워커 프레임워크([crates/ruvent-client](../crates/ruvent-client/README.md)): 서비스마다 lane 태스크 하나가
   허가, 보관 알림, 재조회를 소유한다. 실행은 착수 → 핸들러 → 완료다. 허가는 핸들러가 끝나면 돌아온다.
-* 프록시([crates/ruvent-proxy](../crates/ruvent-proxy/README.md)): 발송 팬아웃 계층(개편 계획 4장). 서버 목록의
-  모든 서버에 SDK로 붙고(서버마다 관찰·생산·작업 연결 하나씩, keepalive와 재접속은 SDK), 대상(채널 또는 접두사)마다
-  서버마다 상향 구독 하나를 두고 사용자에게 나눠 보낸다. 사용자가 붙을 때마다 관찰자에 구독을 한 번 더 내고,
-  관찰자가 붙인 ticket 이상인 그 서버의 확인(`Observed::Subscribed`) 이후의 발송만 그 사용자에게 보낸다. 엔벨롭은
-  허브가 `Arc`로 나누고, 텍스트 프로토콜용 JSON은 이벤트마다 한 번 만든다. 등록은 SDK 생산자로, 요청–응답
-  (`Proxy::exchange`, 인증 워커)은 SDK 요청자로 인스턴스 응답 채널에서 받는다. `/health`는 서버별 관찰 연결과
-  응답 채널 참여로 판정한다. 프록시는 완성품 바이너리가 아니라 라이브러리다. 프로토콜은 feature로 고르고,
-  인증·구독·등록·전달은 훅(`Hooks`)으로 바꾼다. 훅을 쓰지 않으면 JSON 설정대로 돈다. 전달 훅만 허브의 단일
-  태스크에서 동기로 불리고(패닉은 허브가 잡고 그 사용자만 끊는다), 나머지는 사용자 태스크에서 돈다. 허브는
-  구독 장부(`hub/channels`, 순수 상태), 허브 태스크(`hub/task.rs`), 핸들(`hub/mod.rs`, `hub/user.rs`), 상향 호출
-  (`hub/calls.rs`)로 나뉜다. 훅의 상향 핸들(`UpstreamCalls`)에는 구독·취소가 없다.
+* 프록시([crates/ruvent-proxy](../crates/ruvent-proxy/README.md)): 발송 팬아웃 계층(개편 계획 4장)의 골조다. 서버 목록의
+  모든 서버에 SDK 관찰자로 붙고(keepalive와 재접속은 SDK), 대상(채널 또는 접두사)마다 서버마다 상향 구독 하나를 두고
+  구성원에게 나눠 보낸다. 구성원이 붙을 때마다 관찰자에 구독을 한 번 더 내고, 관찰자가 붙인 ticket 이상인 그 서버의
+  확인(`Observed::Subscribed`) 이후의 발송만 그 구성원에게 보낸다. 엔벨롭은 허브가 `Arc`로 나눈다. 허브는 구독
+  장부(`fanout/channels`, 순수 상태), 허브 태스크(`fanout/task.rs`), 핸들(`fanout/mod.rs`의 `Fanout`·`Member`)로
+  나뉜다. 클라이언트 쪽 프로토콜, 인증, 등록(SDK 생산자), 요청–응답(SDK 요청자), 기한, 역압, 준비 상태의 노출은
+  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v2 하나만
+  말하고, 프록시와 워커 서버만 그것으로 붙는다.

@@ -1,9 +1,11 @@
 //! Reconnection delays: exponential back-off with full jitter (S20).
 //!
 //! The n-th failed attempt in a row waits a uniformly random time in
-//! `[0, min(cap, initial × 2^n)]`. A server that sent `Bye{draining}` is not
-//! knocked on: until it welcomes again the cap is the longer `draining` one
-//! and the first wait already uses it.
+//! `[0, min(cap, initial × 2^n)]`. `Bye{draining}` changes nothing here: a
+//! server that is being taken down for a restart is back as soon as it
+//! listens again, and a single-server deployment must not wait longer than
+//! the ordinary ceiling to find it. A draining server refuses a production
+//! connection with one `Bye`, which costs it no more than the attempt.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -17,13 +19,11 @@ pub struct Reconnect {
     /// The ceiling never rises past this. Shorter than the server's reconnect
     /// grace (3 s), so a live worker is back within it.
     pub cap: Duration,
-    /// The ceiling after `Bye{draining}` on a production connection.
-    pub draining: Duration,
 }
 
 impl Default for Reconnect {
     fn default() -> Self {
-        Reconnect { initial: Duration::from_millis(50), cap: Duration::from_secs(1), draining: Duration::from_secs(30) }
+        Reconnect { initial: Duration::from_millis(50), cap: Duration::from_secs(1) }
     }
 }
 
@@ -76,34 +76,23 @@ impl Rng {
 pub struct Backoff {
     config: Reconnect,
     failures: u32,
-    draining: bool,
     rng: Rng,
 }
 
 impl Backoff {
     pub fn new(config: Reconnect) -> Self {
-        Backoff { config, failures: 0, draining: false, rng: Rng::default() }
+        Backoff { config, failures: 0, rng: Rng::default() }
     }
 
     /// A welcome: the next disconnection starts over.
     pub fn reset(&mut self) {
         self.failures = 0;
-        self.draining = false;
-    }
-
-    /// The server is draining: wait with the longer ceiling until it welcomes again.
-    pub fn draining(&mut self) {
-        self.draining = true;
     }
 
     /// The wait before the next attempt.
     pub fn wait(&mut self) -> Duration {
-        let ceiling = if self.draining {
-            self.config.draining
-        } else {
-            let grown = self.config.initial.saturating_mul(1u32.checked_shl(self.failures.min(31)).unwrap_or(u32::MAX));
-            grown.min(self.config.cap)
-        };
+        let grown = self.config.initial.saturating_mul(1u32.checked_shl(self.failures.min(31)).unwrap_or(u32::MAX));
+        let ceiling = grown.min(self.config.cap);
         self.failures = self.failures.saturating_add(1);
         let ceiling = u64::try_from(ceiling.as_micros()).unwrap_or(u64::MAX);
         Duration::from_micros(self.rng.up_to(ceiling))
@@ -115,8 +104,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn back_off_grows_to_its_cap_with_full_jitter_and_draining_uses_the_long_cap() {
-        let config = Reconnect { initial: Duration::from_millis(50), cap: Duration::from_secs(1), draining: Duration::from_secs(30) };
+    fn back_off_grows_to_its_cap_with_full_jitter() {
+        let config = Reconnect { initial: Duration::from_millis(50), cap: Duration::from_secs(1) };
         let mut backoff = Backoff::new(config);
         let mut ceilings = Vec::new();
         for attempt in 0..12u32 {
@@ -128,10 +117,6 @@ mod tests {
         assert_eq!(ceilings.last(), Some(&config.cap));
         let waits: Vec<Duration> = (0..64).map(|_| backoff.wait()).collect();
         assert!(waits.iter().any(|wait| *wait < config.cap / 2), "full jitter: some waits are short");
-        backoff.draining();
-        let long: Vec<Duration> = (0..64).map(|_| backoff.wait()).collect();
-        assert!(long.iter().all(|wait| *wait <= config.draining));
-        assert!(long.iter().any(|wait| *wait > config.cap), "the draining ceiling is used from the first wait");
         backoff.reset();
         assert!(backoff.wait() <= config.initial);
     }

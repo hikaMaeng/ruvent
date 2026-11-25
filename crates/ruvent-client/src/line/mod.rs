@@ -12,7 +12,7 @@
 //! | reason | the line |
 //! | --- | --- |
 //! | `superseded` | stops; `Event::Fatal`. So does a reconnection whose `Welcome` says "superseded" (2.3) |
-//! | `draining` | a production line waits with the long ceiling (S20) until welcomed again; other roles reconnect as usual (a work or observation connection hears `draining` only when the server is going down) |
+//! | `draining` | reconnects with the ordinary back-off (S20): a restarted server is found within the ceiling. The producer keeps the server out of its candidates until it welcomes again |
 //! | `slow` | reconnects (what was dispatched meanwhile is lost) |
 //! | `version`, `token`, `forbidden` | stops; `Event::Fatal` |
 //! | `protocol` | reconnects (the owner's numbering starts over from `Welcome.resume`) |
@@ -27,7 +27,7 @@ use crate::link::Connector;
 use crate::remote::Refused;
 use crate::servers::Server;
 use backoff::{Backoff, Reconnect};
-use ruvent::{ByeReason, Hello, Link, Outbound, Role, Welcome};
+use ruvent::{ByeReason, Hello, Link, Outbound, Welcome};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -78,7 +78,6 @@ impl Drop for Line {
 
 async fn run(spec: Spec, events: mpsc::Sender<Event>) {
     let Spec { server, hello, connector, reconnect } = spec;
-    let role = hello.role;
     let mut backoff = Backoff::new(reconnect);
     let mut epoch = 0u64;
     let mut identity: Option<([u8; 16], u32)> = None;
@@ -90,13 +89,9 @@ async fn run(spec: Spec, events: mpsc::Sender<Event>) {
         let mut conn = match connector.open(&server, hello.clone()).await {
             Ok(conn) => conn,
             Err(error) => {
-                match Refused::of(&error) {
-                    Some(reason) if fatal(reason) => {
-                        let _ = events.send(Event::Fatal { server, reason }).await;
-                        return;
-                    }
-                    Some(ByeReason::Draining) if role == Role::Produce => backoff.draining(),
-                    _ => {}
+                if let Some(reason) = Refused::of(&error).filter(|reason| fatal(*reason)) {
+                    let _ = events.send(Event::Fatal { server, reason }).await;
+                    return;
                 }
                 wait = backoff.wait();
                 continue;
@@ -134,13 +129,9 @@ async fn run(spec: Spec, events: mpsc::Sender<Event>) {
         if events.send(Event::Down { server: server.clone(), epoch, bye }).await.is_err() {
             return;
         }
-        match bye {
-            Some(reason) if fatal(reason) => {
-                let _ = events.send(Event::Fatal { server, reason }).await;
-                return;
-            }
-            Some(ByeReason::Draining) if role == Role::Produce => backoff.draining(),
-            _ => {}
+        if let Some(reason) = bye.filter(|reason| fatal(*reason)) {
+            let _ = events.send(Event::Fatal { server, reason }).await;
+            return;
         }
         wait = backoff.wait();
     }

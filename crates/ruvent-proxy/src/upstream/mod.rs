@@ -1,11 +1,11 @@
 //! Where the proxy's upstream connections come from (4장, 2.8).
 //!
-//! The proxy connects to **every** server of a server list, with one
-//! connection per role on each: observation (the channels its users want,
-//! one subscription per channel or prefix per server), production (what
-//! users publish) and work (its reply channel, for request–response). All of
-//! them are the client SDK's: reconnection with back-off, TCP keepalive on
-//! every socket (S13), the `Bye` table, the unacknowledged buffer.
+//! The fan-out connects to **every** server of a server list, with one
+//! observation connection on each (one subscription per channel or prefix
+//! per server, however many members want it). It is the client SDK's
+//! observer: reconnection with back-off, TCP keepalive on every socket
+//! (S13), the `Bye` table. A program that also publishes or asks gives its
+//! own SDK producer or requester the same connector and list.
 //!
 //! [`Upstream`] names the three things that decide it: how a connection is
 //! opened ([`Connector`]: [`Tcp`] to real servers, [`Local`] to engines in
@@ -16,7 +16,6 @@
 pub use ruvent_client::link::{Conn, Connector, Local, Tcp};
 pub use ruvent_client::servers::{Server, ServerList, Servers};
 
-use crate::config::ProxyConfig;
 use std::sync::Arc;
 
 /// Where the proxy connects.
@@ -33,11 +32,6 @@ impl Upstream {
     /// `servers`, reached through `connector`, under credential `proxy`.
     pub fn new(connector: Arc<dyn Connector>, servers: impl ServerList) -> Upstream {
         Upstream { connector, servers: Arc::new(servers), credential: "proxy".into() }
-    }
-
-    /// The servers of the configuration over TCP, with its token.
-    pub fn from_config(config: &ProxyConfig) -> Upstream {
-        Upstream::new(Arc::new(Tcp::new(config.upstream.token.clone())), Servers::new(&config.upstream.servers))
     }
 
     /// The same, under another in-process credential.

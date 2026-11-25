@@ -71,13 +71,13 @@ Ctrl-C로 정상 종료한다: drain(생산 연결에 최종 확인과 `Bye{drai
 ## 원격 연결 (SDK)
 
 서버 목록과 토큰 하나로 붙는다. 서버마다 역할별 연결을 열고, 끊기면 지수 백오프 + full jitter(50 ms ~ 1초,
-`draining` 뒤 30초)로 다시 붙는다. 모든 소켓에 keepalive를 건다.
+`draining` 뒤에도 같다)로 다시 붙는다. 모든 소켓에 keepalive를 건다.
 
 ```rust,ignore
 use ruvent::Envelope;
 use ruvent_client::link::Tcp;
 use ruvent_client::producer::{Producer, ProducerConfig};
-use ruvent_client::requester::{RequestOptions, Requester, RequesterConfig};
+use ruvent_client::requester::{Part, Requester, RequesterConfig};
 use ruvent_client::servers::Servers;
 use std::sync::Arc;
 
@@ -91,8 +91,19 @@ producer.flush().await?;                      // 지금까지 보낸 것이 모�
 
 // 요청자: 인스턴스마다 응답 채널 `reply.<id>` 하나. 결과는 착수용 이벤트라 재접속·재기동에도 잃지 않는다.
 let requester = Requester::start(tcp.clone(), &servers, RequesterConfig::default());
-let response = requester.request(Envelope::claimable("orders", "price", body), RequestOptions::default()).await?;
+let response = requester.request(Envelope::claimable("orders", "price", body)).await?;
 // response.fragments(스트림 조각) → response.result 순서. response.fragments_lost: 그사이 연결이 바뀌었다
+
+// 요청자는 기한을 두지 않는다. 무엇을 잴지는 호출자가 정한다. 예: 조각 사이 유휴 30초
+let mut stream = requester.stream(Envelope::claimable("chat", "complete", body).with_expires(Duration::from_secs(60))).await?;
+while let Ok(next) = tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+    match next? {
+        Some(Part::Fragment(piece)) => { /* 클라이언트로. 느리면 stream.backlog()를 보고 호출자가 끊는다 */ }
+        Some(Part::Result(result)) => { /* 끝 */ }
+        None => break,
+    }
+}
+// 같은 id 재전송: stream.resend().await? (서버에 원본이 살아 있으면 삼킨다)
 ```
 
 워커 핸들러에서 결과는 `cx.reply(payload)`(응답 채널의 후속, `expires` 60초), 조각은 `cx.fragment(payload).await`
@@ -104,7 +115,7 @@ let response = requester.request(Envelope::claimable("orders", "price", body), R
 | `Bye` 사유 | SDK |
 | --- | --- |
 | `superseded` | 그 생산자 id로 다시 붙지 않고 오류(`ProducerError::Refused`) |
-| `draining` | 생산 후보에서 빼고, 최종 확인 뒤의 미확인분은 다른 서버로. 긴 백오프로 다시 붙는다 |
+| `draining` | 생산 후보에서 빼고, 최종 확인 뒤의 미확인분은 다른 서버로. 평소 백오프로 다시 붙고 `Welcome`을 받으면 후보에 넣는다 |
 | `slow` | 다시 붙는다. 그사이 발송은 잃는다 |
 | `version`, `token`, `forbidden` | 다시 붙지 않고 오류 |
 
@@ -112,40 +123,20 @@ let response = requester.request(Envelope::claimable("orders", "price", body), R
 
 ## 프록시
 
-프록시는 배포용 바이너리가 없다. `ruvent-proxy`에 의존하는 프로그램을 만든다. 프로토콜은 feature(`ws`, `http`,
-기본은 둘 다)로 고르고, 켠 프로토콜은 한 `listen` 주소에서 함께 열린다.
+프록시는 프로젝트가 만든다. `ruvent-proxy`는 골조만 준다. 서버별 상향 관찰 연결과, 대상마다 상위 구독 하나를
+구성원에게 나누는 팬아웃이다. 클라이언트 쪽 프로토콜(WebSocket, HTTP, WebRTC 등), 인증, 구독 권한 검사, 등록,
+요청–응답, 기한, 역압, `/health`는 프로젝트가 만든다. 등록과 요청–응답은 SDK의 생산자·요청자를 자기 설정으로 쓴다.
 
 ```rust,ignore
-#[tokio::main]
-async fn main() -> Result<(), ruvent_proxy::LaunchError> {
-    ruvent_proxy::Server::new().run().await              // 설정대로
-    // ruvent_proxy::Server::new().hooks(Domain).run().await   // 도메인 훅을 붙여서
-}
+use ruvent_proxy::{Fanout, FanoutConfig, Target, Upstream};
+
+let fanout = Fanout::start(FanoutConfig::default(), Upstream::new(tcp.clone(), servers.clone()));
+let (member, mut events) = fanout.attach().await?;          // 클라이언트 연결 하나마다
+member.subscribe(Target::Prefix("chat.room-7".into())).await?;  // 프로젝트의 권한 검사 뒤
+while let Some(event) = events.recv().await { /* Arc<Envelope>를 클라이언트 프로토콜로 */ }
 ```
 
-```sh
-cargo run --release -p ruvent-proxy --example plain -- crates/ruvent-proxy/proxy.example.json
-cargo run --release -p ruvent-proxy --example custom -- crates/ruvent-proxy/proxy.example.json
-```
-
-* 상향: 설정의 `upstream.servers`에 적은 **모든 서버**에 붙는다. 서버마다 관찰(구독), 생산(등록), 작업(응답 채널)
-  연결이 하나씩이고 모두 SDK의 것이다(재접속, keepalive, `Bye` 사유표). 라우터가 관리하는 목록이나 같은 프로세스
-  엔진은 `Server::upstream(Upstream { connector, servers, credential })`로 넘긴다.
-* WS: `GET /v1/ws?token=…` 뒤에 JSON 메시지(`publish`, `subscribe`, `unsubscribe`)를 주고받는다. 구독은 정확한
-  `channel` 또는 `prefix`(그 아래 `.` 경계의 모든 채널) 하나를 적는다.
-* HTTP: `POST /v1/events`(Bearer 토큰)로 등록하고 커밋되면 200이다. `GET /v1/stream?channel=…&prefix=…`(SSE)로 받는다.
-* `/health`: 목록의 모든 서버에서 관찰 연결과 응답 채널 참여가 살아 있으면 200, 아니면 503. 본문에 서버별 상태가 있다.
-* 요청–응답: `Proxy::exchange(event)`(또는 훅의 `cx.upstream()?.exchange(…)`). 결과는 프록시 인스턴스의 응답 채널
-  `reply.<인스턴스 id>`에 착수용 이벤트로 오고, 상향이 끊겨도 기다리던 결과는 다시 붙으면 온다. 조각은 결과보다
-  앞서 같은 연결로 온다(`exchange_stream`).
-* 원 엔벨롭: 자기 프로토콜을 붙이는 프로그램은 `Proxy::attach_raw`로 `Outgoing::Event(Arc<Envelope>)`를 받는다.
-  payload를 JSON 텍스트로 바꾸지 않는다.
-* 훅: `authenticate`, `subscribe`(대상이 채널 또는 접두사), `publish`, `deliver` 중 필요한 것만 쓴다. 쓰지 않은 훅은
-  설정의 인증 모드(`none`, `static`, `worker`)와 채널 범위를 따른다. `worker` 인증은 요청–응답 하나이고, 워커는
-  요청의 `reply` 채널에 착수용 후속으로 답한다. 훅, 메시지 형식, 설정, 오류 → 상태 코드는
-  [crates/ruvent-proxy/README.md](../crates/ruvent-proxy/README.md).
-* 멈추기: `run()`은 Ctrl-C에, `run_until(신호)`는 그 신호에 끝난다. 끝나면 사용자 연결이 모두 닫히고 상향 연결도
-  모두 놓는다. 바인드만 하고 직접 서비스하려면 `bind()` 뒤 `Bound::serve_until(신호)`.
+자세한 계약은 [crates/ruvent-proxy/README.md](../crates/ruvent-proxy/README.md).
 
 ## 워커가 정하는 것
 

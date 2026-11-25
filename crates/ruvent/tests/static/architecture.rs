@@ -191,21 +191,18 @@ fn workspace_library() -> Vec<Source> {
 /// | `ruvent/snapshot/mod.rs` `time::timeout(` | a snapshot unit's age limit |
 /// | `ruvent/engine/mod.rs` `time::sleep(` | the timing wheel: one one-shot sleep to the earliest lease end or visibility time, none when the wheel is empty (2.4) |
 /// | `ruvent-client/line/mod.rs` `time::sleep(` | reconnection back-off: one wait between two attempts of a line, exponential with full jitter (S20) |
-/// | `ruvent-client/requester/mod.rs` `time::timeout(` | the call deadline of a request: past it the request is sent again (same id) or fails (2.8, 2.9) |
 /// | `ruvent-client/worker/extend.rs` `time::sleep(` | the automatic extension: one one-shot sleep to the earliest `Extend` due (half a lease), none while no run is due (2.4, B7) |
 /// | `ruvent-client/worker/shutdown.rs` `time::sleep(` | the shutdown grace: armed only while shutting down (2.9 "종료") |
 /// | `ruvent-client/worker/run.rs` `time::timeout(` | a handler's run limit: past it the run is cut off and released (B7; the lease is no longer the run limit) |
 /// | `ruvent-server/connection/handshake.rs` `time::timeout(` | how long a new connection has to say hello |
 /// | `ruvent-server/connection/close.rs` `time::timeout(` | the deadline of a staged close after `Bye` (2.2, S20) |
 ///
-/// The proxy declares none of its own: it reconnects through the SDK's lines
-/// and waits for an authentication worker's answer with the SDK requester's
-/// call deadline.
+/// The requester and the proxy declare none: a request's deadline, and any
+/// other wait a proxy bounds, is the program's (4장).
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
     ("ruvent/engine/mod.rs", "time::sleep(", 1),
     ("ruvent-client/line/mod.rs", "time::sleep(", 1),
-    ("ruvent-client/requester/mod.rs", "time::timeout(", 1),
     ("ruvent-client/worker/extend.rs", "time::sleep(", 1),
     ("ruvent-client/worker/shutdown.rs", "time::sleep(", 1),
     ("ruvent-client/worker/run.rs", "time::timeout(", 1),
@@ -262,30 +259,32 @@ fn nothing_polls_and_every_timer_is_declared() {
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
-/// The proxy's roles stay apart, so each can change and be tested alone:
+/// The proxy crate is a skeleton (4장): the per-server upstream and the
+/// subscription rule, nothing a program decides.
 ///
-/// * the subscription book (`hub/channels`) is pure state: no task, no queue,
-///   no clock, nothing awaited;
-/// * a hook's upstream handle cannot subscribe or unsubscribe on the hub's
-///   connection, whose markers decide when a user's subscription takes effect;
-/// * the deliver hook is called in one place, behind a panic guard, so a
-///   failing hook cannot end the hub task.
+/// * the subscription book (`fanout/channels`) is pure state: no task, no
+///   queue, no clock, nothing awaited;
+/// * no client-facing protocol, configuration file, authentication or
+///   request–response: the crate depends on no HTTP or serialization crate
+///   and does not produce, request or work — the program does that through
+///   its own SDK handles.
 #[test]
-fn the_proxy_keeps_its_roles_apart() {
+fn the_proxy_is_a_skeleton() {
     let sources = workspace_library();
     let file = |path: &str| sources.iter().find(|source| source.path == path).unwrap_or_else(|| panic!("{path} is gone; update this rule with the move")).code();
-    let book = file("ruvent-proxy/hub/channels/mod.rs");
+    let book = file("ruvent-proxy/fanout/channels/mod.rs");
     for needle in ["tokio", "mpsc", "oneshot", "Instant", "time::", "async ", ".await", "spawn"] {
         assert!(!book.contains(needle), "the subscription book uses `{needle}`; it must stay pure state");
     }
-    let context = file("ruvent-proxy/hooks/context.rs");
-    for needle in ["fn subscribe", "fn unsubscribe", "pub methods", "-> Option<Arc<dyn Methods>>"] {
-        assert!(!context.contains(needle), "the hooks' upstream handle exposes `{needle}`");
+    let proxy: Vec<&Source> = sources.iter().filter(|source| source.path.starts_with("ruvent-proxy/")).collect();
+    for needle in ["axum", "serde", "http::", "requester", "producer", "worker::", "Hooks"] {
+        let users: Vec<&str> = proxy.iter().filter(|source| source.code().contains(needle)).map(|source| source.path.as_str()).collect();
+        assert!(users.is_empty(), "the proxy skeleton uses `{needle}` in {users:?}; that is the program's");
     }
-    let calls: Vec<(&str, usize)> =
-        sources.iter().filter(|source| source.path.starts_with("ruvent-proxy/")).map(|source| (source.path.as_str(), source.count(".deliver("))).filter(|(_, count)| *count > 0).collect();
-    assert_eq!(calls, [("ruvent-proxy/hub/task.rs", 1)], "the deliver hook is called from one place");
-    assert!(file("ruvent-proxy/hub/task.rs").contains("catch_unwind(AssertUnwindSafe(|| hooks.deliver("), "the deliver hook runs behind a panic guard");
+    let manifest = std::fs::read_to_string(workspace_root().join("crates/ruvent-proxy/Cargo.toml")).unwrap();
+    let dependencies = manifest.split("[dependencies]").nth(1).and_then(|rest| rest.split("[dev-dependencies]").next()).unwrap_or_default();
+    let names: Vec<&str> = dependencies.lines().filter_map(|line| line.split(['=', '.']).next()).map(str::trim).filter(|name| !name.is_empty() && !name.starts_with('#')).collect();
+    assert_eq!(names, ["ruvent", "ruvent-client", "tokio"], "the proxy skeleton depends on the ledger, the SDK and the runtime only");
 }
 
 fn only<'a>(sources: &'a [Source], needle: &str) -> Vec<(&'a str, usize)> {

@@ -35,10 +35,6 @@ const GATES: &[Gate] = &[
     gate("server", &["test", "-p", "ruvent-server"]),
     gate("client and workers", &["test", "-p", "ruvent-client"]),
     gate("proxy", &["test", "-p", "ruvent-proxy"]),
-    // Each protocol is a feature: the crate must build and lint clean with only one, and with none.
-    gate("proxy: ws only", &["clippy", "-p", "ruvent-proxy", "--no-default-features", "--features", "ws", "--all-targets", "--", "-D", "warnings"]),
-    gate("proxy: http only", &["clippy", "-p", "ruvent-proxy", "--no-default-features", "--features", "http", "--all-targets", "--", "-D", "warnings"]),
-    gate("proxy: no protocol", &["clippy", "-p", "ruvent-proxy", "--no-default-features", "--all-targets", "--", "-D", "warnings"]),
 ];
 
 const DEEP: &[Gate] = &[Gate { name: "properties at 100,000 cases", args: &["test", "--release", "-p", "ruvent", "-p", "ruvent-protocol", "--lib"], env: &[("PROPTEST_CASES", "100000")] }];

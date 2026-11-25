@@ -1,94 +1,51 @@
-//! Build a proxy server for end users.
+//! The skeleton of a proxy: the event servers' dispatch fan-out (plan 4장).
 //!
-//! A proxy is the event servers' dispatch fan-out layer (plan 4장): it
-//! connects to every event server of a list, holds one upstream
-//! subscription per channel (or prefix) per server however many users it
-//! serves, and hands each event to its users. A server's dispatch cost is
-//! then proportional to the number of proxies, not of users. This crate is
-//! the whole proxy: there is no separate binary per protocol. You pick the
-//! protocols as features and write a three-line `main`:
+//! A proxy connects to every event server of a list, holds one upstream
+//! subscription per channel (or prefix) per server however many members it
+//! serves, and hands each event to its members. A server's dispatch cost is
+//! then proportional to the number of proxies, not of users.
 //!
-//! ```no_run
-//! # #[cfg(any(feature = "ws", feature = "http"))]
-//! #[tokio::main]
-//! async fn main() -> Result<(), ruvent_proxy::LaunchError> {
-//!     // `my-proxy proxy.json`: everything it decides comes from the JSON file.
-//!     ruvent_proxy::Server::new().run().await
-//! }
-//! # #[cfg(not(any(feature = "ws", feature = "http")))]
-//! # fn main() {}
-//! ```
-//!
-//! Your own rules are hooks: implement only the methods of [`Hooks`] you
-//! need, and the rest keep the configured behaviour. A hook trusts nothing
-//! the client sent until it has checked it — here a session cookie is
-//! looked up in the program's own session table:
+//! The event servers speak one protocol, the ruvent wire over TCP; proxies
+//! and worker servers reach them only through it (the client SDK). Everything
+//! a proxy shows its own clients is the proxy program's: the protocols it
+//! serves (WebSocket, HTTP, WebRTC, …), who a client is and what it may
+//! subscribe to, what a client may publish, request deadlines and
+//! back-pressure toward a slow client. This crate decides none of it. It
+//! gives the part every proxy needs and gets wrong easily: the per-server
+//! upstream and the subscription rule.
 //!
 //! ```no_run
-//! # #[cfg(any(feature = "ws", feature = "http"))]
-//! # mod example {
-//! use ruvent_proxy::{async_trait, Context, Denied, Handshake, Hooks, User};
-//! use std::collections::HashMap;
+//! use ruvent_proxy::{Fanout, FanoutConfig, Servers, Target, Tcp, Upstream};
+//! use std::sync::Arc;
 //!
-//! /// session id → user name. A real program asks its session store.
-//! struct Sessions(HashMap<String, String>);
-//!
-//! #[async_trait]
-//! impl Hooks for Sessions {
-//!     async fn authenticate(&self, _cx: Context<'_>, handshake: &Handshake) -> Result<User, Denied> {
-//!         let session = handshake.cookie("session").ok_or(Denied::Missing)?;
-//!         let name = self.0.get(session).ok_or(Denied::Rejected)?;
-//!         Ok(User::new(name.as_str(), [format!("chat.{name}.*")]))
-//!     }
+//! # async fn run() -> Result<(), ruvent_proxy::SubscribeError> {
+//! let upstream = Upstream::new(Arc::new(Tcp::new("proxy-token")), Servers::new(["10.0.0.1:7400", "10.0.0.2:7400"]));
+//! let fanout = Fanout::start(FanoutConfig::default(), upstream);
+//! // One per client connection of the program's own protocol:
+//! let (member, mut events) = fanout.attach().await?;
+//! member.subscribe(Target::Channel("chat.room-7".into())).await?; // after the program's own check
+//! while let Some(event) = events.recv().await {
+//!     // Write `event` to the client in the program's protocol.
+//!     let _ = event;
 //! }
-//!
-//! # async fn run(sessions: HashMap<String, String>) -> Result<(), ruvent_proxy::LaunchError> {
-//! ruvent_proxy::Server::new().hooks(Sessions(sessions)).run().await
-//! # }
+//! # Ok(())
 //! # }
 //! ```
 //!
 //! | module | what it is |
 //! | --- | --- |
-//! | [`hooks`] | where a domain plugs in: authenticate, subscribe, publish, deliver |
-//! | [`server`] | the builder that turns a configuration and hooks into a running server (feature `ws` or `http`) |
-//! | [`protocol`] | the routes of each protocol feature, mountable in your own `axum` app |
-//! | [`handshake`] | what a user's connection or request carried: headers, query, peer, token |
-//! | [`config`] | the JSON file |
-//! | [`auth`] | end users, and the configured modes: `none`, `static` tokens (Q1(c)), an authentication worker (Q1(a)) |
-//! | [`hub`] | the upstream subscriptions and the fan-out to users; publishing and request–response |
-//! | [`health`] | what `/health` reports: each listed server's connections |
-//! | [`message`] | the user-facing JSON, the same for every protocol, and the raw event stream |
+//! | [`fanout`] | the upstream subscriptions and the fan-out to members: [`Fanout`], [`Member`] |
+//! | [`health`] | each listed server's observation connection, and readiness |
 //! | [`upstream`] | where the upstream connections go: connector, server list, credential |
 //!
-//! A user that was disconnected misses what was sent meanwhile (dispatch is
-//! one-shot, 0.3); a user whose send buffer fills is disconnected.
+//! A member that was disconnected misses what was sent meanwhile (dispatch
+//! is one-shot, 0.3); a member whose stream fills is detached.
 
-pub mod auth;
-pub mod config;
-pub mod handshake;
+pub mod fanout;
 pub mod health;
-pub mod hooks;
-pub mod hub;
-pub mod message;
 pub mod upstream;
 
-#[cfg(any(feature = "ws", feature = "http"))]
-pub mod protocol;
-#[cfg(any(feature = "ws", feature = "http"))]
-pub mod server;
-
-pub use auth::{Denied, User};
-pub use config::ProxyConfig;
-pub use handshake::Handshake;
+pub use fanout::{Fanout, FanoutConfig, Member, MemberId, SubscribeError};
 pub use health::{Health, ServerHealth};
-pub use hooks::{Context, Defaults, Hooks, UpstreamCalls};
-pub use hub::{bad_request, Proxy, UserHandle, UserId};
-pub use message::{Cause, Outcome, Outgoing, Publish, PublishKind, Rejection, Request};
-#[cfg(any(feature = "ws", feature = "http"))]
-pub use protocol::router;
-pub use ruvent::{async_trait, Envelope, Target};
-pub use ruvent_client::requester::{Part, RequestError, RequestOptions, Response, Stream};
-#[cfg(any(feature = "ws", feature = "http"))]
-pub use server::{Bound, LaunchError, Server};
-pub use upstream::{Connector, Local, ServerList, Servers, Tcp, Upstream};
+pub use ruvent::{Envelope, Target};
+pub use upstream::{Connector, Local, Server, ServerList, Servers, Tcp, Upstream};

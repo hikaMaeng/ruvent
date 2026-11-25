@@ -2,7 +2,6 @@
 //! Answers are labelled with `&str` so each test reads as a trace.
 
 use super::*;
-use crate::message::Cause;
 use std::sync::Arc;
 
 type Book = Channels<&'static str>;
@@ -27,16 +26,16 @@ fn oks(step: &Step<&'static str>) -> Vec<&'static str> {
     step.answers.iter().filter(|(_, result)| result.is_ok()).map(|(label, _)| *label).collect()
 }
 
-fn errors(step: &Step<&'static str>) -> Vec<(&'static str, Rejection)> {
-    step.answers.iter().filter_map(|(label, result)| result.clone().err().map(|rejection| (*label, rejection))).collect()
+fn errors(step: &Step<&'static str>) -> Vec<(&'static str, SubscribeError)> {
+    step.answers.iter().filter_map(|(label, result)| (*result).err().map(|rejection| (*label, rejection))).collect()
 }
 
-fn audience(book: &Book, name: &str, on: &str) -> Vec<UserId> {
+fn audience(book: &Book, name: &str, on: &str) -> Vec<MemberId> {
     book.audience(name, &server(on))
 }
 
 /// Joins `user` to `target` and runs it to "subscribed" on `on`: confirmation, then the call's answer.
-fn joined(book: &mut Book, user: UserId, target: Target, on: &str, label: &'static str) -> u64 {
+fn joined(book: &mut Book, user: MemberId, target: Target, on: &str, label: &'static str) -> u64 {
     let step = book.join(user, target.clone(), label);
     let Some(Call::Subscribe { ticket, .. }) = step.calls.first().cloned() else { panic!("no subscribe issued") };
     book.confirmed(&server(on), &target, ticket);
@@ -54,7 +53,7 @@ fn a_join_waits_for_its_own_confirmation_and_its_answer() {
     let step = book.join(1, channel("room"), "u1");
     assert_eq!(step.calls, vec![sub(channel("room"), 1)]);
     assert!(step.answers.is_empty(), "not in effect before the confirmation");
-    assert_eq!(audience(&book, "room", "s0"), Vec::<UserId>::new());
+    assert_eq!(audience(&book, "room", "s0"), Vec::<MemberId>::new());
     let step = book.confirmed(&server("s0"), &channel("room"), 1);
     assert!(step.answers.is_empty(), "the call has not come back yet");
     assert_eq!(audience(&book, "room", "s0"), vec![1], "in effect on s0 from its confirmation");
@@ -131,7 +130,7 @@ fn confirmations_and_answers_nobody_asked_for_are_ignored() {
     assert!(!book.contains(&channel("ghost")), "a confirmation creates no entry");
     book.join(1, channel("room"), "u1");
     assert!(book.answered(&channel("room"), 7, Ok(())).answers.is_empty());
-    assert!(book.answered(&channel("room"), 7, Err(Rejection::forbidden("no"))).answers.is_empty());
+    assert!(book.answered(&channel("room"), 7, Err(Refusal::Forbidden)).answers.is_empty());
     assert!(book.contains(&channel("room")));
 }
 
@@ -158,7 +157,7 @@ fn leaving_before_the_confirmation_answers_the_waiting_join() {
     assert_eq!(step.calls, vec![Call::Unsubscribe(channel("room"))]);
     let failed = errors(&step);
     assert_eq!(failed.len(), 1);
-    assert_eq!((failed[0].0, failed[0].1.cause), ("u1", Cause::Unavailable));
+    assert_eq!((failed[0].0, failed[0].1), ("u1", SubscribeError::Left));
 }
 
 /// After `0 → 1 → 0 → 1` the user waits for the second subscribe's confirmation; the first's activates nothing.
@@ -170,7 +169,7 @@ fn resubscribing_waits_for_the_second_subscribes_confirmation() {
     let step = book.join(1, channel("room"), "again");
     assert_eq!(step.calls, vec![sub(channel("room"), first + 1)]);
     book.confirmed(&server("s0"), &channel("room"), first);
-    assert_eq!(audience(&book, "room", "s0"), Vec::<UserId>::new(), "a late confirmation of the first subscribe leaks nothing");
+    assert_eq!(audience(&book, "room", "s0"), Vec::<MemberId>::new(), "a late confirmation of the first subscribe leaks nothing");
     book.confirmed(&server("s0"), &channel("room"), first + 1);
     assert_eq!(audience(&book, "room", "s0"), vec![1]);
 }
@@ -193,9 +192,9 @@ fn leaving_all_leaves_every_target_and_unknown_ones_do_nothing() {
 fn a_refusal_fails_the_join_it_answers() {
     let mut book = Book::new();
     book.join(1, channel("secret"), "u1");
-    let step = book.answered(&channel("secret"), 1, Err(Rejection::from_refusal(ruvent::Refusal::Forbidden)));
+    let step = book.answered(&channel("secret"), 1, Err(Refusal::Forbidden));
     let failed = errors(&step);
-    assert_eq!((failed[0].0, failed[0].1.cause, failed[0].1.message.as_str()), ("u1", Cause::Forbidden, "upstream refused: forbidden"));
+    assert_eq!((failed[0].0, failed[0].1), ("u1", SubscribeError::Refused(Refusal::Forbidden)));
     assert_eq!(step.calls, vec![Call::Unsubscribe(channel("secret"))]);
     assert!(!book.contains(&channel("secret")));
 }

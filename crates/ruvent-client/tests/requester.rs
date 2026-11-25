@@ -5,7 +5,7 @@
 mod support;
 
 use ruvent::{EngineConfig, Envelope};
-use ruvent_client::requester::{Part, RequestError, RequestOptions, Requester, RequesterConfig};
+use ruvent_client::requester::{Part, Requester, RequesterConfig};
 use ruvent_client::servers::Servers;
 use ruvent_client::worker::{Service, Worker};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +36,7 @@ async fn a_request_gets_its_fragments_then_its_result_over_tcp() {
         }))
         .start();
     let requester = Requester::start(tcp(), &list, RequesterConfig::default());
-    let response = within("the response", requester.request(ask("x"), RequestOptions::default())).await.unwrap();
+    let response = within("the response", requester.request(ask("x"))).await.unwrap();
     assert_eq!(&response.result.payload[..], b"x!");
     let pieces: Vec<&[u8]> = response.fragments.iter().map(|fragment| &fragment.payload[..]).collect();
     assert_eq!(pieces, [b"a", b"b", b"c"]);
@@ -73,7 +73,7 @@ async fn a_restart_during_a_request_loses_no_result_and_runs_nothing_twice() {
         }))
         .start();
     let requester = Requester::start(local.clone(), &list, RequesterConfig::default());
-    let mut stream = within("the request", requester.stream(ask("x"), RequestOptions::default())).await.unwrap();
+    let mut stream = within("the request", requester.stream(ask("x"))).await.unwrap();
     match within("the first fragment", stream.next()).await.unwrap() {
         Some(Part::Fragment(fragment)) => assert_eq!((&fragment.payload[..], fragment.correlation), (&b"before"[..], Some(stream.correlation()))),
         other => panic!("expected the first fragment, got {other:?}"),
@@ -120,7 +120,7 @@ async fn a_requester_that_reconnects_still_gets_its_result_once() {
     let requester = Requester::start(tcp(), &Servers::new([&relay.address]), RequesterConfig::default());
     let waiting = {
         let requester = requester.clone();
-        tokio::spawn(async move { requester.request(ask("x"), RequestOptions::default()).await })
+        tokio::spawn(async move { requester.request(ask("x")).await })
     };
     eventually("the run started", || runs.load(Ordering::SeqCst) == 1).await;
     relay.cut(Cut::Both);
@@ -132,39 +132,65 @@ async fn a_requester_that_reconnects_still_gets_its_result_once() {
     worker.shutdown().await;
 }
 
-/// 2.9: the call deadline. With no worker the request times out; a retry
-/// at the deadline resends the same id (the original swallows it), and a
-/// late worker answers the one waiter once.
+/// 2.9: the requester sets no deadline. The caller bounds its wait from
+/// outside; a resend under the same id (the original swallows it) keeps the
+/// one waiter, and a late worker answers it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_past_its_deadline_times_out_and_a_retry_keeps_one_waiter() {
+async fn the_caller_bounds_the_wait_and_a_resend_keeps_one_waiter() {
     let (local, list, engines) = locals(1, EngineConfig::default()).await;
     let requester = Requester::start(local.clone(), &list, RequesterConfig::default());
-    let quick = RequestOptions { deadline: Duration::from_millis(150), retries: 0 };
-    assert_eq!(within("timeout", requester.request(ask("lost"), quick)).await, Err(RequestError::Timeout));
-    let patient = RequestOptions { deadline: Duration::from_millis(300), retries: 3 };
-    let waiting = {
-        let requester = requester.clone();
-        tokio::spawn(async move { requester.request(ask("late"), patient).await })
-    };
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut stream = within("the request", requester.stream(ask("late"))).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(150), stream.next()).await.is_err(), "nobody answers: the caller's own bound ends the wait");
+    within("the resend", stream.resend()).await.unwrap();
+    within("a second resend", stream.resend()).await.unwrap();
     let runs = Arc::new(AtomicU64::new(0));
     let handler_runs = runs.clone();
     let worker = Worker::builder(local, &list)
         .service(Service::new("orders").on("price", move |cx| {
             let runs = handler_runs.clone();
             async move {
-                if cx.payload()[..] == b"late"[..] {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                }
+                runs.fetch_add(1, Ordering::SeqCst);
                 cx.reply(cx.payload().clone());
                 Ok(())
             }
         }))
         .start();
-    let response = within("the late answer", waiting).await.unwrap().unwrap();
-    assert_eq!(&response.result.payload[..], b"late");
+    match within("the late answer", stream.next()).await.unwrap() {
+        Some(Part::Result(result)) => assert_eq!(&result.payload[..], b"late"),
+        other => panic!("expected the result, got {other:?}"),
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(runs.load(Ordering::SeqCst), 1, "the resend under the same id ran nothing again");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the resends under the same id ran nothing again");
+    let _ = &engines;
+    worker.shutdown().await;
+}
+
+/// The requester drops no fragment: a caller that reads nothing while a
+/// thousand arrive finds every one, in order, and the backlog shows them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fragments_are_kept_for_a_caller_that_reads_late() {
+    let (local, list, engines) = locals(1, EngineConfig::default()).await;
+    const COUNT: u32 = 3000;
+    let worker = Worker::builder(local.clone(), &list)
+        .service(Service::new("orders").on("price", |cx| async move {
+            for n in 0..COUNT {
+                cx.fragment(n.to_string().into_bytes()).await.unwrap();
+            }
+            cx.reply(&b"end"[..]);
+            Ok(())
+        }))
+        .start();
+    let requester = Requester::start(local, &list, RequesterConfig::default());
+    let mut stream = within("the request", requester.stream(ask("x"))).await.unwrap();
+    eventually("every fragment arrived unread", || stream.backlog() == COUNT as usize).await;
+    for n in 0..COUNT {
+        match within("a fragment", stream.next()).await.unwrap() {
+            Some(Part::Fragment(fragment)) => assert_eq!(fragment.payload[..], *n.to_string().as_bytes()),
+            other => panic!("expected fragment {n}, got {other:?}"),
+        }
+    }
+    assert!(matches!(within("the result", stream.next()).await.unwrap(), Some(Part::Result(_))));
+    assert!(!stream.fragments_lost());
     let _ = &engines;
     worker.shutdown().await;
 }

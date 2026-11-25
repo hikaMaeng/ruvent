@@ -13,12 +13,8 @@ ruvent-protocol = { path = "crates/ruvent-protocol" }
 ruvent-client = { path = "crates/ruvent-client" }
 ruvent-proxy = { path = "crates/ruvent-proxy" }
 async-trait = "0.1"
-axum = "0.8"
 bytes = "1"
 crc32fast = "1"
-form_urlencoded = "1"
-futures-util = "0.3"
-http = "1"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

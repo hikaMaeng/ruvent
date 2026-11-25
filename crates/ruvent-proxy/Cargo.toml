@@ -1,6 +1,6 @@
 [package]
 name = "ruvent-proxy"
-description = "Build a proxy server for end users: one upstream subscription per channel, the protocols you pick as features, your rules as hooks."
+description = "The skeleton of a proxy: one upstream subscription per target per event server, fanned out to members. Protocols, authentication and policy are the program's."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,43 +8,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = ["ws", "http"]
-# WebSocket: `GET /v1/ws`.
-ws = ["dep:axum", "axum/ws", "dep:futures-util"]
-# HTTP: `POST /v1/events`, server-sent events on `GET /v1/stream`.
-http = ["dep:axum", "dep:futures-util"]
-
 [dependencies]
 ruvent.workspace = true
 ruvent-client.workspace = true
-form_urlencoded.workspace = true
-http.workspace = true
-parking_lot.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
-axum = { workspace = true, optional = true }
-futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Already in the lock file through axum's `ws` feature; only the tests use it directly.
-tokio-tungstenite = "0.29"
+parking_lot.workspace = true
 # The acceptance tests run a real event server over TCP.
 ruvent-server = { path = "../ruvent-server" }
-
-[[test]]
-name = "ws"
-required-features = ["ws"]
-
-[[test]]
-name = "http"
-required-features = ["http"]
-
-[[test]]
-name = "hooks"
-required-features = ["ws", "http"]
-
-[[test]]
-name = "acceptance"
-required-features = ["ws", "http"]
