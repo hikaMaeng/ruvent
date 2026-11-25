@@ -8,15 +8,16 @@ use super::State;
 use crate::engine::config::Method;
 use crate::engine::ops::{FaultKind, Outbound, SessionId};
 use crate::envelope::{ClaimToken, Digest, Envelope, EventId, Kind, WorkKey};
-use crate::journal::Record;
+use crate::journal::{Location, Record, Spooled};
 use crate::names::Name;
 use std::collections::HashMap;
 
 impl State {
     /// `Complete`: everything is checked before anything changes. Either the
     /// event goes and every follow-up is registered in the same step, or
-    /// nothing happens.
-    pub(super) fn complete(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>) {
+    /// nothing happens. `spooled` gives the follow-ups whose payload the
+    /// connection received to disk (2.6), by position.
+    pub(super) fn complete(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)>) {
         let Some(index) = self.attempt_for(session, credential, id, token) else { return };
         let Some(channel) = self.slots.get(index).map(|slot| slot.channel.clone()) else { return };
         if !self.allowed(credential, Method::Complete, &channel) {
@@ -25,18 +26,25 @@ impl State {
         if follow_ups.len() > self.config.max_follow_ups {
             return self.fault(session, FaultKind::Malformed, "more follow-ups than one completion may register");
         }
+        let mut streamed: HashMap<usize, Location> = HashMap::with_capacity(spooled.len());
+        for (position, body) in &spooled {
+            let position = *position as usize;
+            if position >= follow_ups.len() || follow_ups[position].kind != Kind::Claimable || !follow_ups[position].payload.is_empty() || streamed.insert(position, body.at).is_some() {
+                return self.fault(session, FaultKind::Malformed, "a streamed body names no claimable follow-up without a payload");
+            }
+        }
         let mut admitted = Vec::with_capacity(follow_ups.len());
-        for follow_up in follow_ups {
+        for (position, follow_up) in follow_ups.into_iter().enumerate() {
             let Some(follow_up) = self.admit(session, credential, follow_up) else { return };
-            admitted.push(follow_up);
+            admitted.push((follow_up, streamed.get(&position).copied()));
         }
         // A follow-up whose id is active, or repeats a sibling's, is dropped
         // when the content is the same and refuses the completion when not (2.3).
         let mut chosen: HashMap<EventId, Digest> = HashMap::new();
         let mut kept = Vec::with_capacity(admitted.len());
-        for follow_up in admitted {
+        for (follow_up, body) in admitted {
             if follow_up.kind == Kind::Claimable && !follow_up.id.is_nil() {
-                let digest = Digest::of(&follow_up.payload);
+                let digest = body.map_or_else(|| Digest::of(&follow_up.payload), |at| at.digest());
                 // The parent leaves in this step, so its own id is free for a follow-up.
                 if let Some(active) = self.slots.by_id(&follow_up.id).filter(|active| *active != index) {
                     if self.slots.get(active).is_some_and(|slot| slot.digest() == digest) {
@@ -50,7 +58,7 @@ impl State {
                     None => {}
                 }
             }
-            kept.push(follow_up);
+            kept.push((follow_up, body));
         }
 
         let before = self.effects.records.len();
@@ -59,16 +67,16 @@ impl State {
             self.record(Record::Remove(parent.fixed.key));
         }
         let children = kept.len() as u64;
-        let child_bytes: u64 = kept.iter().map(|event| event.payload.len() as u64).sum();
+        let child_bytes: u64 = kept.iter().map(|(event, body)| body.map_or(event.payload.len() as u64, |at| u64::from(at.len))).sum();
         let window = self.config.memory.net_growth_window;
         if let Some(lane) = self.lanes.get_mut(&parent.lane()) {
             lane.growth.record(parent.len(), children, child_bytes, window);
         }
         let mut dispatches = Vec::new();
-        for follow_up in kept {
+        for (follow_up, body) in kept {
             match follow_up.kind {
                 Kind::Claimable => {
-                    self.enqueue(follow_up, parent.fixed.root.clone());
+                    self.enqueue(follow_up, parent.fixed.root.clone(), body);
                 }
                 Kind::Dispatch => dispatches.push(follow_up),
             }
@@ -257,8 +265,9 @@ impl State {
                 root.ended += 1;
             }
         }
-        let cost = self.cost(slot.len());
-        self.account_remove(&slot.fixed.root, cost);
+        let usage = self.usage(&slot);
+        self.account_remove(&slot.fixed.root, usage);
+        self.free_payload(slot.at, slot.fixed.durable);
         Some(slot)
     }
 

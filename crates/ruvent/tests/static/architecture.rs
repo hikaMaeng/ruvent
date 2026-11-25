@@ -43,6 +43,107 @@ fn modules_depend_only_downward() {
     assert!(violations.is_empty(), "layering violations:\n{}", violations.join("\n"));
 }
 
+/// Inside the two modules that grew parts: which of its own submodules each
+/// part may name (6장, "새 모듈의 자리").
+///
+/// ```text
+/// journal (the log):  codec ◄── bodies, checkpoint, spool ◄── recover ◄── segment
+/// engine:             config, ops ◄── state (the ledger: accounting in state/pause, state/disk, state/roots; the wheel in state/wheel)
+///                                ◄── storage (the checkpoint writer, the chores, reads, the gauge)
+/// ```
+///
+/// `segment` and `checkpoint` name each other: the container hands out its
+/// checkpoint writer, which renames into the container's directory.
+const SUBLAYERS: &[(&str, Parts)] = &[
+    (
+        "journal",
+        &[
+            ("codec", &[]),
+            ("bodies", &["codec", "segment"]),
+            ("checkpoint", &["codec", "segment"]),
+            ("spool", &["codec", "segment"]),
+            ("recover", &["checkpoint", "codec", "segment"]),
+            ("segment", &["bodies", "checkpoint", "codec", "recover", "spool"]),
+        ],
+    ),
+    ("engine", &[("config", &[]), ("ops", &[]), ("state", &["config", "ops"]), ("storage", &["ops"])]),
+];
+
+/// One module's parts: each part and the parts it may name.
+type Parts = &'static [(&'static str, &'static [&'static str])];
+
+/// The module path of a source file: `journal/segment/mod.rs` is
+/// `journal::segment`, `engine/state/disk.rs` is `engine::state::disk`.
+fn module_path(path: &str) -> Vec<String> {
+    let stem = path.trim_end_matches(".rs");
+    let stem = stem.strip_suffix("/mod").unwrap_or(stem);
+    stem.split('/').map(str::to_owned).collect()
+}
+
+/// The first segment of every path in a `use` tree or path that starts right
+/// after `at` in `code`: `a::x`, or each item of `{a::x, b, c::{..}}`.
+fn heads(code: &str, at: usize) -> Vec<String> {
+    let rest = &code[at..];
+    if let Some(inner) = rest.strip_prefix('{') {
+        let mut depth = 0usize;
+        let mut items = Vec::new();
+        let mut current = String::new();
+        for ch in inner.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                '}' if depth == 0 => break,
+                '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => items.push(std::mem::take(&mut current)),
+                _ => current.push(ch),
+            }
+        }
+        items.push(current);
+        items.iter().map(|item| item.trim().chars().take_while(|ch| ch.is_alphanumeric() || *ch == '_').collect()).filter(|head: &String| !head.is_empty()).collect()
+    } else {
+        vec![rest.chars().take_while(|ch| ch.is_alphanumeric() || *ch == '_').collect()]
+    }
+}
+
+#[test]
+fn the_parts_of_the_log_and_the_engine_name_only_the_parts_they_may() {
+    let mut violations = Vec::new();
+    for source in library() {
+        let path = module_path(&source.path);
+        let Some((top, table)) = SUBLAYERS.iter().find(|(top, _)| path.first().map(String::as_str) == Some(*top)) else { continue };
+        if path.len() < 2 {
+            continue;
+        }
+        let own = path[1].as_str();
+        let allowed = table.iter().find(|(part, _)| *part == own).map(|(_, allowed)| *allowed).unwrap_or_else(|| panic!("`{top}::{own}` is not in the sublayer table; decide where it sits"));
+        let parts: BTreeSet<&str> = table.iter().map(|(part, _)| *part).collect();
+        let code = source.code();
+        let mut named = BTreeSet::new();
+        // `super::x` from this file means a sibling at the second level only
+        // when this file is the part's root (`<top>/<part>.rs` or `/mod.rs`).
+        if path.len() == 2 {
+            for (at, _) in code.match_indices("super::") {
+                named.extend(heads(&code, at + 7));
+            }
+        }
+        let prefix = format!("crate::{top}::");
+        for (at, _) in code.match_indices(&prefix) {
+            named.extend(heads(&code, at + prefix.len()));
+        }
+        for name in named {
+            if parts.contains(name.as_str()) && name != own && !allowed.contains(&name.as_str()) {
+                violations.push(format!("{} names {top}::{name}", source.path));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "sublayer violations:\n{}", violations.join("\n"));
+}
+
 #[test]
 fn every_module_is_in_the_layer_table_and_no_layer_is_stale() {
     let present: BTreeSet<String> = library().iter().filter(|source| source.path != "lib.rs").map(|source| source.module().to_owned()).collect();
@@ -164,15 +265,23 @@ fn only<'a>(sources: &'a [Source], needle: &str) -> Vec<(&'a str, usize)> {
     sources.iter().map(|source| (source.path.as_str(), source.count(needle))).filter(|(_, count)| *count > 0).collect()
 }
 
-/// One writer task owns the journal; the engine hands it one job at a time.
+/// One writer task owns the log; the engine hands it one job at a time. The
+/// checkpoint writer and the chores each run in one place of their own (6장,
+/// "저널 작성 지점").
 #[test]
 fn the_journal_is_written_from_one_place() {
     let sources = library();
     assert_eq!(only(&sources, "journal.append("), [("engine/mod.rs", 2)], "the startup write, and the writer task");
-    assert_eq!(only(&sources, "journal.rewrite("), [("engine/mod.rs", 1)]);
     assert_eq!(only(&sources, "self.flight = Some("), [("engine/mod.rs", 1)], "a flight is taken out in exactly one place");
     assert_eq!(only(&sources, "jobs.try_send("), [("engine/mod.rs", 1)]);
     assert_eq!(only(&sources, "mpsc::channel::<Job>(1)"), [("engine/mod.rs", 1)], "the writer never has a second job queued behind the one in flight");
+    assert_eq!(only(&sources, "encode_frame("), [("journal/codec.rs", 1), ("journal/segment/mod.rs", 2)], "log frames are encoded by the log writer alone (once more after a roll)");
+    for call in ["checkpoints.begin(", "checkpoints.write(", "checkpoints.finish("] {
+        assert_eq!(only(&sources, call), [("engine/storage/mod.rs", 1)], "the checkpoint writer runs in one place: {call}");
+    }
+    for call in ["chores.relocate(", "chores.delete("] {
+        assert_eq!(only(&sources, call), [("engine/storage/mod.rs", 1)], "the chores run in one place: {call}");
+    }
 }
 
 #[test]
@@ -181,7 +290,11 @@ fn the_engine_state_has_one_owner() {
     assert_eq!(only(&sources, "State::new("), [("engine/mod.rs", 1)]);
     assert_eq!(only(&sources, "tokio::spawn(core.run())"), [("engine/mod.rs", 1)]);
     // No lock guards shared state in the core: the engine task owns it.
-    assert_eq!(only(&sources, "Mutex<"), [("methods/mod.rs", 2)], "only the client's table of calls waiting for an answer, and its sequence counter held while a numbered call is handed over");
+    assert_eq!(
+        only(&sources, "Mutex<"),
+        [("journal/spool/mod.rs", 1), ("methods/mod.rs", 2)],
+        "only the spool's reservations, shared by the connection owners; the client's table of calls waiting for an answer, and its sequence counter held while a numbered call is handed over"
+    );
 }
 
 #[test]

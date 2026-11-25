@@ -49,9 +49,9 @@ cargo run --release -p ruvent --example bench   # 측정
 
 | 결정 | 테스트 |
 | --- | --- |
-| 코어 모듈은 아래로만 의존한다(`names` ← `envelope` ← `journal`·`snapshot` ← `engine` ← `methods`) | `modules_depend_only_downward`, `every_module_is_in_the_layer_table_and_no_layer_is_stale` |
+| 코어 모듈은 아래로만 의존한다(`names` ← `envelope` ← `journal`·`snapshot` ← `engine` ← `methods`). 로그(`journal`)와 엔진(`engine`)의 하위 모듈은 하위 계층 표가 정한 것만 부른다 | `modules_depend_only_downward`, `every_module_is_in_the_layer_table_and_no_layer_is_stale`, `the_parts_of_the_log_and_the_engine_name_only_the_parts_they_may` |
 | 어느 라이브러리도 폴링하지 않고, 타이머는 선언된 여섯 곳뿐이다(스냅샷 단위 나이, 엔진의 기한 휠, 핸들러 실행 한도, 핸드셰이크 기한, 인증 응답 기한, 상위 재접속 백오프) | `nothing_polls_and_every_timer_is_declared` |
-| 저널은 기록 태스크 한 곳에서만, 한 번에 한 비행만 쓴다 | `the_journal_is_written_from_one_place` |
+| 영속 로그는 기록 태스크 한 곳에서만, 한 번에 한 비행만 쓴다. 체크포인트 작성기와 잡일(이주·삭제)도 각각 한 곳이다 | `the_journal_is_written_from_one_place` |
 | 엔진 상태의 소유자는 엔진 태스크 하나다 | `the_engine_state_has_one_owner` |
 | 라이브러리에 `unsafe`·터미널 출력·`todo!`가 없다 | `no_library_has_unsafe_or_writes_to_the_terminal` |
 | 코어는 JSON을 모른다(payload를 해석하지 않는다) | `the_core_knows_no_json` |
@@ -91,7 +91,14 @@ cargo run --release -p ruvent --example bench   # 측정
 | 한 접속이 멈춰도 다른 접속은 진행 | `a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on`, `a_slow_user_is_disconnected_and_nobody_else_is` |
 | 삭제는 대기 중일 때만, 결과 통지는 정확히 한 건 | `deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_with_one_notice`, `deletion_removes_only_a_waiting_event_and_always_announces_its_outcome` |
 | `Stats` 상위 K, `Drain`(2.8, B24, M8-5) | `stats_report_totals_top_channels_idle_lanes_and_roots`, `drain_sends_new_producers_away_and_closes_open_ones_after_a_final_committed`, `drain_gives_every_producer_a_final_committed_before_bye` |
-| 재기동·저널: 휘발 채널 결과표, snapshot 재생 동치, 정상 종료 snapshot, 누적 가동 시각 | `volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says`, `a_full_snapshot_replays_to_the_same_ledger_as_the_records_it_replaced`, `a_shutdown_writes_a_snapshot_and_the_uptime_clock_carries_on`, `unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash`, `a_failed_write_stops_the_engine_and_releases_nothing_it_carried`, `the_journal_is_compacted_and_the_compacted_file_restarts` |
+| 재기동·저널: 휘발 채널 결과표, 체크포인트 재생 동치, 정상 종료 체크포인트(꼬리 없음), 누적 가동 시각 | `volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says`, `a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced`, `a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clock_carries_on`, `unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash`, `a_failed_write_stops_the_engine_and_releases_nothing_it_carried` |
+| 퍼지 체크포인트: 훑기 도중의 변경이 재생에서 빠지지 않음, 꼬리의 등록이 위치를 채움, 계기(S4)(2.5, B25) | `a_fuzzy_checkpoint_misses_no_change_made_during_its_walk`, `a_tail_registration_gives_a_checkpoint_entry_its_payload_location`, `a_checkpoint_starts_when_the_tail_passes_one_segment_or_eight_times_the_last` |
+| 세그먼트 수명: 제거가 디스크에 닿고 체크포인트가 뒤에서 시작해야 지운다, 체크포인트가 빈 세그먼트를 놓아 준다(2.5) | `a_segment_goes_once_its_removals_land_and_the_checkpoint_starts_after_it`, `checkpoints_let_empty_segments_go_and_the_log_restarts_from_what_is_left` |
+| 이주: 붙잡힌 죽은 바이트가 예산 비율(S3)을 넘으면 가장 성긴 세그먼트, `Relocate`가 디스크에 닿은 뒤 놓음(2.5) | `pinned_dead_bytes_relocate_the_sparsest_segment_and_free_it_once_on_disk`, `relocation_copies_payloads_to_the_long_lane_and_removal_deletes_whole_segments` |
+| 본문 캐시와 읽기 경로: 고수위에서 놓기만, 콜드 본문은 읽어서 보냄, 줄 머리 미리 읽기, 복구는 메타만(2.5, M3) | `cached_payloads_are_released_at_the_watermark_and_go_out_through_a_read`, `recovery_holds_metadata_only_and_payloads_come_back_through_reads` |
+| `Body` 흘려 읽기: 영속 후속은 본문 위치를 가리킴, 예약분을 넘긴 휘발 후속은 저널에 없고 재기동 때 버림, 디스크로 받을지의 판단(2.6 4·5번, B15) | `streamed_follow_ups_point_at_their_body_and_a_volatile_one_is_journaled_nowhere`, `streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a_restart`, `body_to_disk_says_yes_at_the_watermark_and_for_a_volatile_channel_only_past_the_reserve`, `a_streamed_body_reads_back_and_its_segment_waits_for_it` |
+| 디스크 회계와 디스크 고수위(S6): 디스크 몫이 가장 큰 뿌리 정지 | `the_disk_watermark_pauses_the_root_with_the_biggest_disk_share` |
+| M8-4: 이주·삭제·콜드 읽기·체크포인트 훑기가 겹치고 훑는 도중에 죽어도 잃는 것이 없다 | `relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothing` |
 | 장부 정합성(속성): 한 이벤트는 한 자리, 줄·참여·회계·group 계수의 합이 맞다 | `random_operations_keep_the_ledgers_bookkeeping_consistent` |
 | 옛 클라이언트 경로(다른 크레이트. 그 크레이트의 에이전트가 새 계약으로 옮긴다) | `a_resent_completion_after_a_lost_reply_has_no_effect_and_no_follow_ups`, `after_a_server_restart_a_surviving_workers_old_completion_is_void` |
 
@@ -103,7 +110,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 레코드 종류별 규칙 | `layouts_refuse_what_they_must_not_carry`, `timing_and_group_are_claimable_only`, `the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers`, `every_envelope_round_trips_through_every_layout_that_accepts_it`, `arbitrary_bytes_never_panic_the_decoder` |
 | 실패 횟수 포화, id | `failures_saturate_at_65535`, `ids_are_uuids_and_nil_means_unassigned` |
 | 이름표 | `equal_texts_share_one_handle`, `one_off_names_do_not_grow_the_dictionary_without_bound`, `a_name_held_elsewhere_survives_a_sweep` |
-| 저널 형식 3(레코드 집합, 단일 파일 컨테이너) | `every_record_kind_survives_a_reopen`, `a_claim_removed_in_the_same_batch_is_not_written`, `a_second_engine_cannot_open_a_journal_in_use`, `a_format_2_or_older_journal_is_refused_and_left_byte_for_byte`, `a_torn_last_frame_is_cut_and_everything_before_it_recovered`, `a_batch_that_breaks_the_serial_chain_ends_replay`, `a_completion_frame_cut_at_any_byte_recovers_all_or_nothing`, `a_rewritten_journal_decodes_on_its_own_and_accepts_appends` |
+| 저널 형식 3(레코드 집합, 세그먼트 컨테이너, 체크포인트 파일, 스트리밍 복구) | `every_record_kind_survives_a_reopen_and_payloads_stay_on_disk`, `a_claim_removed_in_the_same_frame_is_not_written_and_keeps_its_serial`, `a_second_engine_cannot_open_a_log_in_use`, `a_single_file_or_older_journal_is_refused_and_left_byte_for_byte`, `a_torn_last_frame_is_cut_and_everything_before_it_recovered`, `damage_in_the_middle_of_the_log_stops_recovery_instead_of_cutting_it`, `a_completion_frame_cut_at_any_byte_recovers_all_or_nothing`, `segments_roll_at_their_size_and_each_defines_its_own_names`, `recovery_reads_the_checkpoint_and_the_tail_from_its_start`, `an_unfinished_checkpoint_is_ignored_and_the_previous_one_read`, `a_damaged_checkpoint_stops_recovery` |
 | 운영 스냅샷 | `a_snapshot_file_holds_both_kinds_and_reads_back`, `the_configuration_picks_channels_and_types`, `chosen_channels_are_collected_into_snapshot_files` |
 | 구독·대기분 | `the_backlog_comes_in_pages_in_work_key_order`, `the_subscription_marker_precedes_the_answer` |
 | 엔진 태스크 | `the_operations_work_through_the_in_process_client`, `after_shutdown_calls_fail_as_closed` |

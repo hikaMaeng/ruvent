@@ -1,12 +1,13 @@
 //! A restart rebuilds the ledger from records (2.4, 2.5).
 
 use super::*;
+use crate::journal::{End, Part, Recovered, Replay};
 
 /// Replays `records` into a fresh ledger at uptime `uptime`, with the cast connected.
 fn restarted(records: Vec<Record>, uptime: u64) -> H {
     let mut s = State::new(&config(), Box::new(V7));
     s.recover(records, uptime, 0, true).unwrap();
-    let mut h = H { s, now: uptime, durable: 1, carrying: 2, records: Vec::new(), seqs: HashMap::new() };
+    let mut h = H { s, now: uptime, durable: 1, carrying: 2, records: Vec::new(), log: Vec::new(), written: 0, firsts: HashMap::new(), seqs: HashMap::new() };
     h.open(W1, hello(Role::Work, 2));
     h
 }
@@ -94,7 +95,7 @@ fn volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says(
 }
 
 #[test]
-fn a_full_snapshot_replays_to_the_same_ledger_as_the_records_it_replaced() {
+fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
     let mut h = H::durable(false).cast();
     h.call(W1, Call::Join { req: 1, channel: "work".into(), types: Vec::new(), lease_ms: 15, dispatch: false });
     for step in 0..40u8 {
@@ -120,8 +121,18 @@ fn a_full_snapshot_replays_to_the_same_ledger_as_the_records_it_replaced() {
         slots
     };
     let replayed = restarted(h.records.clone(), h.now);
-    let folded = restarted(h.s.snapshot(), h.now);
-    assert_eq!(view(&replayed.s), view(&folded.s));
+    let serial = h.s.serial();
+    let (head, parts) = h.s.full_checkpoint(serial, h.durable);
+    let mut items = vec![Replay::Head(head)];
+    for part in parts {
+        match part {
+            Part::Producers(producers) => items.extend(producers.into_iter().map(Replay::Producer)),
+            Part::Entries(entries) => items.extend(entries.into_iter().map(Replay::Entry)),
+        }
+    }
+    let mut folded = State::new(&config(), Box::new(V7));
+    folded.recover_from(Recovered::from_replay(items, End { uptime: h.now, serial, commit: 0 }), true).unwrap();
+    assert_eq!(view(&replayed.s), view(&folded));
     assert_eq!(view(&replayed.s), view(&h.s), "and both are the ledger as it was");
 }
 

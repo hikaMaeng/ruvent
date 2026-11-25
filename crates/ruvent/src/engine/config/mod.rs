@@ -82,22 +82,6 @@ impl Grant {
 /// credential may do everything (an embedded engine with in-process workers).
 pub type Grants = HashMap<String, Grant>;
 
-/// When the single-file journal is folded into a snapshot: once the file
-/// holds more than `min_records` and more than `ratio` times what a snapshot
-/// would. The segment container replaces this with the checkpoint triggers
-/// of [`StorageConfig`].
-#[derive(Clone, Copy, Debug)]
-pub struct Compaction {
-    pub min_records: u64,
-    pub ratio: u64,
-}
-
-impl Default for Compaction {
-    fn default() -> Self {
-        Self { min_records: 50_000, ratio: 4 }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Most operations applied between two looks at the journal.
@@ -111,7 +95,6 @@ pub struct EngineConfig {
     /// Most backlog entries in one subscription answer.
     pub backlog_page: usize,
     pub durability: Durability,
-    pub compaction: Compaction,
     pub grants: Option<Grants>,
     pub snapshot: Option<SnapshotConfig>,
     /// This server's id in `Welcome`. `None`: a fresh one at every start.
@@ -136,7 +119,8 @@ pub struct EngineConfig {
     pub stats_top: usize,
     /// B6, B9, B17, B26 and volatile channels, by channel pattern.
     pub channels: ChannelConfig,
-    /// S3, S4, S6, S17: read by the segment container.
+    /// S3, S4, S6, S17: segments, checkpoints, disk budget, the read path.
+    /// The segment size must match the one the log was opened with.
     pub storage: StorageConfig,
 }
 
@@ -148,7 +132,6 @@ impl Default for EngineConfig {
             outbound: 65_536,
             backlog_page: 1024,
             durability: Durability::default(),
-            compaction: Compaction::default(),
             grants: None,
             snapshot: None,
             server_id: None,

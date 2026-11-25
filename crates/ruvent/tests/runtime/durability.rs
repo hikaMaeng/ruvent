@@ -2,8 +2,7 @@
 
 use crate::support::*;
 use ruvent::{
-    connect, ByeReason, Bytes, Call, Compaction, Durability, Engine, EngineConfig, Envelope, FileJournal, Hello, Incoming, Methods, Outbound, Pattern, Record, Recovered, Refusal, SnapshotConfig,
-    Target,
+    connect, ByeReason, Bytes, Call, Durability, Engine, EngineConfig, Envelope, Hello, Incoming, Methods, Outbound, Pattern, Recovered, Refusal, SegmentLog, SnapshotConfig, StorageConfig, Target,
 };
 use std::time::Duration;
 
@@ -126,10 +125,10 @@ async fn a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on() {
 /// nothing is assigned again, no failure is counted (2.4, M8-6).
 #[tokio::test]
 async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_workers_completion() {
-    let path = scratch("restart").join("events.journal");
+    let path = scratch("restart").join("journal");
     let hello = Hello::worker("svc");
     let (ids, assignment) = {
-        let (journal, recovered) = FileJournal::open(&path).unwrap();
+        let (journal, recovered) = SegmentLog::open(&path).unwrap();
         let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let mut ids = Vec::new();
@@ -146,7 +145,7 @@ async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_worke
         engine.shutdown().await.unwrap();
         (ids, assignment)
     };
-    let (journal, recovered) = FileJournal::open(&path).unwrap();
+    let (journal, recovered) = SegmentLog::open(&path).unwrap();
     let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
     let (observer, _) = observer(&engine).await;
     let backlog = observer.subscribe(Target::Channel("work".into()), None).await.unwrap();
@@ -167,11 +166,11 @@ async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_worke
 /// after; the producer resumes from it after the restart (2.3, M8-1).
 #[test]
 fn an_acknowledged_sequence_survives_a_crash_and_resume_says_so() {
-    let path = scratch("crash").join("events.journal");
+    let path = scratch("crash").join("journal");
     let hello = Hello::producer("svc");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let (journal, recovered) = FileJournal::open(&path).unwrap();
+        let (journal, recovered) = SegmentLog::open(&path).unwrap();
         let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
         let (producer, _) = connect(&engine, hello.clone(), 64).await.unwrap();
         for _ in 0..3 {
@@ -182,22 +181,22 @@ fn an_acknowledged_sequence_survives_a_crash_and_resume_says_so() {
     drop(runtime);
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let (journal, recovered) = FileJournal::open(&path).unwrap();
-        assert_eq!(recovered.records.iter().filter(|record| matches!(record, Record::Register { .. })).count(), 3);
+        let (journal, recovered) = SegmentLog::open(&path).unwrap();
         let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
         let (producer, _) = connect(&engine, hello, 64).await.unwrap();
         assert_eq!(producer.welcome().unwrap().resume, 3, "nothing acknowledged was lost; nothing will be applied twice");
     });
 }
 
-/// Once superseded records outnumber live ones, the journal is rewritten, and
-/// the rewritten file restarts to the same ledger.
+/// Checkpoints follow the log's tail; segments wholly before the last one
+/// with nothing live in them go; the log restarts from what is left (2.5).
 #[tokio::test]
-async fn the_journal_is_compacted_and_the_compacted_file_restarts() {
-    let path = scratch("compact").join("events.journal");
-    let config = EngineConfig { compaction: Compaction { min_records: 20, ratio: 2 }, ..EngineConfig::default() };
+async fn checkpoints_let_empty_segments_go_and_the_log_restarts_from_what_is_left() {
+    let path = scratch("segments").join("journal");
+    let storage = StorageConfig { segment_bytes: 2048, ..StorageConfig::default() };
+    let config = EngineConfig { storage: storage.clone(), ..EngineConfig::default() };
     {
-        let (journal, recovered) = FileJournal::open(&path).unwrap();
+        let (journal, recovered) = SegmentLog::open_with(&path, storage.segment_bytes).unwrap();
         let engine = Engine::start(config.clone(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let (worker, mut assignments) = worker(&engine).await;
@@ -210,42 +209,54 @@ async fn the_journal_is_compacted_and_the_compacted_file_restarts() {
             worker.committed(seq).await.unwrap();
         }
         producer.register_committed(work("kept")).await.unwrap();
-        let size = std::fs::metadata(&path).unwrap().len();
-        assert!(size < 8192, "rewritten while running: {size} bytes after about 1,000 records");
+        let (observer, _) = observer(&engine).await;
+        let counters = observer.stats().await.unwrap().counters;
+        assert!(counters.checkpoints > 0 && counters.segments_removed > 0, "{counters:?}");
         drop(worker);
         drop(producer);
         engine.shutdown().await.unwrap();
     }
-    let (journal, recovered) = FileJournal::open(&path).unwrap();
-    assert!(recovered.records.len() < 20, "compacted: {} records left of about 1,000 written", recovered.records.len());
+    let segments = std::fs::read_dir(&path).unwrap().filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|extension| extension == "seg")).count();
+    assert!(segments <= 4, "{segments} segments left of the dozens written");
+    let (journal, recovered) = SegmentLog::open_with(&path, storage.segment_bytes).unwrap();
     let engine = Engine::start(config, journal, recovered).await.unwrap();
     let (observer, _) = observer(&engine).await;
     assert_eq!(observer.subscribe(Target::Channel("kept".into()), None).await.unwrap().notices.len(), 1);
     assert!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.is_empty());
 }
 
-/// A normal shutdown writes the stopped ledger's snapshot last, so the next
-/// start reads only the snapshot (2.5, B22).
+/// A normal shutdown writes the stopped ledger's checkpoint last, so the next
+/// start reads the checkpoint and no tail; the uptime clock carries on (2.5, B22).
 #[tokio::test]
-async fn a_shutdown_writes_a_snapshot_and_the_uptime_clock_carries_on() {
-    let gate = Gate::new();
-    gate.release(100);
-    let engine = Engine::start(EngineConfig::default(), gate.clone(), Recovered::default()).await.unwrap();
-    let (producer, _) = producer(&engine).await;
-    producer.register_committed(work("work")).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let before = engine.uptime();
-    drop(producer);
-    engine.shutdown().await.unwrap();
-    let written = gate.written.lock().unwrap().clone();
-    let last = written.last().unwrap();
-    assert!(matches!(last.records.first(), Some(Record::Generation(_))), "the last write is a snapshot");
-    assert!(last.records.iter().any(|record| matches!(record, Record::Register { .. })));
-    assert!(last.uptime >= before);
-    let recovered = Recovered { records: last.records.clone(), uptime: last.uptime, serial: last.first, commit: last.commit };
-    let restarted = Engine::start(EngineConfig::default(), ruvent::Volatile, recovered).await.unwrap();
+async fn a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clock_carries_on() {
+    let path = scratch("shutdown").join("journal");
+    let (before, generation) = {
+        let (journal, recovered) = SegmentLog::open(&path).unwrap();
+        let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
+        let (producer, _) = producer(&engine).await;
+        producer.register_committed(work("work")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = engine.uptime();
+        drop(producer);
+        engine.shutdown().await.unwrap();
+        (before, engine.generation())
+    };
+    let items = ruvent::journal::read_checkpoint(path.join("checkpoint.ckpt")).unwrap();
+    assert!(items.iter().any(|item| matches!(item, ruvent::Replay::Entry(entry) if &*entry.event.channel == "work")));
+    let (journal, recovered) = SegmentLog::open(&path).unwrap();
+    let mut source = recovered.into_source();
+    let mut records = 0;
+    while let Some(item) = source.next().unwrap() {
+        records += usize::from(matches!(item, ruvent::Replay::Record { .. }));
+    }
+    assert_eq!(records, 0, "the checkpoint starts where the log ends");
+    drop(journal);
+    let (journal, recovered) = SegmentLog::open(&path).unwrap();
+    let restarted = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
     assert!(restarted.uptime() >= before, "the clock starts where it stopped, not at zero");
-    assert_eq!(restarted.generation(), engine.generation() + 1);
+    assert_eq!(restarted.generation(), generation + 1);
+    let (observer, _) = observer(&restarted).await;
+    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 1);
 }
 
 /// Drain: every production connection gets its final `Committed` and then

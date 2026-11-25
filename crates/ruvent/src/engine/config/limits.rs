@@ -84,8 +84,20 @@ pub struct StorageConfig {
     pub disk_reserve_segments: u64,
     /// S6: … or this fraction of the capacity, whichever is larger.
     pub disk_reserve: f64,
-    /// S17: preallocate segments.
+    /// S6: the disk capacity the log may use, in bytes. The standard library
+    /// cannot ask the file system, so the server says. `None`: no disk budget,
+    /// no disk watermark and no relocation trigger; usage is still counted.
+    pub disk_capacity: Option<u64>,
+    /// S17: preallocate segments. Not implemented: the plan adds it only if
+    /// M5 shows an effect.
     pub preallocate: bool,
+    /// Cold payloads of a lane read ahead after its head went out cold (2.5).
+    pub read_ahead: usize,
+    /// Reads from segments at once; more wait in the engine (2.2).
+    pub max_reads: usize,
+    /// Checkpoint slices handed to the writer and not yet written (2.10, the
+    /// walk's bound with `checkpoint_slice`).
+    pub checkpoint_queue: usize,
 }
 
 impl Default for StorageConfig {
@@ -98,7 +110,11 @@ impl Default for StorageConfig {
             checkpoint_tail_cap: 8 << 30,
             disk_reserve_segments: 4,
             disk_reserve: 0.10,
+            disk_capacity: None,
             preallocate: false,
+            read_ahead: 16,
+            max_reads: 64,
+            checkpoint_queue: 2,
         }
     }
 }

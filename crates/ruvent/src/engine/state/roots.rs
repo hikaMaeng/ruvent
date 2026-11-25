@@ -7,8 +7,11 @@ use std::collections::{HashMap, HashSet};
 /// What a paused root remembers.
 #[derive(Debug, Default)]
 pub(super) struct Paused {
-    /// Its share (bytes) when it was paused.
+    /// Its memory share and disk share (bytes) when it was paused.
     pub at_bytes: u64,
+    pub at_disk: u64,
+    /// Paused for disk: its disk share decides resume and net growth.
+    pub by_disk: bool,
     /// The pause-notice record: production connections told `Paused` and what
     /// they sent to the root since.
     ///
@@ -44,8 +47,10 @@ pub(super) struct Notified {
 pub(super) struct Root {
     /// Events held for it, in any state.
     pub events: u64,
-    /// Managed bytes held for it: metadata and payloads.
+    /// Its memory share: metadata and volatile payloads.
     pub bytes: u64,
+    /// Its disk share: payloads in segments.
+    pub disk: u64,
     /// Lineages that ended: completions without follow-ups, deletions, expiries.
     pub ended: u64,
     pub paused: Option<Paused>,
@@ -59,6 +64,6 @@ impl Root {
     /// Whether its net-growth lanes must not be assigned from: paused, and
     /// its share is above what it was at the pause.
     pub fn blocks_growth(&self) -> bool {
-        self.paused.as_ref().is_some_and(|paused| self.bytes > paused.at_bytes)
+        self.paused.as_ref().is_some_and(|paused| if paused.by_disk { self.disk > paused.at_disk } else { self.bytes > paused.at_bytes })
     }
 }

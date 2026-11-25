@@ -7,7 +7,7 @@
 //! behaviour serves, not the replaced one.
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{connect, Assignment, Bytes, Client, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Hello, Inbox, Incoming, Methods, Recovered, Target, DELETED, DELETE_FAILED};
+use ruvent::{connect, Assignment, Bytes, Client, Durability, Engine, EngineConfig, Envelope, EventId, Hello, Inbox, Incoming, Methods, Recovered, SegmentLog, Target, DELETED, DELETE_FAILED};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ fn scratch(name: &str) -> PathBuf {
     let directory = std::env::temp_dir().join(format!("ruvent-accept-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
-    directory.join("events.journal")
+    directory.join("journal")
 }
 
 fn work() -> Envelope {
@@ -186,7 +186,7 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
         let path = scratch(if crash { "crash" } else { "stop" });
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (journal, recovered) = FileJournal::open(&path).unwrap();
+            let (journal, recovered) = SegmentLog::open(&path).unwrap();
             let engine = Engine::start(EngineConfig { durability: Durability::Strict, ..EngineConfig::default() }, journal, recovered).await.unwrap();
             let ((producer, _), (worker, _), _) = roles(&engine, "svc").await;
             for _ in 0..3 {
@@ -204,7 +204,7 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
         drop(runtime);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let (journal, recovered) = FileJournal::open(&path).unwrap();
+            let (journal, recovered) = SegmentLog::open(&path).unwrap();
             let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
             let (observer, _) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
             assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 3, "crash={crash}: the three unprocessed events, not the completed one");
@@ -283,14 +283,11 @@ async fn a_claim_does_not_wait_for_the_disk_even_under_strict() {
     }
     #[ruvent::async_trait]
     impl ruvent::Journal for Stuck {
-        async fn append(&mut self, _: ruvent::Batch) -> std::io::Result<()> {
+        async fn append(&mut self, _: ruvent::Batch) -> std::io::Result<ruvent::Written> {
             if self.good > 0 {
                 self.good -= 1;
-                return Ok(());
+                return Ok(ruvent::Written::default());
             }
-            std::future::pending().await
-        }
-        async fn rewrite(&mut self, _: ruvent::Batch) -> std::io::Result<()> {
             std::future::pending().await
         }
     }

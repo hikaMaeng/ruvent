@@ -85,15 +85,23 @@ pub(super) struct Slot {
     /// checkpoint splits replay on (2.5). `0` before anything is written.
     pub commit: u64,
     pub serial: u64,
-    /// The payload. The single-file container keeps every payload in memory.
+    /// The payload in memory: the body cache (2.5). Empty while the payload
+    /// is only on disk — released under memory pressure, recovered, or
+    /// streamed (then [`Slot::cold`]).
     pub payload: Bytes,
-    /// Where the segment container keeps the payload, once it does.
+    /// Where the payload is on disk: set when its registration lands, when it
+    /// was streamed, and by relocation. A durable payload's only copy on disk.
     pub at: Option<Location>,
 }
 
 impl Slot {
     pub fn digest(&self) -> Digest {
-        self.fixed.digest.unwrap_or_else(|| Digest::of(&self.payload))
+        self.fixed.digest.or_else(|| self.at.map(|at| at.digest())).unwrap_or_else(|| Digest::of(&self.payload))
+    }
+
+    /// The payload is on disk and not in memory: it is read before it goes out.
+    pub fn cold(&self) -> bool {
+        self.at.is_some_and(|at| self.payload.len() as u64 != u64::from(at.len))
     }
 
     /// The event as it goes out: head, key, failures, optional fields, payload.
@@ -121,8 +129,9 @@ impl Slot {
         (self.channel.clone(), self.fixed.event_type.clone())
     }
 
+    /// The payload's length, wherever it is.
     pub fn len(&self) -> u64 {
-        self.payload.len() as u64
+        self.at.map_or(self.payload.len() as u64, |at| u64::from(at.len))
     }
 
     pub fn attempt(&self) -> Option<&Attempt> {
@@ -199,6 +208,15 @@ impl Slots {
         }
     }
 
+    pub fn current_mut(&mut self, index: Index, generation: u32) -> Option<&mut Slot> {
+        let entry = self.entries.get_mut(index as usize)?;
+        if entry.generation == generation {
+            entry.slot.as_mut()
+        } else {
+            None
+        }
+    }
+
     pub fn generation(&self, index: Index) -> u32 {
         self.entries.get(index as usize).map_or(0, |entry| entry.generation)
     }
@@ -213,6 +231,11 @@ impl Slots {
 
     pub fn len(&self) -> usize {
         self.ids.len()
+    }
+
+    /// One past the highest index ever used: what a scan of the arena walks.
+    pub fn extent(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Index, &Slot)> {

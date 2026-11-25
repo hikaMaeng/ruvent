@@ -124,7 +124,7 @@ fn a_completion_under_another_credential_is_a_fault() {
     h.join(W1, "work", 1);
     let assignment = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let seq = h.next_seq(20);
-    let effects = h.call(20, Call::Complete { seq, id: id(1), token: assignment.token, follow_ups: Vec::new() });
+    let effects = h.call(20, Call::Complete { seq, id: id(1), token: assignment.token, follow_ups: Vec::new(), spooled: Vec::new() });
     assert_eq!(faults(&effects, 20), [FaultKind::Forbidden]);
     assert!(h.slot(id(1)).is_some());
 }

@@ -24,6 +24,36 @@ pub struct Counters {
     pub over_limit: u64,
     /// Root channels paused, by any rule.
     pub pauses: u64,
+    /// Cached durable payloads released at the high watermark (2.5).
+    pub released: u64,
+    /// Cold payloads read ahead into the cache.
+    pub read_ahead: u64,
+    /// Bytes of volatile follow-up payloads received to disk past the memory
+    /// reserve (2.6 item 5, B15). Zero in normal operation (M3).
+    pub spilled_bytes: u64,
+    /// Payloads moved to the long-lived lane.
+    pub relocated: u64,
+    /// Segments removed.
+    pub segments_removed: u64,
+    /// Checkpoints made durable.
+    pub checkpoints: u64,
+}
+
+/// Memory and disk as the connection owners see them: what decides whether a
+/// follow-up's body is received to disk (2.6). Copied after every ledger batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pressure {
+    /// Managed memory in use, the budget (limit - reserve) and the limit.
+    pub memory_used: u64,
+    pub memory_budget: u64,
+    pub memory_limit: u64,
+    /// The memory high watermark in bytes (of the whole budget).
+    pub memory_high: u64,
+    /// Disk in use (segments and the checkpoint), and the budget and the
+    /// capacity when a capacity is configured.
+    pub disk_used: u64,
+    pub disk_budget: Option<u64>,
+    pub disk_limit: Option<u64>,
 }
 
 /// One channel in the top-K by waiting events.
@@ -50,8 +80,10 @@ pub struct RootStat {
     pub root: Name,
     /// Events held for the root, in any state.
     pub events: u64,
-    /// Managed bytes held for the root.
+    /// The root's memory share: metadata and volatile payloads.
     pub bytes: u64,
+    /// The root's disk share: payloads in segments.
+    pub disk: u64,
     pub paused: bool,
 }
 
@@ -72,6 +104,13 @@ pub struct Stats {
     /// Events the budget holds at the configured metadata size, and the target (S22).
     pub depth_capacity: u64,
     pub depth_target: u64,
+    /// Disk in use (segments and the checkpoint), the budget and the capacity
+    /// (S6); budget and capacity are 0 when no capacity is configured.
+    pub disk_used: u64,
+    pub disk_budget: u64,
+    pub disk_limit: u64,
+    /// Segments on disk.
+    pub segments: u64,
     pub draining: bool,
     pub counters: Counters,
     pub channels: Vec<ChannelStat>,

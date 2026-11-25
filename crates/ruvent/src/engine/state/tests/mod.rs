@@ -7,6 +7,7 @@ mod observe;
 mod produce;
 mod recover;
 mod resources;
+mod storage;
 mod timing;
 
 use super::slots::{Place, Slot};
@@ -29,6 +30,12 @@ pub struct H {
     pub carrying: u64,
     /// Every record written so far, in order.
     pub records: Vec<Record>,
+    /// The same records with their serials.
+    pub log: Vec<(u64, Record)>,
+    /// How many of `log` a simulated segment writer has landed (`land_in`).
+    pub written: usize,
+    /// The first serial of each simulated segment.
+    pub firsts: HashMap<u32, u64>,
     /// The next sequence number per numbered connection.
     seqs: HashMap<SessionId, u64>,
 }
@@ -101,7 +108,8 @@ impl H {
     pub fn with(config: EngineConfig, journaled: bool) -> H {
         let mut s = State::new(&config, Box::new(V7));
         let records = s.recover(Vec::new(), 0, 0, journaled).unwrap();
-        H { s, now: 0, durable: 1, carrying: 2, records, seqs: HashMap::new() }
+        let log = records.iter().cloned().map(|record| (0, record)).collect();
+        H { s, now: 0, durable: 1, carrying: 2, records, log, written: 0, firsts: HashMap::new(), seqs: HashMap::new() }
     }
 
     /// No journal: every channel volatile, every operation committed when applied.
@@ -127,7 +135,43 @@ impl H {
         self.s.begin(self.now, self.durable, self.carrying);
         apply(&mut self.s);
         let effects = self.s.take();
+        self.keep(&effects);
+        effects
+    }
+
+    fn keep(&mut self, effects: &Effects) {
         self.records.extend(effects.records.iter().cloned());
+        self.log.extend(effects.records.iter().cloned().enumerate().map(|(at, record)| (effects.first_serial + at as u64, record)));
+    }
+
+    /// Everything recorded since the last call lands in log segment `segment`
+    /// as a segment log would write it: payloads at made-up offsets, the
+    /// segment reported. The batch being filled is on disk afterwards.
+    pub fn land_in(&mut self, segment: u32, bytes: u64) -> Effects {
+        let fresh = &self.log[self.written..];
+        let located: Vec<(u64, crate::journal::Location)> = fresh
+            .iter()
+            .filter_map(|(serial, record)| match record {
+                Record::Register { event, at: None, .. } => {
+                    Some((*serial, crate::journal::Location { segment, offset: 1000 + serial * 100, len: event.payload.len() as u32, crc: crc32fast::hash(&event.payload) }))
+                }
+                _ => None,
+            })
+            .collect();
+        let through = self.log.last().map_or(0, |(serial, _)| serial + 1);
+        let first = fresh.first().map_or(through, |(serial, _)| *serial);
+        let first = *self.firsts.entry(segment).or_insert(first);
+        self.written = self.log.len();
+        let state = crate::journal::SegmentState { number: segment, lane: crate::journal::Lane::Log, bytes, first, removed: false };
+        let written = crate::journal::Written { located, segments: vec![state], log_bytes: 100 };
+        let landing = self.carrying;
+        self.carrying += 1;
+        self.durable = landing;
+        self.s.begin(self.now, self.durable, self.carrying);
+        self.s.wrote(written, through);
+        self.s.landed(landing);
+        let effects = self.s.take();
+        self.keep(&effects);
         effects
     }
 
@@ -139,7 +183,7 @@ impl H {
         self.s.begin(self.now, self.durable, self.carrying);
         self.s.landed(landing);
         let effects = self.s.take();
-        self.records.extend(effects.records.iter().cloned());
+        self.keep(&effects);
         effects
     }
 
@@ -156,7 +200,7 @@ impl H {
         self.s.begin(self.now, self.durable, self.carrying);
         self.s.landed(commit);
         let effects = self.s.take();
-        self.records.extend(effects.records.iter().cloned());
+        self.keep(&effects);
         effects
     }
 
@@ -207,7 +251,7 @@ impl H {
 
     pub fn complete(&mut self, session: SessionId, assignment: &Assignment, follow_ups: Vec<Envelope>) -> Effects {
         let seq = self.next_seq(session);
-        self.call(session, Call::Complete { seq, id: assignment.event.id, token: assignment.token, follow_ups })
+        self.call(session, Call::Complete { seq, id: assignment.event.id, token: assignment.token, follow_ups, spooled: Vec::new() })
     }
 
     /// The slot holding `id`.

@@ -144,6 +144,6 @@ fn drain_sends_new_producers_away_and_closes_open_ones_after_a_final_committed()
     assert_eq!(sent(&newcomer, 30), [Outbound::Bye(ByeReason::Draining)]);
     let assignment = h.slot(id(1)).unwrap().attempt().unwrap().token;
     let seq = h.next_seq(W1);
-    let completed = h.call(W1, Call::Complete { seq, id: id(1), token: assignment, follow_ups: Vec::new() });
+    let completed = h.call(W1, Call::Complete { seq, id: id(1), token: assignment, follow_ups: Vec::new(), spooled: Vec::new() });
     assert_eq!(assigned(&completed, W1).len(), 1, "work connections carry on");
 }

@@ -20,7 +20,7 @@
 #![allow(clippy::print_stdout)]
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{connect, Bytes, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Hello, Methods, WorkKey};
+use ruvent::{connect, Bytes, Durability, Engine, EngineConfig, Envelope, EventId, Hello, Methods, SegmentLog, WorkKey};
 use std::time::{Duration, Instant};
 
 const WORKERS: usize = 64;
@@ -76,7 +76,7 @@ async fn main() {
     volatile.shutdown().await.expect("shutdown");
 
     for (name, durability, total) in [("file-scheduled", Durability::Scheduled, 200_000), ("file-strict", Durability::Strict, 20_000)] {
-        let (journal, recovered) = FileJournal::open(directory.join(format!("{name}.journal"))).expect("journal");
+        let (journal, recovered) = SegmentLog::open(directory.join(name)).expect("journal");
         let engine = Engine::start(EngineConfig { durability, ..EngineConfig::default() }, journal, recovered).await.expect("start");
         let (done, took) = lifecycles(&engine, total).await;
         println!("mode={name} cycles={done} seconds={:.3} cycles/s={:.0}", took.as_secs_f64(), done as f64 / took.as_secs_f64());

@@ -6,7 +6,7 @@ use super::State;
 use crate::engine::config::Method;
 use crate::engine::ops::{DeleteFailure, FaultKind, Outbound, Role, SessionId, DELETED, DELETE_FAILED};
 use crate::envelope::{Digest, Envelope, EventId, Kind, WorkKey};
-use crate::journal::Record;
+use crate::journal::{Location, Record};
 use crate::names::Name;
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -69,7 +69,7 @@ impl State {
                 }
                 let root = event.channel.clone();
                 self.pause_notice(session, &root, event.payload.len() as u64);
-                self.enqueue(event, root);
+                self.enqueue(event, root, None);
             }
         }
     }
@@ -85,13 +85,19 @@ impl State {
         }
     }
 
-    /// Queues an admitted claimable event (its id may still be nil) under `root`.
-    pub(super) fn enqueue(&mut self, mut event: Envelope, root: Name) -> Index {
+    /// Queues an admitted claimable event (its id may still be nil) under
+    /// `root`. `streamed`: its payload was received to disk there (2.6) and
+    /// `event.payload` is empty.
+    pub(super) fn enqueue(&mut self, mut event: Envelope, root: Name, streamed: Option<Location>) -> Index {
         let explicit = !event.id.is_nil();
         if !explicit {
             event.id = self.fresh_id();
         }
         let durable = self.journaled && !self.config.channels.settings(&event.channel).volatile;
+        let digest = match streamed {
+            Some(at) => at.digest(),
+            None => Digest::of(&event.payload),
+        };
         let key = self.next_key();
         let not_before = event.not_before.map(|delay| self.now.saturating_add(delay));
         let expires = event.expires.map(|life| self.now.saturating_add(life));
@@ -109,17 +115,28 @@ impl State {
             durable,
             registered_at: self.now,
             visible_from: if durable { self.carrying } else { 0 },
-            digest: explicit.then(|| Digest::of(&event.payload)),
+            digest: explicit.then_some(digest),
         };
-        let slot = Slot { fixed, channel: event.channel, failures: 0, expires, place: Place::Waiting, commit: 0, serial: 0, payload: event.payload, at: None };
-        let cost = self.cost(slot.len());
+        let slot = Slot { fixed, channel: event.channel, failures: 0, expires, place: Place::Waiting, commit: 0, serial: 0, payload: event.payload, at: streamed };
+        let usage = self.usage(&slot);
         let index = self.slots.insert(slot);
-        self.account_add(&root, cost);
+        self.account_add(&root, usage);
         let generation = self.slots.generation(index);
+        if let Some(at) = streamed {
+            // A streamed payload is live in its body segment from now on.
+            self.book.live_add(&at);
+            if !durable {
+                self.counters.spilled_bytes += u64::from(at.len);
+            }
+        }
         let envelope = self.slots.get(index).map(|slot| slot.envelope());
         if let Some(envelope) = envelope {
             if durable {
-                self.record_for(index, Record::Register { event: envelope.clone(), root });
+                let serial = self.serial;
+                self.record_for(index, Record::Register { event: envelope.clone(), root, at: streamed });
+                if streamed.is_none() {
+                    self.unlocated.push_back((serial, index, generation));
+                }
             }
             self.observe(&envelope);
         }

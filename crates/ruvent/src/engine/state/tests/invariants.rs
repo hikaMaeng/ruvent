@@ -59,15 +59,16 @@ fn check(state: &State) -> Result<(), TestCaseError> {
     let mut waiting = 0usize;
     let mut held = 0usize;
     let mut bytes = 0u64;
-    let mut roots: HashMap<Name, (u64, u64)> = HashMap::new();
+    let mut roots: HashMap<Name, (u64, u64, u64)> = HashMap::new();
     let mut joins: HashMap<JoinId, (u32, u64)> = HashMap::new();
     let mut groups: HashMap<(Name, GroupId), u32> = HashMap::new();
     for (index, slot) in state.slots.iter() {
-        let cost = state.cost(slot.len());
-        bytes += cost;
+        let usage = state.usage(slot);
+        bytes += usage.memory;
         let root = roots.entry(slot.fixed.root.clone()).or_default();
         root.0 += 1;
-        root.1 += cost;
+        root.1 += usage.share;
+        root.2 += usage.disk;
         match &slot.place {
             Place::Waiting => waiting += 1,
             Place::Held => held += 1,
@@ -92,8 +93,8 @@ fn check(state: &State) -> Result<(), TestCaseError> {
     prop_assert_eq!(held, in_holds);
     prop_assert_eq!(bytes, state.slot_bytes, "managed bytes are the sum over the events");
     for (name, root) in &state.roots {
-        let (events, root_bytes) = roots.get(name).copied().unwrap_or_default();
-        prop_assert_eq!((root.events, root.bytes), (events, root_bytes), "root {}", name);
+        let (events, root_bytes, disk) = roots.get(name).copied().unwrap_or_default();
+        prop_assert_eq!((root.events, root.bytes, root.disk), (events, root_bytes, disk), "root {}", name);
     }
     prop_assert_eq!(roots.len(), state.roots.values().filter(|root| root.events > 0).count());
     for (id, join) in &state.joins {
@@ -138,7 +139,7 @@ proptest! {
                         let session = join.map_or(W1, |join| join.0);
                         let follow_ups = if follow { vec![work("a"), Envelope::dispatch("feed", "t", Bytes::new())] } else { Vec::new() };
                         let seq = h.next_seq(session);
-                        h.call(session, Call::Complete { seq, id, token, follow_ups });
+                        h.call(session, Call::Complete { seq, id, token, follow_ups, spooled: Vec::new() });
                     }
                 }
                 Step::Release(at, failed, delay) => {

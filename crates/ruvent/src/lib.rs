@@ -26,11 +26,16 @@ pub mod snapshot;
 
 pub use async_trait::async_trait;
 pub use bytes::Bytes;
-pub use engine::config::{ChannelConfig, ChannelRule, ChannelSettings, Compaction, Durability, EngineConfig, Grant, Grants, MaxBacklog, MemoryConfig, Method, ProducerConfig, StorageConfig};
-pub use engine::ops::{Assignment, ByeReason, Call, ChannelStat, Counters, FaultKind, Hello, IdleLane, Outbound, Refusal, Role, RootStat, SessionId, Stats, Target, Welcome, DELETED, DELETE_FAILED};
+pub use engine::config::{ChannelConfig, ChannelRule, ChannelSettings, Durability, EngineConfig, Grant, Grants, MaxBacklog, MemoryConfig, Method, ProducerConfig, StorageConfig};
+pub use engine::ops::{
+    Assignment, ByeReason, Call, ChannelStat, Counters, FaultKind, Hello, IdleLane, Outbound, Pressure, Refusal, Role, RootStat, SessionId, Stats, Target, Welcome, DELETED, DELETE_FAILED,
+};
 pub use engine::{Closed, Engine, EngineError, Session};
 pub use envelope::{ClaimToken, Digest, Envelope, EventId, GroupId, Kind, ProducerId, WorkKey};
-pub use journal::{Batch, FileJournal, Journal, Location, Record, Recovered, Volatile};
+pub use journal::{
+    Batch, Bodies, CheckpointHead, Checkpoints, Chores, End, Entry, Journal, Lane, Location, Part, Parts, ProducerEntry, Record, Recovered, Replay, SegmentLog, SegmentState, Source, Spool,
+    SpoolWrite, Spooled, Standing, Volatile, Written,
+};
 pub use methods::{client, connect, Backlog, Client, ConnectError, Demux, Inbox, Incoming, Link, Methods};
 pub use names::{Name, Pattern};
 pub use snapshot::SnapshotConfig;

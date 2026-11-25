@@ -47,7 +47,7 @@ fn the_biggest_root_is_paused_at_the_high_watermark_and_resumed_below_seven_eigh
         h.s.joins[&(W1, Name::new("x"))].attempts.iter().filter_map(|index| h.s.slots.get(*index).map(|slot| (slot.fixed.id, slot.attempt().unwrap().token))).collect();
     for assignment in held {
         let seq = h.next_seq(W1);
-        let effects = h.call(W1, Call::Complete { seq, id: assignment.0, token: assignment.1, follow_ups: Vec::new() });
+        let effects = h.call(W1, Call::Complete { seq, id: assignment.0, token: assignment.1, follow_ups: Vec::new(), spooled: Vec::new() });
         resumed.extend(paused(&effects, P));
     }
     assert_eq!(resumed, ["resumed x"]);
@@ -58,7 +58,7 @@ fn the_biggest_root_is_paused_at_the_high_watermark_and_resumed_below_seven_eigh
 fn a_paused_root_tells_its_producers_once_and_stops_reading_past_the_allowance() {
     let mut h = H::with(EngineConfig { pause_allowance: 10, ..config() }, false).cast();
     h.produce(P, small("x"));
-    h.step(|state| state.pause(&Name::new("x")));
+    h.step(|state| state.pause(&Name::new("x"), false));
     let first = h.produce(P, Envelope::claimable("x", "do", Bytes::from(vec![0; 6])));
     assert_eq!(paused(&first, P), ["paused x"]);
     let second = h.produce(P, Envelope::claimable("x", "do", Bytes::from(vec![0; 8])));
@@ -93,7 +93,7 @@ fn a_paused_root_is_not_assigned_from_net_growth_lanes_and_chain_ends_still_are(
     h.call(W2, Call::Window { channel: "leaf".into(), count: 0, bytes: 0 });
     h.produce(P, small("fan"));
     h.produce(P, small("leaf"));
-    h.step(|state| state.pause(&Name::new("fan")));
+    h.step(|state| state.pause(&Name::new("fan"), false));
     h.produce(P, small("fan"));
     h.produce(P, small("leaf"));
     // The root "fan" grew past its share at the pause: its fan lane is held, the "leaf" root is not paused.

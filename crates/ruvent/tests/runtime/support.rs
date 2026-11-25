@@ -1,6 +1,6 @@
 //! Journals that can be held, failed or watched, and small helpers.
 
-use ruvent::{async_trait, connect, Batch, Bytes, Client, Engine, Envelope, Hello, Inbox, Incoming, Journal};
+use ruvent::{async_trait, connect, Batch, Bytes, Client, Engine, Envelope, Hello, Inbox, Incoming, Journal, Written};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -28,14 +28,10 @@ impl Gate {
 
 #[async_trait]
 impl Journal for Gate {
-    async fn append(&mut self, batch: Batch) -> io::Result<()> {
+    async fn append(&mut self, batch: Batch) -> io::Result<Written> {
         self.permits.acquire().await.map_err(io::Error::other)?.forget();
         self.written.lock().unwrap().push(batch);
-        Ok(())
-    }
-
-    async fn rewrite(&mut self, batch: Batch) -> io::Result<()> {
-        self.append(batch).await
+        Ok(Written::default())
     }
 }
 
@@ -46,16 +42,12 @@ pub struct Failing {
 
 #[async_trait]
 impl Journal for Failing {
-    async fn append(&mut self, _batch: Batch) -> io::Result<()> {
+    async fn append(&mut self, _batch: Batch) -> io::Result<Written> {
         if self.good == 0 {
             return Err(io::Error::other("disk on fire"));
         }
         self.good -= 1;
-        Ok(())
-    }
-
-    async fn rewrite(&mut self, batch: Batch) -> io::Result<()> {
-        self.append(batch).await
+        Ok(Written::default())
     }
 }
 

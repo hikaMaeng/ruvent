@@ -352,7 +352,7 @@ impl Methods for Client {
     }
 
     async fn complete(&self, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>) -> Result<u64, Refusal> {
-        self.numbered(|seq| Call::Complete { seq, id, token, follow_ups }).await
+        self.numbered(|seq| Call::Complete { seq, id, token, follow_ups, spooled: Vec::new() }).await
     }
 
     async fn extend(&self, id: EventId, token: ClaimToken) -> Result<(), Refusal> {

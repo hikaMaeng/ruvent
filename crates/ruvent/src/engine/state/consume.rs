@@ -274,8 +274,11 @@ impl State {
             }
             more
         };
-        if let Some(event) = self.slots.get(index).map(|slot| slot.envelope()) {
-            self.send(id.0, Outbound::Assign(Assignment { event, token, lease_ms, until, more }), None);
+        if let Some((event, cold)) = self.slots.get(index).map(|slot| (slot.envelope(), slot.cold())) {
+            self.send_event(id.0, Outbound::Assign(Assignment { event, token, lease_ms, until, more }), None, index);
+            if cold {
+                self.read_ahead(lane);
+            }
         }
     }
 
@@ -337,7 +340,7 @@ impl State {
         self.tidy(&lane);
         let gate = self.gate_for(index);
         if let Some(event) = self.slots.get(index).map(|slot| slot.envelope()) {
-            self.send(session, Outbound::Claimed { req, assignment: Assignment { event, token, lease_ms, until, more: false } }, gate);
+            self.send_event(session, Outbound::Claimed { req, assignment: Assignment { event, token, lease_ms, until, more: false } }, gate, index);
         }
     }
 

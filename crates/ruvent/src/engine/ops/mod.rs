@@ -39,10 +39,11 @@ mod codes;
 mod stats;
 
 use crate::envelope::{ClaimToken, Envelope, EventId, ProducerId, WorkKey};
+use crate::journal::Spooled;
 use crate::names::Name;
 
 pub use codes::{ByeReason, FaultKind, Refusal};
-pub use stats::{ChannelStat, Counters, IdleLane, RootStat, Stats};
+pub use stats::{ChannelStat, Counters, IdleLane, Pressure, RootStat, Stats};
 
 /// One engine-wide connection number. Never reused by one engine.
 pub type SessionId = u64;
@@ -194,11 +195,15 @@ pub enum Call {
         bytes: u64,
     },
     /// Work. `seq` numbers it under the connection's producer id.
+    /// `spooled`: follow-ups (by position) whose payload the connection owner
+    /// received to disk instead of memory (2.6); their envelope's payload is
+    /// empty. See `Engine::body_to_disk`.
     Complete {
         seq: u64,
         id: EventId,
         token: ClaimToken,
         follow_ups: Vec<Envelope>,
+        spooled: Vec<(u32, Spooled)>,
     },
     /// Work. Re-arms the lease and moves the attempt to this connection's join.
     Extend {

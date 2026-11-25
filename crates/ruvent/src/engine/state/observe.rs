@@ -99,6 +99,10 @@ impl State {
             memory_budget: self.memory_budget(),
             memory_limit: self.memory_limit,
             depth_target: self.config.memory.depth_target,
+            disk_used: self.disk_used(),
+            disk_budget: self.disk_budget().unwrap_or(0),
+            disk_limit: self.config.storage.disk_capacity.unwrap_or(0),
+            segments: self.book.segments.values().filter(|segment| segment.known).count() as u64,
             draining: self.draining,
             counters: self.counters.clone(),
             ..Stats::default()
@@ -119,13 +123,27 @@ impl State {
         channels.truncate(top);
         idle_lanes.sort_by(|a, b| b.waiting.cmp(&a.waiting).then_with(|| (&a.channel, &a.event_type).cmp(&(&b.channel, &b.event_type))));
         idle_lanes.truncate(top);
-        let mut roots: Vec<RootStat> = self.roots.iter().map(|(root, entry)| RootStat { root: root.clone(), events: entry.events, bytes: entry.bytes, paused: entry.paused.is_some() }).collect();
+        let mut roots: Vec<RootStat> =
+            self.roots.iter().map(|(root, entry)| RootStat { root: root.clone(), events: entry.events, bytes: entry.bytes, disk: entry.disk, paused: entry.paused.is_some() }).collect();
         roots.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.root.cmp(&b.root)));
         roots.truncate(top);
         stats.channels = channels;
         stats.idle_lanes = idle_lanes;
         stats.roots = roots;
         stats
+    }
+
+    /// Memory and disk now, for the connection owners (2.6).
+    pub fn pressure(&self) -> crate::engine::ops::Pressure {
+        crate::engine::ops::Pressure {
+            memory_used: self.memory_used(),
+            memory_budget: self.memory_budget(),
+            memory_limit: self.memory_limit,
+            memory_high: self.high_watermark(),
+            disk_used: self.disk_used(),
+            disk_budget: self.disk_budget(),
+            disk_limit: self.config.storage.disk_capacity,
+        }
     }
 
     /// `Drain`: new production connections are sent away; every open one gets

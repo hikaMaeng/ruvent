@@ -31,12 +31,19 @@
 //! | isolated events | logical id, on `isolated.<channel>` | server | isolation ~ completion, deletion, keep time | counted to the original root | workers, expiry |
 //! | reply-channel results | logical id, on `reply.<instance>` | server | follow-up ~ completion or expiry | counted to the request's root | requesters, expiry |
 //! | drain mark | server | server | `Drain` ~ stop | 1 | operator |
+//! | body cache | slot (`Slot::payload`; release order in `cache`) | server | registration or read-ahead ~ released at the watermark, or the event leaves | managed memory: released past the high watermark | ledger (`release_cache`) |
+//! | unlocated registrations | serial → slot (`unlocated`) | ledger | durable registration ~ its write lands | registrations in flight | ledger (`wrote`) |
+//! | reads ahead | slot (`warming`) | ledger | asked ~ answered | `read_ahead` × cold heads out | ledger (`warmed`) |
+//! | segment book, frees, relocation | segment (`disk::Book`) | log directory | reported ~ removed | segments on disk | ledger, on the container's reports |
+//! | checkpoint walk | slot cursor (`checkpoint::Scan`) | one checkpoint | begin ~ durable or aborted | one | ledger |
 //!
 //! Fault dedup per (connection, kind) lives in `Session::faults`: the
 //! connection owner may dedup again; the ledger does it so a misconfigured
 //! producer cannot fill the send buffer with faults.
 
+mod checkpoint;
 mod consume;
+mod disk;
 mod lanes;
 mod lifecycle;
 mod observe;
@@ -48,10 +55,12 @@ mod roots;
 mod slots;
 mod wheel;
 
+pub use disk::Warm;
+
 use super::config::{EngineConfig, Grants, Method};
 use super::ops::{ByeReason, Call, Counters, FaultKind, Hello, Outbound, Refusal, Role, SessionId, Target, Welcome};
 use crate::envelope::{ClaimToken, Envelope, EventId, GroupId, ProducerId, WorkKey};
-use crate::journal::Record;
+use crate::journal::{Location, Record};
 use crate::names::{Name, Names};
 use lanes::{Join, Lane, LaneKey};
 use producers::Producers;
@@ -82,6 +91,9 @@ pub struct Outgoing {
     pub message: Option<Outbound>,
     /// Released only once the batch with this commit number is on disk.
     pub gate: Option<u64>,
+    /// The event's payload is only on disk here: read it into the message's
+    /// envelope before it goes out (2.5, the read path).
+    pub read: Option<Location>,
 }
 
 /// What the ledger produced since the last [`State::take`].
@@ -95,6 +107,12 @@ pub struct Effects {
     pub observed: Vec<Envelope>,
     /// Production connections whose reading must stop (`false`) or resume (`true`), 2.6.
     pub reading: Vec<(SessionId, bool)>,
+    /// Payloads to read ahead into the cache; answer each with [`State::warmed`].
+    pub warm: Vec<Warm>,
+    /// Payloads to copy to the long-lived lane; answer with [`State::relocated`].
+    pub relocate: Vec<Location>,
+    /// Segments that may be removed once no read pins them.
+    pub delete: Vec<u32>,
 }
 
 /// One open connection.
@@ -233,6 +251,11 @@ pub struct State {
     counters: Counters,
     id_source: Box<dyn IdSource>,
     effects: Effects,
+    book: disk::Book,
+    unlocated: VecDeque<(u64, Index, u32)>,
+    cache: VecDeque<(Index, u32)>,
+    warming: HashSet<Index>,
+    scan: Option<checkpoint::Scan>,
 }
 
 impl State {
@@ -275,6 +298,11 @@ impl State {
             counters: Counters::default(),
             id_source,
             effects: Effects::default(),
+            book: disk::Book::default(),
+            unlocated: VecDeque::new(),
+            cache: VecDeque::new(),
+            warming: HashSet::new(),
+            scan: None,
         }
     }
 
@@ -320,6 +348,7 @@ impl State {
         self.flush_producers();
         self.check_memory();
         self.settle();
+        self.tend_disk();
         let effects = std::mem::take(&mut self.effects);
         self.effects.first_serial = self.serial;
         effects
@@ -328,6 +357,7 @@ impl State {
     /// The batch with commit number `commit` is on disk.
     pub fn landed(&mut self, commit: u64) {
         self.durable = self.durable.max(commit);
+        self.apply_frees(commit);
         while self.producers.acks.front().is_some_and(|(waiting, _)| *waiting <= commit) {
             let Some((_, id)) = self.producers.acks.pop_front() else { break };
             if let Some(producer) = self.producers.entries.get_mut(&id) {
@@ -367,7 +397,14 @@ impl State {
     }
 
     fn send(&mut self, session: SessionId, message: Outbound, gate: Option<u64>) {
-        self.effects.sends.push(Outgoing { session, message: Some(message), gate });
+        self.effects.sends.push(Outgoing { session, message: Some(message), gate, read: None });
+    }
+
+    /// A message carrying the event at `index`: its payload is read first if
+    /// it is cold.
+    fn send_event(&mut self, session: SessionId, message: Outbound, gate: Option<u64>, index: Index) {
+        let read = self.slots.get(index).filter(|slot| slot.cold()).and_then(|slot| slot.at);
+        self.effects.sends.push(Outgoing { session, message: Some(message), gate, read });
     }
 
     /// Tells the connection why, closes it after everything sent before, and
@@ -376,7 +413,7 @@ impl State {
         if let Some(reason) = bye {
             self.send(session, Outbound::Bye(reason), None);
         }
-        self.effects.sends.push(Outgoing { session, message: None, gate: None });
+        self.effects.sends.push(Outgoing { session, message: None, gate: None, read: None });
         self.close(session, &[]);
     }
 
@@ -547,7 +584,7 @@ impl State {
             Call::Delete { id, result, tag, key, .. } => self.delete(session, &credential, id, &result, tag, key),
             Call::Join { req, channel, types, lease_ms, dispatch } => self.join(session, &credential, req, &channel, types, lease_ms, dispatch),
             Call::Window { channel, count, bytes } => self.window(session, &channel, count, bytes),
-            Call::Complete { id, token, follow_ups, .. } => self.complete(session, &credential, id, token, follow_ups),
+            Call::Complete { id, token, follow_ups, spooled, .. } => self.complete(session, &credential, id, token, follow_ups, spooled),
             Call::Extend { id, token } => self.extend(session, &credential, id, token),
             Call::Release { id, token, delay_ms, failed } => self.give_back(session, &credential, id, token, delay_ms, failed),
             Call::Claim { req, id, lease_ms } => self.claim(session, &credential, req, id, lease_ms),

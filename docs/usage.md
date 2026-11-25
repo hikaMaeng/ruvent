@@ -3,11 +3,11 @@
 ## 내장 엔진 + 내장 워커
 
 ```rust
-use ruvent::{connect, Engine, EngineConfig, FileJournal};
+use ruvent::{connect, Engine, EngineConfig, SegmentLog};
 use ruvent_client::worker::{App, Service};
 
 # async fn demo() -> std::io::Result<()> {
-let (journal, recovered) = FileJournal::open("data/events.journal")?;
+let (journal, recovered) = SegmentLog::open("data/journal")?;
 let engine = Engine::start(EngineConfig::default(), journal, recovered).await?;
 let (client, inbox) = connect(&engine, "workers", 4096).await.expect("engine is up");
 let running = App::new(client, inbox)
