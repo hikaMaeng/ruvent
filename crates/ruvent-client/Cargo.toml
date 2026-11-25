@@ -1,6 +1,6 @@
 [package]
 name = "ruvent-client"
-description = "Connections to the event server over a socket, and the worker framework that runs on the seven methods (in-process or remote)."
+description = "The client SDK of the event server: server lists, reconnection, producers, workers, requesters and observers over TCP or in-process."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,3 +19,4 @@ socket2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+ruvent-server = { path = "../ruvent-server" }

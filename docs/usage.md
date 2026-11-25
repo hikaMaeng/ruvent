@@ -2,27 +2,32 @@
 
 ## 내장 엔진 + 내장 워커
 
-```rust
-use ruvent::{connect, Engine, EngineConfig, SegmentLog};
-use ruvent_client::worker::{App, Service};
+SDK는 연결 방법(`link::Connector`)만 바꿔 끼운다. 프로세스 안 엔진은 `link::Local`에 이름으로 넣는다.
 
-# async fn demo() -> std::io::Result<()> {
+```rust,ignore
+use ruvent::{Engine, EngineConfig, SegmentLog};
+use ruvent_client::link::Local;
+use ruvent_client::servers::Servers;
+use ruvent_client::worker::{Retry, Service, Worker};
+use std::sync::Arc;
+use std::time::Duration;
+
 let (journal, recovered) = SegmentLog::open("data/journal")?;
 let engine = Engine::start(EngineConfig::default(), journal, recovered).await?;
-let (client, inbox) = connect(&engine, "workers", 4096).await.expect("engine is up");
-let running = App::new(client, inbox)
-    .service(Service::new("orders").on("create", |cx| async move {
+let local = Arc::new(Local::new());
+local.insert("main", engine.clone());
+let servers = Servers::new(["main"]);
+let worker = Worker::builder(local, &servers)
+    .service(Service::new("orders").slots(16).on("create", |cx| async move {
+        if downstream_is_down() {
+            return Err(Retry::later(Duration::from_secs(5)));   // 이벤트 탓 아님: 실패 횟수 그대로
+        }
         cx.emit_dispatch("orders.events", "created", cx.payload().clone());
-        Ok(())
+        Ok(())                                                  // Complete(후속 포함)
     }))
-    .start()
-    .await
-    .expect("subscribed");
-tokio::select! {
-    stopped = engine.stopped() => { stopped.expect("engine failed"); }
-    _ = running.wait() => {}
-}
-# Ok(()) }
+    .start();
+// …
+worker.shutdown().await;   // 창 0 → 유예 → 남은 실행은 실패 아님으로 반환
 ```
 
 ## 이벤트 서버
@@ -63,14 +68,45 @@ cargo run --release -p ruvent-server -- crates/ruvent-server/server.example.json
 Ctrl-C로 정상 종료한다: drain(생산 연결에 최종 확인과 `Bye{draining}`) → 나머지 연결에 `Bye{draining}` →
 엔진 종료와 체크포인트. 엔진이 스스로 멈추면 실패 코드로 끝난다.
 
-## 원격 연결
+## 원격 연결 (SDK)
+
+서버 목록과 토큰 하나로 붙는다. 서버마다 역할별 연결을 열고, 끊기면 지수 백오프 + full jitter(50 ms ~ 1초,
+`draining` 뒤 30초)로 다시 붙는다. 모든 소켓에 keepalive를 건다.
 
 ```rust,ignore
-let (client, inbox) = ruvent_client::remote::connect("127.0.0.1:7400", "workers-secret-change-me", ruvent::Hello::worker("ignored"), Default::default()).await?;
+use ruvent::Envelope;
+use ruvent_client::link::Tcp;
+use ruvent_client::producer::{Producer, ProducerConfig};
+use ruvent_client::requester::{RequestOptions, Requester, RequesterConfig};
+use ruvent_client::servers::Servers;
+use std::sync::Arc;
+
+let tcp = Arc::new(Tcp::new("workers-secret-change-me"));
+let servers = Servers::new(["10.0.0.1:7400", "10.0.0.2:7400"]);   // `servers.set(…)`로 바꾸면 붙고 뗀다
+
+// 생산자: 선택기가 서버를 고르고, 누적 확인이 올 때까지 미확인 버퍼에 쥔다(가득이면 기다린다).
+let producer = Producer::start(tcp.clone(), &servers, ProducerConfig::default());
+producer.send(Envelope::claimable("orders", "create", payload)).await?;
+producer.flush().await?;                      // 지금까지 보낸 것이 모두 커밋될 때까지
+
+// 요청자: 인스턴스마다 응답 채널 `reply.<id>` 하나. 결과는 착수용 이벤트라 재접속·재기동에도 잃지 않는다.
+let requester = Requester::start(tcp.clone(), &servers, RequesterConfig::default());
+let response = requester.request(Envelope::claimable("orders", "price", body), RequestOptions::default()).await?;
+// response.fragments(스트림 조각) → response.result 순서. response.fragments_lost: 그사이 연결이 바뀌었다
 ```
 
-`Hello`가 역할(생산·작업·관찰)과 생산자 id, 인스턴스 nonce를 정한다. 돌려받는 `Client`는 인프로세스 연결과 같다.
-재접속·미확인 버퍼·서버 선택·워커 규칙은 SDK 계층(계획 2.9)의 몫이다.
+워커 핸들러에서 결과는 `cx.reply(payload)`(응답 채널의 후속, `expires` 60초), 조각은 `cx.fragment(payload).await`
+(작업 연결로 바로 방출)로 낸다. 관찰자(`observer::Observer`)는 구독을 연결마다 다시 내고 발송 엔벨롭을 그대로
+넘긴다. 끊긴 동안의 발송은 `Observed::Gap`으로 알린다.
+
+| `Bye` 사유 | SDK |
+| --- | --- |
+| `superseded` | 그 생산자 id로 다시 붙지 않고 오류(`ProducerError::Refused`) |
+| `draining` | 생산 후보에서 빼고, 최종 확인 뒤의 미확인분은 다른 서버로. 긴 백오프로 다시 붙는다 |
+| `slow` | 다시 붙는다. 그사이 발송은 잃는다 |
+| `version`, `token`, `forbidden` | 다시 붙지 않고 오류 |
+
+소켓 한 줄만 쓰려면 `ruvent_client::remote::connect`(전송층, 재접속 없음)를 쓴다.
 
 ## 프록시
 
@@ -100,9 +136,13 @@ cargo run --release -p ruvent-proxy --example custom -- crates/ruvent-proxy/prox
 
 ## 워커가 정하는 것
 
-* 재시도 상한: `Service::max_retries`. 엔벨롭 `retry`(서버가 회수 때 올린 값)가 넘으면 핸들러를 돌리지 않고
-  완료한다.
-* 실패 보고: `Service::failures(채널)`을 설정했을 때만 실패 발송 이벤트를 낸다.
-* 긴 일: 핸들러가 작업용 착수 이벤트를 후속으로 내고 자기 이벤트를 완료한다. 그 일은
-  `Service::executor(채널)`(별도 예산, 긴 lease)이 처리한다.
-* 외부 효과 중복: `Context::key()`(작업 키)로 거른다. 회수와 재기동에도 바뀌지 않는다.
+* 핸들러의 끝은 셋이다: `Ok(())`(완료, 영구 실패도 실패 후속과 함께 완료), `Err(Retry::later(지연))`(기본, 이벤트
+  탓 아님: 실패 횟수 그대로), `Err(Retry::failed(지연))`(이벤트 탓: 실패 횟수가 오른다). 몇 번까지인지는 서버의
+  `isolate_after`(기본 5)가 정하고, SDK는 횟수를 세지 않는다. 핸들러 없이 완료하는 경로도 없다.
+* lease(기본 30초)는 SDK가 절반마다 자동으로 연장한다. 작업의 최대 시간은 실행 한도(이벤트 워커 30초,
+  `Service::executor` 1시간)다. 넘으면 끊고 `Release{실패 = 예}`로 돌려준다. 정지된 채널로의 `cx.send`를
+  기다리다 넘긴 실행은 실패로 세지 않는다.
+* 슬롯 P(`Service::slots`)를 서버들의 창에 나눈다. 창의 합은 P를 넘지 않고, 굶는 서버(`Pending`)가 있으면 슬롯
+  하나씩 옮긴다(계획 2.4).
+* 비가역 부작용은 업무 키의 유일 제약이나 하류 멱등 키로, 덮어쓰기는 `cx.token()`(펜싱 토큰)으로 막는다.
+  `Context::key()`(작업 키)는 회수와 재기동에도 바뀌지 않는다.

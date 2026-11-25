@@ -766,6 +766,7 @@ dependencies = [
  "parking_lot",
  "ruvent",
  "ruvent-protocol",
+ "ruvent-server",
  "socket2",
  "tokio",
 ]

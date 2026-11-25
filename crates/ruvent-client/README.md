@@ -1,50 +1,48 @@
 # ruvent-client
 
-이벤트 서버에 붙는 쪽이다. 두 부분으로 나뉜다.
+이벤트 서버의 클라이언트 SDK(계획 2.9). 서버가 부하를 클라이언트로 넘기는 설계이므로, 클라이언트가 지켜야 할
+규칙(재접속, 미확인 버퍼, 서버 선택, 정지 통보, 워커 창, lease, 종료, 요청–응답)을 여기서 구현한다.
 
-* `remote` — 소켓 연결(wire v2). `remote::connect(주소, 토큰, Hello, Options)`가 인프로세스 연결과 같은
-  `ruvent::Client`와 `Inbox`를 돌려준다. `remote::open`은 `Welcome`과 서버 기능 비트도 준다. `Hello`를 `Bye`로
-  거절당하면 오류 안의 `remote::Refused(ByeReason)`로 사유를 알 수 있다. 모든 소켓에 keepalive(S13)를 건다.
-  메서드 구현은 코어의 `Client` 하나뿐이고, 여기는 링크(쓰기·읽기 태스크)만 붙인다.
-* `worker` — 워커 프레임워크. `ruvent::Methods`만 보므로 같은 서비스를 내장 엔진에도, 원격 서버에도 붙인다.
+| 모듈 | 하는 일 |
+| --- | --- |
+| `servers` | 서버 목록 공급자 `ServerList`(현재 목록 + 변경 알림). 정적·교체 가능한 구현 `Servers` |
+| `link` | 연결 하나를 여는 `Connector`. `Tcp`(wire v2), `Local`(프로세스 안 엔진, 이름 → `Engine`, 재기동 때 교체) |
+| `line` | 서버 하나 × 역할 하나: 지수 백오프 + full jitter(S20) 재접속, `Bye` 사유표, `Welcome`의 server_id·세대 변화(재기동) 감지 |
+| `buffer` | 번호 붙은 연결의 미확인 버퍼: 누적 `Committed`로 비우기, `resume` 재개, 기록을 잃은 서버의 다시 번호 매기기 |
+| `producer` | `Producer`: 선택기(`Selector`, 기본 `LeastUnacked`), 바이트 상한(S8, 가득이면 `send`가 기다림), `Paused`/`Resumed`, `draining`, 재시도 예산(S9) |
+| `worker` | `Worker`: 서비스별 슬롯 P, 서버 사이 창 규칙(`worker::windows::Book`), 자동 연장, 실행 한도, 핸들러의 세 끝(`Retry`), 실행 중 방출, 종료 절차 |
+| `requester` | `Requester`: 응답 채널 `reply.<인스턴스 id>`, 서버마다 한 번 참여(발송 포함, lease 5초), 대기자 표, 조각 유실 표시, 호출 기한과 같은 id 재전송 |
+| `observer` | `Observer`: 서버마다 관찰 연결, 연결마다 구독 재발행, 원 엔벨롭 수신, `Stats`·`Drain` |
+| `remote` | 전송층: `connect`/`open`(코어 `Client`), `open_raw`(SDK가 쓰는 날 연결). 모든 소켓에 keepalive(S13) |
 
-## 워커 프레임워크
+## 시작
 
-```rust
-use ruvent_client::worker::{App, Service};
-use std::time::Duration;
-
-# async fn demo(client: ruvent::Client, inbox: ruvent::Inbox) {
-let running = App::new(client, inbox)
-    .service(
-        Service::new("orders")
-            .on("create", |cx| async move {
-                cx.emit_dispatch("orders.events", "created", cx.payload().clone());
-                Ok(())
-            })
-            .permits(16)
-            .lease(Duration::from_secs(30))
-            .max_retries(5)
-            .failures("orders.failed"),
-    )
-    .service(Service::executor("jobs").on("render", |_cx| async move { Ok(()) }))
-    .start()
-    .await
-    .unwrap();
-running.wait().await.unwrap_err(); // 연결이 끝나면 오류로 돌아온다
-# }
+```rust,ignore
+let tcp = Arc::new(ruvent_client::link::Tcp::new(token));
+let servers = ruvent_client::servers::Servers::new(["10.0.0.1:7400", "10.0.0.2:7400"]);
+let producer = Producer::start(tcp.clone(), &servers, ProducerConfig::default());
+let worker = Worker::builder(tcp.clone(), &servers).service(Service::new("orders").on("create", handler)).start();
+let requester = Requester::start(tcp.clone(), &servers, RequesterConfig::default());
+let (observer, stream) = Observer::start(tcp, &servers, ObserverConfig::default());
 ```
 
-| 설정 | 기본값 | 뜻 |
-| --- | --- | --- |
-| `permits` | 16 (실행기 4) | 서비스별 독립 허가 예산. 허가는 핸들러가 끝나는 즉시 돌아온다(완료 응답을 기다리지 않는다) |
-| `lease` | 30초 (실행기 1시간) | 착수 기한. 핸들러가 넘기면 완료 보고 없이 버리고, 서버가 다음 등록 때 회수한다 |
-| `max_retries` | 5 | 엔벨롭 `retry`가 이를 넘으면 핸들러를 돌리지 않고 완료한다 |
-| `failures` | 없음 | 설정하면 실패·재시도 초과 때 완료의 후속으로 실패 발송 이벤트를 낸다(payload = 사유, correlation = 실패한 id) |
-| `pending_limit` | 1024 | 허가가 없을 때 보관하는 알림 상한. 넘쳐 버리면 다음 여유 때 대기분을 처음부터 다시 읽는다 |
+같은 코드를 `link::Local`로 바꾸면 프로세스 안 엔진에 붙는다(시험과 내장 사용).
 
-* 흐름: 시작 때 채널 구독과 대기분 이어받기 → 알림마다 허가가 있으면 착수 → 핸들러 → 모은 후속과 함께 완료.
-  착수 응답의 작업 키가 알림의 키와 다르면 새 일로 다룬다.
-* 실패(핸들러 `Err`, panic)는 이벤트를 완료 처리한다. 다음 처리가 필요하면 핸들러가 새 이벤트를 낸다.
-* `App::listen(채널, 함수)`는 발송용 이벤트를 받는다.
-* `Running::wait()`는 연결이 끝나면 `Err(Disconnected)`로, `shutdown()` 뒤에는 `Ok`로 끝난다.
+## 설정값(계획 8장, 모두 필드와 기본값)
+
+| 값 | 기본 | 위치 |
+| --- | --- | --- |
+| 재접속 백오프 초기·상한·`draining` 상한(S20) | 50 ms · 1초 · 30초 | `line::backoff::Reconnect` |
+| 미확인 버퍼 상한(S8) | 연결당 64 MiB | `ProducerConfig::unacked_bytes`, `WorkerConfig::unacked_bytes`, `RequesterConfig::unacked_bytes` |
+| 재시도 예산(S9) | 정상 요청의 10% | `ProducerConfig::retry_ratio` |
+| lease · 실행 한도(B7) | 30초 · 30초(실행기 1시간) | `Service::lease`, `Service::run_limit`, `Service::executor` |
+| 결과 보관 기한(B10) | 60초 | `WorkerConfig::result_keep` |
+| 응답 채널 lease(S16) | 5초 | `RequesterConfig::lease` |
+| 종료 유예 | 30초 | `WorkerConfig::shutdown_grace` |
+| keepalive(S13) | 15초 · 5초 · 3회, `TCP_USER_TIMEOUT` 30초 | `remote::Keepalive` |
+
+## 타이머
+
+다섯 곳뿐이고 모두 일회성이다(가장 이른 기한에만 깬다): 재접속 백오프(`line`), 호출 기한(`requester`), 자동 연장
+(`worker/extend.rs`), 종료 유예(`worker/shutdown.rs`), 실행 한도(`worker/run.rs`). 정적 시험
+`nothing_polls_and_every_timer_is_declared`가 지킨다.

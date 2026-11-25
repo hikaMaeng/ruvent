@@ -190,7 +190,11 @@ fn workspace_library() -> Vec<Source> {
 /// | --- | --- |
 /// | `ruvent/snapshot/mod.rs` `time::timeout(` | a snapshot unit's age limit |
 /// | `ruvent/engine/mod.rs` `time::sleep(` | the timing wheel: one one-shot sleep to the earliest lease end or visibility time, none when the wheel is empty (2.4) |
-/// | `ruvent-client/worker/lane.rs` `time::timeout(` | a handler's run limit: past it the run is abandoned (2.9; the lease is no longer the run limit) |
+/// | `ruvent-client/line/mod.rs` `time::sleep(` | reconnection back-off: one wait between two attempts of a line, exponential with full jitter (S20) |
+/// | `ruvent-client/requester/mod.rs` `time::timeout(` | the call deadline of a request: past it the request is sent again (same id) or fails (2.8, 2.9) |
+/// | `ruvent-client/worker/extend.rs` `time::sleep(` | the automatic extension: one one-shot sleep to the earliest `Extend` due (half a lease), none while no run is due (2.4, B7) |
+/// | `ruvent-client/worker/shutdown.rs` `time::sleep(` | the shutdown grace: armed only while shutting down (2.9 "종료") |
+/// | `ruvent-client/worker/run.rs` `time::timeout(` | a handler's run limit: past it the run is cut off and released (B7; the lease is no longer the run limit) |
 /// | `ruvent-server/connection/handshake.rs` `time::timeout(` | how long a new connection has to say hello |
 /// | `ruvent-server/connection/close.rs` `time::timeout(` | the deadline of a staged close after `Bye` (2.2, S20) |
 /// | `ruvent-proxy/hub/mod.rs` `time::timeout(` | how long an authentication worker has to answer |
@@ -198,7 +202,11 @@ fn workspace_library() -> Vec<Source> {
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
     ("ruvent/engine/mod.rs", "time::sleep(", 1),
-    ("ruvent-client/worker/lane.rs", "time::timeout(", 1),
+    ("ruvent-client/line/mod.rs", "time::sleep(", 1),
+    ("ruvent-client/requester/mod.rs", "time::timeout(", 1),
+    ("ruvent-client/worker/extend.rs", "time::sleep(", 1),
+    ("ruvent-client/worker/shutdown.rs", "time::sleep(", 1),
+    ("ruvent-client/worker/run.rs", "time::timeout(", 1),
     ("ruvent-server/connection/handshake.rs", "time::timeout(", 1),
     ("ruvent-server/connection/close.rs", "time::timeout(", 1),
     ("ruvent-proxy/hub/mod.rs", "time::timeout(", 1),

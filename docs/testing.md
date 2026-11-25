@@ -29,7 +29,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | acceptance | `-p ruvent --test acceptance` | 사용자 원문 인수 |
 | protocol | `-p ruvent-protocol` | 와이어 형식 |
 | server | `-p ruvent-server` | 실제 TCP 서버 |
-| client and workers | `-p ruvent-client` | 워커 프레임워크 |
+| client SDK | `-p ruvent-client` | 서버 목록, 재접속, 생산자, 워커 창 규칙, 요청자 |
 | proxy | `-p ruvent-proxy` | 프록시 단위(장부·메시지·핸드셰이크·설정·인증·규칙·상태 코드·조립기), 허브, 두 프로토콜, 훅, 실제 이벤트 서버에 붙인 인수 |
 | proxy: ws only / http only / no protocol | `clippy -p ruvent-proxy --no-default-features [--features ws\|http] --all-targets -D warnings` | 한 프로토콜만, 또는 프로토콜 없이 빌드할 때 깨지는 cfg |
 
@@ -50,7 +50,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 결정 | 테스트 |
 | --- | --- |
 | 코어 모듈은 아래로만 의존한다(`names` ← `envelope` ← `journal`·`snapshot` ← `engine` ← `methods`). 로그(`journal`)와 엔진(`engine`)의 하위 모듈은 하위 계층 표가 정한 것만 부른다 | `modules_depend_only_downward`, `every_module_is_in_the_layer_table_and_no_layer_is_stale`, `the_parts_of_the_log_and_the_engine_name_only_the_parts_they_may` |
-| 어느 라이브러리도 폴링하지 않고, 타이머는 선언된 여섯 곳뿐이다(스냅샷 단위 나이, 엔진의 기한 휠, 핸들러 실행 한도, 핸드셰이크 기한, 인증 응답 기한, 상위 재접속 백오프) | `nothing_polls_and_every_timer_is_declared` |
+| 어느 라이브러리도 폴링하지 않고, 타이머는 선언된 곳뿐이다(스냅샷 단위 나이, 엔진의 기한 휠, 핸드셰이크 기한, 닫기 기한, SDK의 재접속 백오프·호출 기한·자동 연장·종료 유예·실행 한도, 프록시의 인증 응답 기한·상위 재접속 백오프) | `nothing_polls_and_every_timer_is_declared` |
 | 영속 로그는 기록 태스크 한 곳에서만, 한 번에 한 비행만 쓴다. 체크포인트 작성기와 잡일(이주·삭제)도 각각 한 곳이다 | `the_journal_is_written_from_one_place` |
 | 엔진 상태의 소유자는 엔진 태스크 하나다 | `the_engine_state_has_one_owner` |
 | 라이브러리에 `unsafe`·터미널 출력·`todo!`가 없다 | `no_library_has_unsafe_or_writes_to_the_terminal` |
@@ -178,16 +178,57 @@ wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 대기분 이어받기 | `a_backlog_larger_than_one_page_is_read_to_the_end_by_subscribing_again` |
 | 서버가 연결을 놓을 때 | `when_the_server_goes_away_the_inbox_closes_and_calls_fail_closed` |
 
-## 워커 프레임워크 (`crates/ruvent-client/tests/worker.rs`)
+## 클라이언트 SDK (`crates/ruvent-client/`)
+
+단위(`src/**/tests.rs`, `src/**` 안의 `mod tests`: 순수 상태, 네트워크 없음) → 통합(`tests/producer.rs`·`tests/worker.rs`·
+`tests/requester.rs`: 프로세스 안 엔진(`link::Local`)과 실제 `ruvent-server`(TCP), 연결을 끊는 TCP 중계기) 순이다.
+
+### 단위
 
 | 영역 | 테스트 |
 | --- | --- |
-| 처리와 후속 | `a_handled_event_is_completed_and_its_follow_ups_registered`, `a_listener_receives_dispatch_events_in_order` |
-| 실패는 완료, 보고는 선택 | `a_failed_handler_completes_the_event_and_reports_only_when_asked`, `a_panicking_handler_is_a_failure_not_a_dead_worker` |
-| 재시도 정책은 워커 쪽 | `an_event_past_its_retry_limit_is_completed_without_running_the_handler`, `a_handler_that_outlives_its_lease_is_reclaimed_and_run_again_with_retry_plus_one` |
-| 허가와 보관 알림(P3) | `a_worker_with_every_permit_taken_still_runs_work_noticed_meanwhile_once_a_permit_returns`, `work_reclaimed_ahead_of_the_read_position_and_dropped_by_the_local_limit_is_still_run` |
-| 별도 예산 | `a_saturated_executor_does_not_slow_the_event_workers` |
-| 장애 표면화(D8) | `the_app_ends_with_an_error_when_the_engine_stops`, `a_refused_subscription_fails_start` |
+| 미확인 버퍼: 누적 확인, `resume` 재개, 기록을 잃은 서버의 다시 번호 매기기(2.3) | `a_cumulative_acknowledgement_empties_the_buffer_up_to_it`, `resume_drops_what_was_applied_and_keeps_the_numbers_of_the_rest`, `a_server_that_lost_the_record_gets_the_rest_numbered_from_resume_plus_one` |
+| 재접속 백오프: 지수 + full jitter, `draining` 긴 상한(S20) | `back_off_grows_to_its_cap_with_full_jitter_and_draining_uses_the_long_cap` |
+| 재시도 예산(S9) | `retries_are_bounded_by_a_fraction_of_ordinary_sends` |
+| 기본 선택기(B19, B26) | `the_default_selector_prefers_fewer_unacknowledged_bytes_and_avoids_paused_servers` |
+| 서버 사이 창: 불변식과 둘 곳 없는 슬롯 | `slots_with_no_place_go_to_the_smallest_connected_window_and_never_exceed_p` |
+| 서버 사이 창: 규칙 하나(굶는 서버, 한가한 창, 끝난 서버의 2 차이) | `a_starving_server_takes_one_slot_from_the_largest_idle_window`, `a_run_end_moves_a_slot_only_when_the_ender_is_two_above_the_receiver` |
+| 서버 사이 창: 포화와 P < S | `saturation_evens_the_windows_to_within_one_and_holds_the_invariant`, `p_below_s_reaches_a_zero_window_server_as_soon_as_a_slot_goes_idle` |
+| 서버 사이 창: 끊긴 서버, 셈 어긋남, 엇갈림, 종료 | `a_disconnected_server_keeps_what_its_runs_hold_and_frees_the_rest`, `a_pending_with_a_known_idle_window_says_the_value_again`, `an_assignment_past_the_window_overflows_and_a_closed_book_opens_nothing` |
+
+### 생산자 (`tests/producer.rs`)
+
+| 영역 | 테스트 |
+| --- | --- |
+| 누적 확인으로 버퍼가 빈다(S8, B2, TCP) | `cumulative_acknowledgements_empty_the_unacknowledged_buffer_over_tcp` |
+| 재접속 뒤 `resume`에서 잇고 중복 0(2.3, TCP 중계기 양쪽 끊기) | `a_reconnection_resumes_after_welcome_resume_with_no_duplicates` |
+| 서버 재기동: 저널 있음은 재개, 없음은 다시 번호 매기기 | `a_restart_with_the_journal_resumes_and_one_without_it_renumbers` |
+| `Paused`는 그 채널만 쥐고 `Resumed`에 푼다(2.6) | `a_paused_channel_holds_only_its_own_sends` |
+| 같은 id 두 인스턴스: `superseded`, 되풀이 없음(M8-7) | `a_superseded_producer_stops_and_the_other_goes_on_without_flapping` |
+| 같은 nonce의 비대칭 재접속 3회 멈춤 0(M8-7) | `the_same_nonce_reconnects_three_times_through_a_one_sided_cut_without_stalling` |
+| `Bye` 사유표: 토큰 거절은 다시 붙지 않고 오류로 | `a_refused_token_ends_the_producer_with_its_reason` |
+| `draining`: 최종 확인 뒤의 나머지를 다른 서버로, 한 번씩(2.9) | `a_draining_server_hands_its_unapplied_rest_to_another_server_once` |
+
+### 워커 (`tests/worker.rs`)
+
+| 영역 | 테스트 |
+| --- | --- |
+| 서버 2·4대 90/10 편중: P 초과 실행 0, 바쁜 서버 창 ≥ 1, 중복 실행 0(M1) | `skewed_load_over_two_and_four_servers_never_runs_past_p_and_keeps_every_busy_window_open` |
+| P < S, 간헐 유입(M1) | `workers_with_fewer_slots_than_servers_reach_every_server` |
+| 강제 종료된 워커의 일이 재접속 유예 안에 재배정(M8-2, TCP) | `a_killed_worker_is_reassigned_within_the_reconnect_grace` |
+| 서버 정상 재시작 중 착수 유지: 재배정 0, 실패 횟수 변화 0(M8-6) | `a_graceful_restart_keeps_the_run_claimed_and_counts_nothing` |
+| 하류 장애 "나중에 다시"는 격리 0, "이벤트 탓"은 n번째에 격리(M8-12, B23) | `releasing_later_more_often_than_isolate_after_isolates_nothing_but_failures_do` |
+| 종료 절차: 창 0 → 유예 → 반환(실패 아님) | `shutdown_closes_the_windows_and_gives_back_what_outlives_the_grace` |
+| 실행 중 방출은 완료보다 먼저(2.2) | `a_dispatch_emitted_while_running_comes_before_the_completions_follow_up` |
+
+### 요청자 (`tests/requester.rs`)
+
+| 영역 | 테스트 |
+| --- | --- |
+| 조각 → 결과 순서(2.8, TCP) | `a_request_gets_its_fragments_then_its_result_over_tcp` |
+| 요청 중 서버 재시작: 결과 유실 0, 재실행 0, 결과 뒤 조각 0, 조각 유실 표시(M8-9) | `a_restart_during_a_request_loses_no_result_and_runs_nothing_twice` |
+| 요청자 재접속에도 결과는 한 번 온다(2.9) | `a_requester_that_reconnects_still_gets_its_result_once` |
+| 호출 기한과 같은 id 재전송: 대기자 하나, 재실행 0 | `a_request_past_its_deadline_times_out_and_a_retry_keeps_one_waiter` |
 
 ## 프록시 (`crates/ruvent-proxy/`)
 

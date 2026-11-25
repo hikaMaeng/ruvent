@@ -45,7 +45,8 @@ fn types_are_lanes_and_an_unsupported_type_does_not_block_the_rest() {
     assert_eq!(h.waiting("work"), 1);
 }
 
-/// `more` on the assignment that fills the window; `Pending` once per window (2.4).
+/// `more` on the assignment that fills the window; `Pending` once per window
+/// (2.4), also to a window said while it is full and work already waits.
 #[test]
 fn a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window() {
     let mut h = H::volatile().cast();
@@ -58,11 +59,14 @@ fn a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window() 
     assert_eq!(more, [false, true], "the one that fills the window says more is waiting");
     let quiet = h.produce(P, work("work").with_id(id(4)));
     assert!(sent(&quiet, W1).is_empty(), "`more` already said it");
-    h.call(W1, Call::Window { channel: "work".into(), count: 2, bytes: 0 });
-    let first = h.produce(P, work("work").with_id(id(5)));
-    assert_eq!(sent(&first, W1), [Outbound::Pending { channel: "work".into() }]);
-    let second = h.produce(P, work("work").with_id(id(6)));
+    let again = h.call(W1, Call::Window { channel: "work".into(), count: 2, bytes: 0 });
+    assert_eq!(sent(&again, W1), [Outbound::Pending { channel: "work".into() }], "said while full with work waiting");
+    let second = h.produce(P, work("work").with_id(id(5)));
     assert!(sent(&second, W1).is_empty(), "at most one per window");
+    h.call(W1, Call::Join { req: 2, channel: "late".into(), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    h.produce(P, work("late").with_id(id(6)));
+    let zero = h.call(W1, Call::Window { channel: "late".into(), count: 0, bytes: 0 });
+    assert_eq!(sent(&zero, W1), [Outbound::Pending { channel: "late".into() }], "a window of 0 said after the work arrived hears it");
 }
 
 #[test]

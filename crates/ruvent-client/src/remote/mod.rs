@@ -3,8 +3,9 @@
 //! This is the transport only. [`connect`] says `Hello` with the role the
 //! given [`ruvent::Hello`] names, waits for `Welcome` (or the `Bye` that came
 //! instead), and returns the same [`ruvent::Client`] an in-process connection
-//! returns. Reconnection, the unacknowledged buffer, server selection and the
-//! worker's window rules sit above this (2.9).
+//! returns. [`open_raw`] stops below the client: the SDK's lines
+//! (`crate::link`) number their own calls. Reconnection, the unacknowledged
+//! buffer, server selection and the worker's window rules sit above this (2.9).
 //!
 //! Two tasks serve one connection:
 //!
@@ -87,6 +88,13 @@ impl Refused {
     }
 }
 
+impl Refused {
+    /// The `io::Error` a refusal is reported as.
+    pub fn error(reason: ByeReason) -> io::Error {
+        refused(reason)
+    }
+}
+
 fn refused(reason: ByeReason) -> io::Error {
     let kind = match reason {
         ByeReason::Token | ByeReason::Forbidden => io::ErrorKind::PermissionDenied,
@@ -102,6 +110,18 @@ pub struct Connected {
     pub inbox: Inbox,
     pub welcome: Welcome,
     /// What the server implements; use nothing it did not announce.
+    pub features: u64,
+}
+
+/// A welcomed connection below the client API: calls go out through `link`
+/// as they are (the caller numbers them), and everything the server sends
+/// arrives on `outbound` in order. `outbound` ends after `Bye` or when the
+/// socket closes. Dropping every clone of `link` writes what was queued and
+/// closes the socket; dropping `outbound` alone stops reading.
+pub struct RawConnection {
+    pub link: Arc<dyn Link>,
+    pub outbound: mpsc::Receiver<Outbound>,
+    pub welcome: Welcome,
     pub features: u64,
 }
 
@@ -134,13 +154,33 @@ pub async fn connect(address: &str, token: &str, hello: Hello, options: Options)
 
 /// [`connect`], with the `Welcome` and the server's feature bits.
 pub async fn open(address: &str, token: &str, hello: Hello, options: Options) -> io::Result<Connected> {
+    let role = hello.role;
+    let raw = open_raw(address, token, hello, options).await?;
+    let (client, demux, inbox) = ruvent::methods::client(raw.link, role, options.inbox);
+    demux.route(Outbound::Welcome(raw.welcome.clone())).await;
+    let mut outbound = raw.outbound;
+    tokio::spawn(async move {
+        while let Some(message) = outbound.recv().await {
+            if !demux.route(message).await {
+                break;
+            }
+        }
+        // The reader stopped the writer before it let go of `outbound`, so
+        // nothing is sent after the waiting calls fail here.
+        demux.close().await;
+    });
+    Ok(Connected { client, inbox, welcome: raw.welcome, features: raw.features })
+}
+
+/// Connects like [`open`] and hands over the raw connection: the SDK's
+/// lines number their own calls and read the server's messages as they are.
+pub async fn open_raw(address: &str, token: &str, hello: Hello, options: Options) -> io::Result<RawConnection> {
     let stream = TcpStream::connect(address).await?;
     socket::tune(&stream, &options.keepalive)?;
     let (read, mut write) = stream.into_split();
     let mut encoder = Encoder::new(options.dictionary).with_inline(options.inline).with_max_body(options.max_body);
     let mut decoder = Decoder::new(Side::Client, options.dictionary);
     let mut reader = RecordReader::with_limits(read, options.direct, options.max_body);
-    let role = hello.role;
 
     encoder.push(&Message::Hello { version: VERSION, features: options.features, token: token.to_owned(), hello })?;
     encoder.take().write_to(&mut write).await?;
@@ -152,15 +192,14 @@ pub async fn open(address: &str, token: &str, hello: Hello, options: Options) ->
     };
 
     let (calls, mut queue) = mpsc::channel::<Call>(options.queue.max(1));
-    let (client, demux, inbox) = ruvent::methods::client(Arc::new(Remote { calls, max_body: options.max_body }), role, options.inbox);
-    demux.route(Outbound::Welcome(welcome.clone())).await;
+    let (sink, outbound) = mpsc::channel::<Outbound>(options.inbox.max(1));
 
     let batch = options.batch.max(1);
     let mut writer = tokio::spawn(async move {
         let mut pending = Vec::with_capacity(batch);
         loop {
             if queue.recv_many(&mut pending, batch).await == 0 {
-                // Every clone of the client is gone.
+                // Every clone of the link is gone: what was queued is written.
                 let _ = write.shutdown().await;
                 return;
             }
@@ -177,6 +216,7 @@ pub async fn open(address: &str, token: &str, hello: Hello, options: Options) ->
 
     tokio::spawn(async move {
         let mut writer_done = false;
+        let mut detached = false;
         loop {
             let message = tokio::select! {
                 message = next(&mut reader, &mut decoder) => message,
@@ -185,23 +225,28 @@ pub async fn open(address: &str, token: &str, hello: Hello, options: Options) ->
                     break;
                 }
             };
-            let open = match message {
-                Ok(Some(Message::Outbound(outbound))) => demux.route(outbound).await,
-                _ => false,
-            };
-            if !open {
+            let Ok(Some(Message::Outbound(outbound))) = message else { break };
+            let bye = matches!(outbound, Outbound::Bye(_));
+            if sink.send(outbound).await.is_err() {
+                // Nobody reads any more; the writer ends when the link is dropped.
+                detached = true;
+                break;
+            }
+            if bye {
+                // 2.2: on `Bye` the client closes at once.
                 break;
             }
         }
-        // Stop the writer before failing the waiting calls, so nothing is sent after.
-        if !writer_done {
+        // The connection is over: stop the writer before `outbound` ends, so
+        // nothing is sent after its reader saw the end.
+        if !writer_done && !detached {
             writer.abort();
             let _ = writer.await;
         }
-        demux.close().await;
+        drop(sink);
     });
 
-    Ok(Connected { client, inbox, welcome, features })
+    Ok(RawConnection { link: Arc::new(Remote { calls, max_body: options.max_body }), outbound, welcome, features })
 }
 
 /// The next whole message. `None`: the server closed at a record boundary.

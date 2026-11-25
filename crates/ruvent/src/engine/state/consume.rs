@@ -100,6 +100,13 @@ impl State {
         join.count = count;
         join.bytes = bytes;
         join.signalled = false;
+        // A window said while full (0 included) and work it could take
+        // already waits is told `Pending` now, not only when more work
+        // arrives: a worker that joins a server with a backlog hears it
+        // (2.4, at most once per `Window`).
+        if !join.has_room() {
+            self.signal_waiting(&id);
+        }
         self.to_fill.push(id);
     }
 
@@ -192,6 +199,25 @@ impl State {
             }
         }
         None
+    }
+
+    /// `Pending` to one join whose lanes have an eligible head.
+    fn signal_waiting(&mut self, id: &JoinId) {
+        let Some(join) = self.joins.get(id) else { return };
+        if join.signalled {
+            return;
+        }
+        let lanes = join.lanes.clone();
+        for lane in lanes {
+            if self.head(&lane).is_some() {
+                if let Some(join) = self.joins.get_mut(id) {
+                    join.signalled = true;
+                }
+                let channel = id.1.clone();
+                self.send(id.0, Outbound::Pending { channel }, None);
+                return;
+            }
+        }
     }
 
     fn signal_pending(&mut self, lane: &LaneKey) {
