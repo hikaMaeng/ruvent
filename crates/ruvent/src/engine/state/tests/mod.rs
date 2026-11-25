@@ -1,0 +1,221 @@
+//! The ledger's rules, decided against the state machine alone: no task, no
+//! socket, no clock. A harness feeds it the time and the commit numbers.
+
+mod consume;
+mod invariants;
+mod observe;
+mod produce;
+mod recover;
+mod resources;
+mod timing;
+
+use super::slots::{Place, Slot};
+use super::*;
+use crate::engine::config::{ChannelRule, ChannelSettings, Durability, Grant, MemoryConfig, Pattern};
+use crate::engine::ops::{Assignment, ByeReason, FaultKind, Hello, Outbound, Refusal, Role, Target};
+use bytes::Bytes;
+use std::time::Duration;
+
+pub const P: SessionId = 1;
+pub const W1: SessionId = 2;
+pub const W2: SessionId = 3;
+pub const O: SessionId = 4;
+
+/// A ledger with a clock and commit numbers under the test's control.
+pub struct H {
+    pub s: State,
+    pub now: u64,
+    pub durable: u64,
+    pub carrying: u64,
+    /// Every record written so far, in order.
+    pub records: Vec<Record>,
+    /// The next sequence number per numbered connection.
+    seqs: HashMap<SessionId, u64>,
+}
+
+/// A configuration with a memory limit far from every test's size, so no
+/// pause happens unless the test asks for one.
+pub fn config() -> EngineConfig {
+    EngineConfig { memory: MemoryConfig { limit: Some(1 << 40), ..MemoryConfig::default() }, ..EngineConfig::default() }
+}
+
+pub fn strict() -> EngineConfig {
+    EngineConfig { durability: Durability::Strict, ..config() }
+}
+
+pub fn hello(role: Role, byte: u8) -> Hello {
+    Hello { role, credential: "svc".into(), producer: (role != Role::Observe).then_some([byte; 16]), nonce: [byte; 16], linger_ms: None, acks: true, channels: Vec::new() }
+}
+
+pub fn id(byte: u8) -> EventId {
+    let mut bytes = [byte; 16];
+    bytes[6] = 0x70 | (byte & 0x0f);
+    bytes[8] = 0x80 | (byte & 0x3f);
+    EventId(bytes)
+}
+
+pub fn work(channel: &str) -> Envelope {
+    Envelope::claimable(channel, "do", Bytes::from_static(b"p"))
+}
+
+/// What `session` was sent, in order (closes left out).
+pub fn sent(effects: &Effects, session: SessionId) -> Vec<Outbound> {
+    effects.sends.iter().filter(|send| send.session == session).filter_map(|send| send.message.clone()).collect()
+}
+
+pub fn assigned(effects: &Effects, session: SessionId) -> Vec<Assignment> {
+    sent(effects, session)
+        .into_iter()
+        .filter_map(|message| match message {
+            Outbound::Assign(assignment) => Some(assignment),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn committed(effects: &Effects, session: SessionId) -> Vec<u64> {
+    sent(effects, session)
+        .into_iter()
+        .filter_map(|message| match message {
+            Outbound::Committed { seq } => Some(seq),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn faults(effects: &Effects, session: SessionId) -> Vec<FaultKind> {
+    sent(effects, session)
+        .into_iter()
+        .filter_map(|message| match message {
+            Outbound::Fault { kind, .. } => Some(kind),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn closed(effects: &Effects, session: SessionId) -> bool {
+    effects.sends.iter().any(|send| send.session == session && send.message.is_none())
+}
+
+impl H {
+    pub fn with(config: EngineConfig, journaled: bool) -> H {
+        let mut s = State::new(&config, Box::new(V7));
+        let records = s.recover(Vec::new(), 0, 0, journaled).unwrap();
+        H { s, now: 0, durable: 1, carrying: 2, records, seqs: HashMap::new() }
+    }
+
+    /// No journal: every channel volatile, every operation committed when applied.
+    pub fn volatile() -> H {
+        Self::with(config(), false)
+    }
+
+    /// A journal; Scheduled or Strict.
+    pub fn durable(strict: bool) -> H {
+        Self::with(if strict { self::strict() } else { config() }, true)
+    }
+
+    /// The usual cast: a producer, two workers, an observer.
+    pub fn cast(mut self) -> H {
+        self.open(P, hello(Role::Produce, 1));
+        self.open(W1, hello(Role::Work, 2));
+        self.open(W2, hello(Role::Work, 3));
+        self.open(O, hello(Role::Observe, 4));
+        self
+    }
+
+    pub fn step(&mut self, apply: impl FnOnce(&mut State)) -> Effects {
+        self.s.begin(self.now, self.durable, self.carrying);
+        apply(&mut self.s);
+        let effects = self.s.take();
+        self.records.extend(effects.records.iter().cloned());
+        effects
+    }
+
+    /// The batch being filled is now on disk.
+    pub fn land(&mut self) -> Effects {
+        let landing = self.carrying;
+        self.carrying += 1;
+        self.durable = landing;
+        self.s.begin(self.now, self.durable, self.carrying);
+        self.s.landed(landing);
+        let effects = self.s.take();
+        self.records.extend(effects.records.iter().cloned());
+        effects
+    }
+
+    /// The engine hands the batch being filled to the writer; later records go
+    /// in the next one. Returns the handed batch's commit number.
+    pub fn launch(&mut self) -> u64 {
+        self.carrying += 1;
+        self.carrying - 1
+    }
+
+    /// The batches up to `commit` are on disk; the one being filled is not.
+    pub fn land_through(&mut self, commit: u64) -> Effects {
+        self.durable = commit;
+        self.s.begin(self.now, self.durable, self.carrying);
+        self.s.landed(commit);
+        let effects = self.s.take();
+        self.records.extend(effects.records.iter().cloned());
+        effects
+    }
+
+    pub fn advance(&mut self, millis: u64) -> Effects {
+        self.now += millis;
+        self.step(|_| {})
+    }
+
+    pub fn open(&mut self, session: SessionId, hello: Hello) -> Effects {
+        self.step(|state| state.open(session, hello))
+    }
+
+    pub fn close(&mut self, session: SessionId, unwritten: &[ClaimToken]) -> Effects {
+        let unwritten = unwritten.to_vec();
+        self.step(move |state| state.close(session, &unwritten))
+    }
+
+    pub fn call(&mut self, session: SessionId, call: Call) -> Effects {
+        self.step(|state| state.call(session, call))
+    }
+
+    pub fn next_seq(&mut self, session: SessionId) -> u64 {
+        let next = self.seqs.entry(session).or_insert(1);
+        let seq = *next;
+        *next += 1;
+        seq
+    }
+
+    /// `Register` from the producer `session`, under its next sequence number.
+    pub fn produce(&mut self, session: SessionId, event: Envelope) -> Effects {
+        let seq = self.next_seq(session);
+        self.call(session, Call::Register { seq: Some(seq), event })
+    }
+
+    /// Registers a claimable event with a fresh id and returns the id.
+    pub fn register(&mut self, channel: &str) -> EventId {
+        let id = EventId::new_v7();
+        self.produce(P, work(channel).with_id(id));
+        id
+    }
+
+    pub fn join(&mut self, session: SessionId, channel: &str, count: u32) -> Effects {
+        let mut effects = self.call(session, Call::Join { req: 1, channel: channel.into(), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+        let more = self.call(session, Call::Window { channel: channel.into(), count, bytes: 0 });
+        effects.sends.extend(more.sends);
+        effects
+    }
+
+    pub fn complete(&mut self, session: SessionId, assignment: &Assignment, follow_ups: Vec<Envelope>) -> Effects {
+        let seq = self.next_seq(session);
+        self.call(session, Call::Complete { seq, id: assignment.event.id, token: assignment.token, follow_ups })
+    }
+
+    /// The slot holding `id`.
+    pub fn slot(&self, id: EventId) -> Option<&Slot> {
+        self.s.slots.by_id(&id).and_then(|index| self.s.slots.get(index))
+    }
+
+    pub fn waiting(&self, channel: &str) -> usize {
+        self.s.lanes.iter().filter(|(key, _)| key.0.as_str() == channel).map(|(_, lane)| lane.queue.len()).sum()
+    }
+}

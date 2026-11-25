@@ -1,24 +1,30 @@
 //! The one event envelope.
 //!
 //! Claimable and dispatch events share one layout and differ only in the kind
-//! bit of `flags`. Marking a claim fills the claim block of the same envelope,
-//! in place, in the engine's resident copy. See
-//! `docs/proposals/event-server-redesign.md` §6.0.
+//! bit of `flags`. The ledger holds the metadata of a claimable event; the
+//! envelope is what goes in and out.
 //!
 //! ```text
-//!  fixed head, 27 bytes (every event)
-//!  ┌──────────── id 16 ────────────┬─ channel 4 ─┬── type 4 ──┬flags 1┬retry 2┐
-//!  work key, 8 bytes (claimable, when the server sends it)
-//!  ┌──── generation 4 · arrival 4 ────┐
-//!  claim block, 24 bytes (claimed, sent to the claimer)
-//!  ┌──── token 8 ────┬ claimer 4 ┬ worker 4 ┬──── deadline 8 ────┐
+//!  fixed head, 28 bytes (every event)
+//!  ┌──────────── id 16 ────────────┬─ channel 4 ─┬── type 4 ──┬flags 2┬failures 2┐
+//!  work key (claimable, when the server sends or journals it)
+//!  ┌── generation 4 · arrival varint ──┐
 //!  optional fields (only those whose flag bit is set)
-//!  reply 4 · correlation 16 · principal 4 · delegate 4
+//!  reply 4 · correlation 16 · principal 4 · delegate 4 · not_before varint · expires varint · group 16
 //!  payload: length 4 + bytes
 //! ```
 //!
 //! The byte layout is [`codec`]. Which of these blocks a record carries is
 //! fixed by the record kind, [`codec::Layout`].
+//!
+//! ## Times
+//!
+//! `not_before` and `expires` are milliseconds. In a registration request
+//! (and a follow-up) they are **durations from the moment the server applies
+//! it**. Everywhere the server holds or sends them — the ledger, the journal,
+//! an assignment — they are **absolute values on the server's accumulated
+//! uptime clock**, which survives restarts and does not count the time the
+//! server was down.
 
 pub mod codec;
 
@@ -26,6 +32,7 @@ use crate::names::Name;
 use bytes::Bytes;
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 /// A 16-byte event id in RFC 9562 octet order. All zero means "the server assigns one".
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -70,45 +77,55 @@ impl FromStr for EventId {
     }
 }
 
+/// The name of one retransmission buffer: a producer (2.3). 16 bytes.
+pub type ProducerId = [u8; 16];
+
+/// A `group` (B26): events of one group on a channel with `serialize_group`
+/// are assigned one at a time. The server compares it and never reads it.
+pub type GroupId = [u8; 16];
+
 /// What the server assigns to each registration: `(generation, arrival)`.
 ///
 /// It survives reclaims and restarts, a new registration under a reused id
-/// gets a new one, and the waiting order of the claimable queue is its
-/// numeric order. Field order matters: the derived ordering compares the
-/// generation first.
+/// gets a new one, and the waiting order of a lane is its numeric order. The
+/// generation rises only when the server starts; the arrival never wraps.
+/// Field order matters: the derived ordering compares the generation first.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub struct WorkKey {
     pub generation: u32,
-    pub arrival: u32,
+    pub arrival: u64,
 }
 
-/// Issued fresh at every claim and compared at completion: `(generation, sequence)`.
+/// The name of one attempt: issued fresh at every assignment and compared at
+/// completion, extension and release. Rises monotonically; workers use it as
+/// a fencing token.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub struct ClaimToken {
     pub generation: u32,
-    pub seq: u32,
-}
-
-/// The claim block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Claim {
-    pub token: ClaimToken,
-    /// Attribution number: names the `(service credential, connection)` the
-    /// claim was made under. Never reused within a generation.
-    pub claimer: u32,
-    /// Whatever the claimer tagged itself with. The server stores it and never reads it.
-    pub worker: u32,
-    /// Milliseconds on the server's monotonic clock.
-    pub deadline: u64,
+    pub seq: u64,
 }
 
 /// What happens to an event: one worker claims it, or it is sent to every subscriber.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
-    /// Waits in the claimable queue until a completion report removes it.
+    /// Waits until a completion removes it.
     Claimable,
     /// Handed to the channel's subscribers and gone in the same step.
     Dispatch,
+}
+
+/// A payload digest: its length and CRC32. "Is this the same content" is
+/// decided by it, never by reading the payload twice.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Digest {
+    pub len: u32,
+    pub crc: u32,
+}
+
+impl Digest {
+    pub fn of(payload: &[u8]) -> Self {
+        Digest { len: u32::try_from(payload.len()).unwrap_or(u32::MAX), crc: crc32fast::hash(payload) }
+    }
 }
 
 /// One event. Cloning copies the head and shares the names and the payload.
@@ -119,13 +136,11 @@ pub struct Envelope {
     /// The event's type, called `type` in the layout.
     pub event_type: Name,
     pub kind: Kind,
-    /// Times this event was reclaimed after a missed deadline. Saturates at
-    /// 65,535, which then means "65,535 or more".
-    pub retry: u16,
+    /// Failures counted against this event: lease expiries and releases that
+    /// said "this event failed". Saturates at 65,535.
+    pub failures: u16,
     /// Set by the server on claimable events.
     pub key: Option<WorkKey>,
-    /// Set while claimed.
-    pub claim: Option<Claim>,
     /// Channel for the result.
     pub reply: Option<Name>,
     /// Ties one flow together.
@@ -134,7 +149,17 @@ pub struct Envelope {
     pub principal: Option<Name>,
     /// The end user a proxy registered this on behalf of.
     pub delegate: Option<Name>,
+    /// Visible from this time on (see the module's "Times").
+    pub not_before: Option<u64>,
+    /// Removed, never assigned, from this time on (see the module's "Times").
+    pub expires: Option<u64>,
+    /// Serialization group (B26).
+    pub group: Option<GroupId>,
     pub payload: Bytes,
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Envelope {
@@ -144,13 +169,15 @@ impl Envelope {
             channel: channel.into(),
             event_type: event_type.into(),
             kind,
-            retry: 0,
+            failures: 0,
             key: None,
-            claim: None,
             reply: None,
             correlation: None,
             principal: None,
             delegate: None,
+            not_before: None,
+            expires: None,
+            group: None,
             payload: payload.into(),
         }
     }
@@ -185,30 +212,39 @@ impl Envelope {
         self
     }
 
-    pub fn is_claimed(&self) -> bool {
-        self.claim.is_some()
+    /// Visible only `delay` after the server applies the registration.
+    pub fn with_not_before(mut self, delay: Duration) -> Self {
+        self.not_before = Some(millis(delay));
+        self
     }
 
-    /// The `flags` byte this envelope encodes with, before a layout masks it.
-    pub fn flags(&self) -> u8 {
+    /// Removed if not completed within `life` of the server applying the registration.
+    pub fn with_expires(mut self, life: Duration) -> Self {
+        self.expires = Some(millis(life));
+        self
+    }
+
+    pub fn with_group(mut self, group: GroupId) -> Self {
+        self.group = Some(group);
+        self
+    }
+
+    /// The `flags` word this envelope encodes with, before a layout masks it.
+    pub fn flags(&self) -> u16 {
         let mut flags = 0;
-        if self.kind == Kind::Dispatch {
-            flags |= codec::KIND;
-        }
-        if self.claim.is_some() {
-            flags |= codec::CLAIMED;
-        }
-        if self.reply.is_some() {
-            flags |= codec::REPLY;
-        }
-        if self.correlation.is_some() {
-            flags |= codec::CORRELATION;
-        }
-        if self.principal.is_some() {
-            flags |= codec::PRINCIPAL;
-        }
-        if self.delegate.is_some() {
-            flags |= codec::DELEGATE;
+        for (present, bit) in [
+            (self.kind == Kind::Dispatch, codec::KIND),
+            (self.reply.is_some(), codec::REPLY),
+            (self.correlation.is_some(), codec::CORRELATION),
+            (self.principal.is_some(), codec::PRINCIPAL),
+            (self.delegate.is_some(), codec::DELEGATE),
+            (self.not_before.is_some(), codec::NOT_BEFORE),
+            (self.expires.is_some(), codec::EXPIRES),
+            (self.group.is_some(), codec::GROUP),
+        ] {
+            if present {
+                flags |= bit;
+            }
         }
         flags
     }
@@ -224,7 +260,7 @@ impl Envelope {
 
     /// The same event as a notice: the head and the work key, nothing else.
     pub fn notice(&self) -> Envelope {
-        Envelope { claim: None, reply: None, correlation: None, principal: None, delegate: None, payload: Bytes::new(), ..self.clone() }
+        Envelope { reply: None, correlation: None, principal: None, delegate: None, not_before: None, expires: None, group: None, payload: Bytes::new(), ..self.clone() }
     }
 }
 

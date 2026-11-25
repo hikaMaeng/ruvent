@@ -171,7 +171,7 @@ async fn write(directory: PathBuf, sequence: u64, events: Vec<Envelope>) -> io::
 }
 
 enum Got {
-    Event(Envelope),
+    Event(Box<Envelope>),
     Closed,
     Due,
 }
@@ -187,12 +187,12 @@ impl Collector {
             let mut sequence = 0u64;
             loop {
                 let got = if unit.is_empty() {
-                    receiver.recv().await.map_or(Got::Closed, Got::Event)
+                    receiver.recv().await.map_or(Got::Closed, |event| Got::Event(Box::new(event)))
                 } else {
                     let left = config.max_age.saturating_sub(started.elapsed());
                     // The unit's age limit: the one place this module waits on the clock.
                     match tokio::time::timeout(left, receiver.recv()).await {
-                        Ok(Some(event)) => Got::Event(event),
+                        Ok(Some(event)) => Got::Event(Box::new(event)),
                         Ok(None) => Got::Closed,
                         Err(_) => Got::Due,
                     }
@@ -202,7 +202,7 @@ impl Collector {
                     if unit.is_empty() {
                         started = tokio::time::Instant::now();
                     }
-                    unit.push(event);
+                    unit.push(*event);
                     if unit.len() < config.max_events.max(1) {
                         continue;
                     }

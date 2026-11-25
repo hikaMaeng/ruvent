@@ -88,12 +88,14 @@ fn workspace_library() -> Vec<Source> {
 /// | where | what it is |
 /// | --- | --- |
 /// | `ruvent/snapshot/mod.rs` `time::timeout(` | a snapshot unit's age limit |
-/// | `ruvent-client/worker/lane.rs` `time::timeout(` | a handler's lease: past it the run is abandoned |
+/// | `ruvent/engine/mod.rs` `time::sleep(` | the timing wheel: one one-shot sleep to the earliest lease end or visibility time, none when the wheel is empty (2.4) |
+/// | `ruvent-client/worker/lane.rs` `time::timeout(` | a handler's run limit: past it the run is abandoned (2.9; the lease is no longer the run limit) |
 /// | `ruvent-server/connection/mod.rs` `time::timeout(` | how long a new connection has to say hello |
 /// | `ruvent-proxy/hub/mod.rs` `time::timeout(` | how long an authentication worker has to answer |
 /// | `ruvent-proxy/hub/task.rs` `time::sleep(` | back-off before reconnecting to the upstream server |
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
+    ("ruvent/engine/mod.rs", "time::sleep(", 1),
     ("ruvent-client/worker/lane.rs", "time::timeout(", 1),
     ("ruvent-server/connection/mod.rs", "time::timeout(", 1),
     ("ruvent-proxy/hub/mod.rs", "time::timeout(", 1),
@@ -179,7 +181,7 @@ fn the_engine_state_has_one_owner() {
     assert_eq!(only(&sources, "State::new("), [("engine/mod.rs", 1)]);
     assert_eq!(only(&sources, "tokio::spawn(core.run())"), [("engine/mod.rs", 1)]);
     // No lock guards shared state in the core: the engine task owns it.
-    assert_eq!(only(&sources, "Mutex<"), [("methods/mod.rs", 1)], "only the client's table of calls waiting for an answer is shared");
+    assert_eq!(only(&sources, "Mutex<"), [("methods/mod.rs", 2)], "only the client's table of calls waiting for an answer, and its sequence counter held while a numbered call is handed over");
 }
 
 #[test]
@@ -207,7 +209,11 @@ fn the_wall_clock_is_read_once_in_the_core() {
     assert_eq!(only(&library(), "SystemTime::now"), [("snapshot/mod.rs", 1)], "it names snapshot files; deadlines use the monotonic clock");
 }
 
-/// The server keeps no policy: none of the old engine's policy words appear in the core.
+/// The server keeps no policy: none of the old engine's policy words appear in
+/// the core. One threshold is the exception (2.4, B6): `isolate_after`, the
+/// failure count at which an event moves to its isolation channel. The
+/// producer table's keep time is `linger` (not a retention), and the wheel's
+/// types avoid the word `Dead`.
 #[test]
 fn the_server_keeps_no_event_policy() {
     let mut violations = Vec::new();

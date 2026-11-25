@@ -1,55 +1,69 @@
 //! The envelope's byte layout. One body codec, used by the wire and the journal.
 //!
-//! Numbers are little-endian; `id` and `correlation` are 16 octets in RFC 9562
-//! order. Names travel as numbers from a dictionary the surrounding stream
-//! defines first; this module only asks for the number of a name and the name
-//! of a number. A decoder knows every length from the [`Layout`] and the
-//! `flags` byte alone.
+//! Fixed-width numbers are little-endian; `id`, `correlation` and `group` are
+//! 16 octets. The work key's arrival and the two times are unsigned LEB128
+//! varints ([`put_varint`]). Names travel as numbers from a dictionary the
+//! surrounding stream defines first; this module only asks for the number of
+//! a name and the name of a number. A decoder knows every length from the
+//! [`Layout`] and the `flags` word alone.
+//!
+//! ## `flags` (u16)
+//!
+//! | bit | meaning |
+//! | --- | --- |
+//! | 0 | kind: set means dispatch |
+//! | 1 | reserved (was "claimed" in format 2) |
+//! | 2 | `reply` present |
+//! | 3 | `correlation` present |
+//! | 4 | `principal` present |
+//! | 5 | `delegate` present |
+//! | 6 | `not_before` present |
+//! | 7 | `expires` present |
+//! | 8 | `group` present |
+//! | 9–15 | reserved, always zero |
 
-use super::{Claim, ClaimToken, Envelope, EventId, Kind, WorkKey};
+use super::{Envelope, EventId, Kind, WorkKey};
 use crate::names::Name;
 use bytes::{BufMut, Bytes};
 use std::fmt;
 
-/// Bit 0: the kind. Set means dispatch.
-pub const KIND: u8 = 1 << 0;
-/// Bit 1: claimed.
-pub const CLAIMED: u8 = 1 << 1;
-/// Bits 2 to 5: optional fields present.
-pub const REPLY: u8 = 1 << 2;
-pub const CORRELATION: u8 = 1 << 3;
-pub const PRINCIPAL: u8 = 1 << 4;
-pub const DELEGATE: u8 = 1 << 5;
-/// Bits 6 and 7: reserved, always zero.
-pub const RESERVED: u8 = 0b1100_0000;
-const OPTIONAL: u8 = REPLY | CORRELATION | PRINCIPAL | DELEGATE;
+pub const KIND: u16 = 1 << 0;
+pub const REPLY: u16 = 1 << 2;
+pub const CORRELATION: u16 = 1 << 3;
+pub const PRINCIPAL: u16 = 1 << 4;
+pub const DELEGATE: u16 = 1 << 5;
+pub const NOT_BEFORE: u16 = 1 << 6;
+pub const EXPIRES: u16 = 1 << 7;
+pub const GROUP: u16 = 1 << 8;
+const OPTIONAL: u16 = REPLY | CORRELATION | PRINCIPAL | DELEGATE | NOT_BEFORE | EXPIRES | GROUP;
+/// Bits no layout may set.
+pub const RESERVED: u16 = !(KIND | OPTIONAL);
+/// Fields that only mean something on a claimable event.
+const CLAIMABLE_ONLY: u16 = NOT_BEFORE | EXPIRES | GROUP;
 
-/// id 16 + channel 4 + type 4 + flags 1 + retry 2.
-pub const HEAD: usize = 27;
-/// generation 4 + arrival 4.
-pub const KEY: usize = 8;
-/// token 8 + claimer 4 + worker 4 + deadline 8.
-pub const CLAIM: usize = 24;
+/// id 16 + channel 4 + type 4 + flags 2 + failures 2.
+pub const HEAD: usize = 28;
 
 /// Which fields a record of each kind carries.
 ///
 /// | layout | carries | refused |
 /// | --- | --- | --- |
-/// | `Request` | head, optional, payload | claimed, retry ≠ 0, principal |
-/// | `Notice` | head, work key | claimed, any optional field |
-/// | `Claimed` | head, work key, claim block, optional, payload | not claimed, dispatch |
-/// | `Delivery` | head, optional, payload | claimed, retry ≠ 0, claimable |
-/// | `Journal` | head, work key, optional, payload | claimed, dispatch |
+/// | `Request` | head, optional, payload | failures ≠ 0, principal |
+/// | `Notice` | head, work key | any optional field |
+/// | `Assigned` | head, work key, optional, payload | dispatch |
+/// | `Delivery` | head, optional, payload | failures ≠ 0, claimable |
+/// | `Journal` | head, work key, optional, payload | dispatch |
 ///
-/// Every layout refuses dispatch together with claimed, and the reserved bits.
+/// Every layout refuses the reserved bits, and `not_before`, `expires` and
+/// `group` on a dispatch event.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
-    /// Registration requests (methods 1 and 2) and the follow-ups of a completion.
+    /// Registration requests and the follow-ups of a completion.
     Request,
     /// "There is claimable work": a notice, or one entry of a subscription's backlog.
     Notice,
-    /// The answer to a successful claim.
-    Claimed,
+    /// The event of an assignment or of an explicit claim's answer.
+    Assigned,
     /// A dispatch event handed to a subscriber.
     Delivery,
     /// The body of a journal registration.
@@ -58,7 +72,7 @@ pub enum Layout {
 
 impl Layout {
     pub fn has_key(self) -> bool {
-        matches!(self, Layout::Notice | Layout::Claimed | Layout::Journal)
+        matches!(self, Layout::Notice | Layout::Assigned | Layout::Journal)
     }
 
     pub fn has_optional(self) -> bool {
@@ -69,70 +83,36 @@ impl Layout {
         !matches!(self, Layout::Notice)
     }
 
+    fn has_failures(self) -> bool {
+        !matches!(self, Layout::Request | Layout::Delivery)
+    }
+
     /// The flag bits this layout writes; the rest are cleared on encode.
-    fn written(self) -> u8 {
+    fn written(self) -> u16 {
         match self {
             Layout::Notice => KIND,
-            Layout::Claimed => KIND | CLAIMED | OPTIONAL,
-            Layout::Request | Layout::Delivery | Layout::Journal => KIND | OPTIONAL,
+            _ => KIND | OPTIONAL,
         }
     }
 
-    fn check(self, flags: u8, retry: u16) -> Result<(), Malformed> {
+    fn check(self, flags: u16, failures: u16) -> Result<(), Malformed> {
         if flags & RESERVED != 0 {
             return Err(Malformed::Reserved);
         }
-        if flags & KIND != 0 && flags & CLAIMED != 0 {
-            return Err(Malformed::ClaimedDispatch);
-        }
         let dispatch = flags & KIND != 0;
-        let claimed = flags & CLAIMED != 0;
-        match self {
-            Layout::Request => {
-                if claimed {
-                    return Err(Malformed::Forbidden("claimed"));
-                }
-                if retry != 0 {
-                    return Err(Malformed::Forbidden("retry"));
-                }
-                if flags & PRINCIPAL != 0 {
-                    return Err(Malformed::Forbidden("principal"));
-                }
-            }
-            Layout::Notice => {
-                if claimed {
-                    return Err(Malformed::Forbidden("claimed"));
-                }
-                if flags & OPTIONAL != 0 {
-                    return Err(Malformed::Forbidden("optional field"));
-                }
-            }
-            Layout::Claimed => {
-                if !claimed {
-                    return Err(Malformed::Forbidden("unclaimed"));
-                }
-            }
-            Layout::Delivery => {
-                if claimed {
-                    return Err(Malformed::Forbidden("claimed"));
-                }
-                if retry != 0 {
-                    return Err(Malformed::Forbidden("retry"));
-                }
-                if !dispatch {
-                    return Err(Malformed::Forbidden("claimable"));
-                }
-            }
-            Layout::Journal => {
-                if claimed {
-                    return Err(Malformed::Forbidden("claimed"));
-                }
-                if dispatch {
-                    return Err(Malformed::Forbidden("dispatch"));
-                }
-            }
+        if dispatch && flags & CLAIMABLE_ONLY != 0 {
+            return Err(Malformed::Forbidden("timing or group on a dispatch event"));
         }
-        Ok(())
+        if !self.has_failures() && failures != 0 {
+            return Err(Malformed::Forbidden("failures"));
+        }
+        match self {
+            Layout::Request if flags & PRINCIPAL != 0 => Err(Malformed::Forbidden("principal")),
+            Layout::Notice if flags & OPTIONAL != 0 => Err(Malformed::Forbidden("optional field")),
+            Layout::Delivery if !dispatch => Err(Malformed::Forbidden("claimable")),
+            Layout::Assigned | Layout::Journal if dispatch => Err(Malformed::Forbidden("dispatch")),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -142,7 +122,6 @@ pub enum Malformed {
     /// Fewer bytes than the layout needs.
     Short,
     Reserved,
-    ClaimedDispatch,
     /// A field this layout does not allow.
     Forbidden(&'static str),
     /// A name number the stream never defined.
@@ -151,6 +130,8 @@ pub enum Malformed {
     Missing(&'static str),
     /// Bytes left over after the last record.
     Trailing,
+    /// A varint longer than ten bytes or past `u64`.
+    Overlong,
 }
 
 impl fmt::Display for Malformed {
@@ -158,38 +139,49 @@ impl fmt::Display for Malformed {
         match self {
             Malformed::Short => f.write_str("record cut short"),
             Malformed::Reserved => f.write_str("reserved flag bit set"),
-            Malformed::ClaimedDispatch => f.write_str("dispatch event marked claimed"),
             Malformed::Forbidden(what) => write!(f, "{what} not allowed in this record"),
             Malformed::UnknownName(number) => write!(f, "name {number} was never defined"),
             Malformed::Missing(what) => write!(f, "{what} missing"),
             Malformed::Trailing => f.write_str("bytes left over"),
+            Malformed::Overlong => f.write_str("varint too long"),
         }
     }
 }
 
 impl std::error::Error for Malformed {}
 
+/// Appends `value` as an unsigned LEB128 varint.
+pub fn put_varint(out: &mut impl BufMut, mut value: u64) {
+    while value >= 0x80 {
+        out.put_u8((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.put_u8(value as u8);
+}
+
+/// The encoded size of `value` as a varint.
+pub fn varint_len(value: u64) -> usize {
+    let bits = 64 - value.leading_zeros() as usize;
+    bits.div_ceil(7).max(1)
+}
+
 /// The encoded size of `envelope` in `layout`, not counting name definitions.
 pub fn size(envelope: &Envelope, layout: Layout) -> usize {
     let flags = envelope.flags() & layout.written();
     let mut size = HEAD;
     if layout.has_key() {
-        size += KEY;
+        size += 4 + varint_len(envelope.key.map_or(0, |key| key.arrival));
     }
-    if layout == Layout::Claimed && flags & CLAIMED != 0 {
-        size += CLAIM;
+    for (bit, width) in [(REPLY, 4), (CORRELATION, 16), (PRINCIPAL, 4), (DELEGATE, 4), (GROUP, 16)] {
+        if flags & bit != 0 {
+            size += width;
+        }
     }
-    if flags & REPLY != 0 {
-        size += 4;
+    if flags & NOT_BEFORE != 0 {
+        size += varint_len(envelope.not_before.unwrap_or_default());
     }
-    if flags & CORRELATION != 0 {
-        size += 16;
-    }
-    if flags & PRINCIPAL != 0 {
-        size += 4;
-    }
-    if flags & DELEGATE != 0 {
-        size += 4;
+    if flags & EXPIRES != 0 {
+        size += varint_len(envelope.expires.unwrap_or_default());
     }
     if layout.has_payload() {
         size += 4 + envelope.payload.len();
@@ -201,28 +193,20 @@ pub fn size(envelope: &Envelope, layout: Layout) -> usize {
 /// name; the caller has defined every name of [`Envelope::names`] beforehand.
 pub fn encode(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Name) -> u32, out: &mut impl BufMut) -> Result<(), Malformed> {
     let flags = envelope.flags() & layout.written();
-    let retry = if matches!(layout, Layout::Request | Layout::Delivery) { 0 } else { envelope.retry };
-    layout.check(flags, retry)?;
+    let failures = if layout.has_failures() { envelope.failures } else { 0 };
+    layout.check(flags, failures)?;
     if layout.has_payload() && envelope.payload.len() > u32::MAX as usize {
         return Err(Malformed::Forbidden("payload over 4 GiB"));
     }
     out.put_slice(&envelope.id.0);
     out.put_u32_le(number(&envelope.channel));
     out.put_u32_le(number(&envelope.event_type));
-    out.put_u8(flags);
-    out.put_u16_le(retry);
+    out.put_u16_le(flags);
+    out.put_u16_le(failures);
     if layout.has_key() {
         let key = envelope.key.ok_or(Malformed::Missing("work key"))?;
         out.put_u32_le(key.generation);
-        out.put_u32_le(key.arrival);
-    }
-    if layout == Layout::Claimed {
-        let claim = envelope.claim.ok_or(Malformed::Missing("claim block"))?;
-        out.put_u32_le(claim.token.generation);
-        out.put_u32_le(claim.token.seq);
-        out.put_u32_le(claim.claimer);
-        out.put_u32_le(claim.worker);
-        out.put_u64_le(claim.deadline);
+        put_varint(out, key.arrival);
     }
     if flags & REPLY != 0 {
         out.put_u32_le(number(envelope.reply.as_ref().unwrap_or(&envelope.channel)));
@@ -235,6 +219,15 @@ pub fn encode(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Name)
     }
     if flags & DELEGATE != 0 {
         out.put_u32_le(number(envelope.delegate.as_ref().unwrap_or(&envelope.channel)));
+    }
+    if flags & NOT_BEFORE != 0 {
+        put_varint(out, envelope.not_before.unwrap_or_default());
+    }
+    if flags & EXPIRES != 0 {
+        put_varint(out, envelope.expires.unwrap_or_default());
+    }
+    if flags & GROUP != 0 {
+        out.put_slice(&envelope.group.unwrap_or_default());
     }
     if layout.has_payload() {
         out.put_u32_le(envelope.payload.len() as u32);
@@ -288,8 +281,34 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap_or_default()))
     }
 
+    /// An unsigned LEB128 varint.
+    pub fn varint(&mut self) -> Result<u64, Malformed> {
+        let mut value = 0u64;
+        for index in 0..10 {
+            let byte = self.u8()?;
+            let part = u64::from(byte & 0x7f);
+            if index == 9 && part > 1 {
+                return Err(Malformed::Overlong);
+            }
+            value |= part << (7 * index);
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(Malformed::Overlong)
+    }
+
+    /// A varint that must fit in `u32`.
+    pub fn varint32(&mut self) -> Result<u32, Malformed> {
+        u32::try_from(self.varint()?).map_err(|_| Malformed::Overlong)
+    }
+
     pub fn id(&mut self) -> Result<EventId, Malformed> {
-        Ok(EventId(self.take(16)?.try_into().unwrap_or_default()))
+        Ok(EventId(self.bytes16()?))
+    }
+
+    pub fn bytes16(&mut self) -> Result<[u8; 16], Malformed> {
+        Ok(self.take(16)?.try_into().unwrap_or_default())
     }
 
     pub fn finish(&self) -> Result<(), Malformed> {
@@ -307,19 +326,17 @@ pub fn decode(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Opt
     let id = reader.id()?;
     let channel = lookup(reader.u32()?)?;
     let event_type = lookup(reader.u32()?)?;
-    let flags = reader.u8()?;
-    let retry = reader.u16()?;
-    layout.check(flags, retry)?;
-    let key = if layout.has_key() { Some(WorkKey { generation: reader.u32()?, arrival: reader.u32()? }) } else { None };
-    let claim = if layout == Layout::Claimed {
-        Some(Claim { token: ClaimToken { generation: reader.u32()?, seq: reader.u32()? }, claimer: reader.u32()?, worker: reader.u32()?, deadline: reader.u64()? })
-    } else {
-        None
-    };
+    let flags = reader.u16()?;
+    let failures = reader.u16()?;
+    layout.check(flags, failures)?;
+    let key = if layout.has_key() { Some(WorkKey { generation: reader.u32()?, arrival: reader.varint()? }) } else { None };
     let reply = if flags & REPLY != 0 { Some(lookup(reader.u32()?)?) } else { None };
     let correlation = if flags & CORRELATION != 0 { Some(reader.id()?) } else { None };
     let principal = if flags & PRINCIPAL != 0 { Some(lookup(reader.u32()?)?) } else { None };
     let delegate = if flags & DELEGATE != 0 { Some(lookup(reader.u32()?)?) } else { None };
+    let not_before = if flags & NOT_BEFORE != 0 { Some(reader.varint()?) } else { None };
+    let expires = if flags & EXPIRES != 0 { Some(reader.varint()?) } else { None };
+    let group = if flags & GROUP != 0 { Some(reader.bytes16()?) } else { None };
     let payload = if layout.has_payload() {
         let length = reader.u32()? as usize;
         reader.take_shared(length)?
@@ -327,5 +344,5 @@ pub fn decode(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Opt
         Bytes::new()
     };
     let kind = if flags & KIND != 0 { Kind::Dispatch } else { Kind::Claimable };
-    Ok(Envelope { id, channel, event_type, kind, retry, key, claim, reply, correlation, principal, delegate, payload })
+    Ok(Envelope { id, channel, event_type, kind, failures, key, reply, correlation, principal, delegate, not_before, expires, group, payload })
 }

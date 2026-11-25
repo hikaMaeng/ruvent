@@ -1,19 +1,21 @@
 //! ruvent — the event server core.
 //!
-//! The server offers seven methods and nothing else: register a claimable
-//! event, register a dispatch event, claim, complete, delete, subscribe,
-//! unsubscribe. Claimable events wait in one queue until a completion report
-//! removes them; dispatch events are handed to the subscribers of their
-//! channel and are gone in the same step. Both use one envelope.
+//! One server is one ledger (0.3). Connections come in three roles (2.2):
+//! production (register and delete, numbered by a producer sequence and
+//! acknowledged cumulatively once committed), work (join a channel, open a
+//! window, receive assignments, complete, extend, release, claim by id) and
+//! observation (subscribe, statistics, drain). Claimable events wait in
+//! per-(channel, type) lanes until a completion removes them; dispatch events
+//! go to the subscribers of their channel and are gone in the same step. Both
+//! use one envelope.
 //!
-//! The server does not tell workers, proxies and clients apart: each is a
-//! connection that calls the methods, in-process ([`methods::connect`]) or
-//! over a socket (`ruvent-client`). Retry limits, failure handling and
-//! follow-ups are the workers' logic, not the server's.
+//! Retry counts, back-off and follow-ups are the workers' logic; the server
+//! keeps four things: lease ends, visibility times, expiries and one failure
+//! threshold (`isolate_after`).
 //!
-//! Journaling is not a method. The engine journals the claimable queue so a
-//! restart reloads what was still owed, and optionally collects chosen
-//! channels into operational snapshot files.
+//! Journaling is not an operation. The engine journals the claimable events
+//! of durable channels and the producer sequence table so a restart carries
+//! on, and optionally collects chosen channels into operational snapshot files.
 
 pub mod engine;
 pub mod envelope;
@@ -24,11 +26,11 @@ pub mod snapshot;
 
 pub use async_trait::async_trait;
 pub use bytes::Bytes;
-pub use engine::config::{Compaction, Durability, EngineConfig, Grant, Grants, Method};
-pub use engine::ops::{Call, Outbound, Refusal, Reply, SessionId, DELETED, DELETE_FAILED};
+pub use engine::config::{ChannelConfig, ChannelRule, ChannelSettings, Compaction, Durability, EngineConfig, Grant, Grants, MaxBacklog, MemoryConfig, Method, ProducerConfig, StorageConfig};
+pub use engine::ops::{Assignment, ByeReason, Call, ChannelStat, Counters, FaultKind, Hello, IdleLane, Outbound, Refusal, Role, RootStat, SessionId, Stats, Target, Welcome, DELETED, DELETE_FAILED};
 pub use engine::{Closed, Engine, EngineError, Session};
-pub use envelope::{Claim, ClaimToken, Envelope, EventId, Kind, WorkKey};
-pub use journal::{FileJournal, Journal, Record, Recovered, Volatile};
-pub use methods::{connect, Backlog, Client, Demux, Inbox, Incoming, Link, Methods};
+pub use envelope::{ClaimToken, Digest, Envelope, EventId, GroupId, Kind, ProducerId, WorkKey};
+pub use journal::{Batch, FileJournal, Journal, Location, Record, Recovered, Volatile};
+pub use methods::{client, connect, Backlog, Client, ConnectError, Demux, Inbox, Incoming, Link, Methods};
 pub use names::{Name, Pattern};
 pub use snapshot::SnapshotConfig;

@@ -1,8 +1,13 @@
 //! One test per stated requirement. The quote above each test is the
 //! requirement as it was given; the test is how it is observed.
+//!
+//! Where the approved overhaul plan (`docs/proposals/library-overhaul.md`)
+//! replaced an earlier requirement — reclaim no longer issues a new id (C3),
+//! a connection now has a role (2.2) — the test quotes the statement the new
+//! behaviour serves, not the replaced one.
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{connect, Bytes, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Inbox, Incoming, Methods, Recovered, Refusal, DELETED, DELETE_FAILED};
+use ruvent::{connect, Assignment, Bytes, Client, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Hello, Inbox, Incoming, Methods, Recovered, Target, DELETED, DELETE_FAILED};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,6 +31,14 @@ async fn next(inbox: &mut Inbox) -> Incoming {
     }
 }
 
+async fn assignment(inbox: &mut Inbox) -> Assignment {
+    loop {
+        if let Incoming::Assign(assignment) = next(inbox).await {
+            return assignment;
+        }
+    }
+}
+
 async fn quiet(inbox: &mut Inbox) -> bool {
     loop {
         match tokio::time::timeout(Duration::from_millis(80), inbox.recv()).await {
@@ -36,83 +49,80 @@ async fn quiet(inbox: &mut Inbox) -> bool {
     }
 }
 
-/// > 1. 착수가능한 이벤트 등록
-/// > 2. 발송전용 이벤트 등록
-/// > 3. 특정 이벤트 착수 마킹
-/// > 4. 특정 이벤트 완료보고
+async fn roles(engine: &Engine, credential: &str) -> ((Client, Inbox), (Client, Inbox), (Client, Inbox)) {
+    (connect(engine, Hello::producer(credential), 64).await.unwrap(), connect(engine, Hello::worker(credential), 64).await.unwrap(), connect(engine, Hello::observer(credential), 64).await.unwrap())
+}
+
 /// > 5. 이벤트 삭제(아직 대기열에 있어야함) 이미 발송되거나 착수되면 발송용 삭제 실패 이벤트 등록. 성공시에도 발송용 성공이벤트 등록
-/// > 6. 특정 채널 구독 등록
-/// > 7. 특정 채널 구독 취소
 #[tokio::test]
-async fn the_server_offers_exactly_seven_methods_and_deletion_always_announces_its_outcome() {
+async fn deletion_removes_only_a_waiting_event_and_always_announces_its_outcome() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (client, mut inbox) = connect(&engine, "svc", 64).await.unwrap();
-    client.subscribe("results".into(), None).await.unwrap();
-    let (waiting, _) = client.register_claimable(work()).await.unwrap();
-    let (claimed, _) = client.register_claimable(work()).await.unwrap();
-    client.claim(claimed, 1, Duration::from_secs(30)).await.unwrap();
-    let sent = client.register_dispatch(Envelope::dispatch("feed", "x", Bytes::new())).await.unwrap();
-    for (target, removed, announced) in [(waiting, true, DELETED), (claimed, false, DELETE_FAILED), (sent, false, DELETE_FAILED)] {
+    let ((producer, _), (worker, mut assignments), (observer, mut inbox)) = roles(&engine, "svc").await;
+    observer.subscribe(Target::Channel("results".into()), None).await.unwrap();
+    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    let (_, waiting) = producer.register(work()).await.unwrap();
+    worker.window("work".into(), 1, 0).await.unwrap();
+    let claimed = assignment(&mut assignments).await.event.id;
+    let (_, sent) = producer.register(Envelope::dispatch("feed", "x", Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
+    let (_, second) = producer.register(work()).await.unwrap();
+    assert_ne!(second, claimed);
+    for (target, announced) in [(claimed, DELETE_FAILED), (sent, DELETE_FAILED)] {
         let tag = EventId::new_v7();
-        assert_eq!(client.delete(target, "results".into(), tag, None).await.unwrap(), removed);
+        producer.delete(target, "results".into(), tag, None).await.unwrap();
         let Incoming::Delivery(outcome) = next(&mut inbox).await else { panic!("no outcome event") };
         assert_eq!((&*outcome.event_type, outcome.correlation, outcome.kind), (announced, Some(tag), ruvent::Kind::Dispatch));
     }
-    client.unsubscribe("results".into()).await.unwrap();
-    assert!(quiet(&mut inbox).await);
-    // The contract has these seven methods and no others: `Methods` is the whole API a connection gets.
-    fn _seven<M: Methods>(_: &M) {}
-    _seven(&client);
+    let _ = waiting;
+    let tag = EventId::new_v7();
+    producer.delete(second, "results".into(), tag, None).await.unwrap();
+    let Incoming::Delivery(outcome) = next(&mut inbox).await else { panic!("no outcome event") };
+    assert_eq!((&*outcome.event_type, outcome.correlation), (DELETED, Some(tag)));
 }
 
 /// > 2. 착수마킹(이벤트 자체에 상태를 직접 변경):가져간 워커정보를 비롯한 착수정보 기록. 착수시에 타임아웃이 일어날 시간을 워커가 마킹함
 /// > 3. 완료보고(큐에서 지움)
 #[tokio::test]
-async fn a_claim_records_the_worker_and_its_deadline_in_the_event_and_completion_removes_it() {
+async fn a_claim_carries_the_attempt_and_the_time_out_the_worker_chose_and_completion_removes_it() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (client, _) = connect(&engine, "svc", 64).await.unwrap();
-    let (id, _) = client.register_claimable(work()).await.unwrap();
-    let claimed = client.claim(id, 42, Duration::from_secs(90)).await.unwrap();
-    let claim = claimed.claim.expect("the claim is in the event itself");
-    assert!(claimed.is_claimed());
-    assert_eq!(claim.worker, 42);
-    assert!(claim.deadline >= 90_000, "the worker chose the timeout: {}", claim.deadline);
-    client.complete(id, claim.token, Vec::new()).await.unwrap();
-    assert!(client.subscribe("work".into(), None).await.unwrap().notices.is_empty(), "completion removed it from the queue");
+    let ((producer, _), (worker, _), (observer, _)) = roles(&engine, "svc").await;
+    let (_, id) = producer.register(work()).await.unwrap();
+    let before = engine.uptime();
+    let claimed = worker.claim(id, Duration::from_secs(90)).await.unwrap();
+    assert_eq!(claimed.lease_ms, 90_000, "the worker chose the time-out");
+    assert!(claimed.until >= before + 90_000, "the time it runs out at: {}", claimed.until);
+    assert_eq!(claimed.event.id, id);
+    let seq = worker.complete(id, claimed.token, Vec::new()).await.unwrap();
+    worker.committed(seq).await.unwrap();
+    assert!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.is_empty(), "completion removed it from the queue");
 }
 
-/// > 4. 지연확인 -> 재시도 카운트 증가 후 대기 상태로 전환. 이때 이벤트 ID는 재발급된다.
-/// > 착수이벤트의 타임아웃은 일반적으로 스케줄러가 필요없어.
-/// > 활성화된 이벤트서버는 지속적으로 이벤트가 수신되기 때문에 이벤트 등록시점에 착수이벤트 중 시간이 초과된것을 일괄 미착수 상태로 돌리기만 하면 되기 때문이야. 단 이 때 이벤트 고유번호를 업데이트한다.
-/// > 그러면 타임아웃 이후에 워커가 완료보고해도 그 이벤트 번호에 해당되는 이벤트는 존재하지 않기 때문에 무시하면 된다.
+/// > 6. 하지만 등록, 착수, 완료는 멱등을 보장해야한다.
 #[tokio::test(start_paused = true)]
-async fn a_timed_out_claim_is_returned_to_waiting_at_the_next_registration_with_a_new_id_and_the_late_report_is_ignored() {
+async fn registration_claim_and_completion_are_idempotent_and_a_reclaimed_event_keeps_its_id() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (client, mut inbox) = connect(&engine, "svc", 64).await.unwrap();
-    client.subscribe("work".into(), None).await.unwrap();
-    let mut ids = Vec::new();
-    for _ in 0..3 {
-        ids.push(client.register_claimable(work()).await.unwrap().0);
-        let _ = next(&mut inbox).await;
-    }
-    let mut tokens = Vec::new();
-    for id in &ids {
-        tokens.push(client.claim(*id, 1, Duration::from_secs(1)).await.unwrap().claim.unwrap().token);
-    }
-    tokio::time::advance(Duration::from_secs(60)).await;
-    assert!(quiet(&mut inbox).await, "without a registration nothing happens: there is no scheduler");
-    client.register_dispatch(Envelope::dispatch("elsewhere", "x", Bytes::new())).await.unwrap();
-    let mut renewed = Vec::new();
-    for _ in 0..3 {
-        let Incoming::Notice(notice) = next(&mut inbox).await else { panic!("expected a renewed notice") };
-        assert_eq!(notice.retry, 1);
-        assert!(!ids.contains(&notice.id), "a new id");
-        renewed.push(notice.id);
-    }
-    for (id, token) in ids.iter().zip(tokens) {
-        assert_eq!(client.complete(*id, token, Vec::new()).await, Err(Refusal::Missing), "the old number no longer exists");
-    }
-    assert_eq!(client.subscribe("work".into(), None).await.unwrap().notices.len(), 3, "all three are waiting again");
+    let ((producer, _), (worker, mut assignments), (observer, _)) = roles(&engine, "svc").await;
+    // Registration: the same id and content again is not a second event.
+    let event = work().with_id(EventId::new_v7());
+    producer.register(event.clone()).await.unwrap();
+    producer.register_committed(event.clone()).await.unwrap();
+    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 1);
+    // A lease that runs out gives the event back under the same id; the late report has no effect.
+    worker.join("work".into(), Vec::new(), Duration::from_secs(1), false).await.unwrap();
+    worker.window("work".into(), 1, 0).await.unwrap();
+    let first = assignment(&mut assignments).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let (other, mut others) = connect(&engine, Hello::worker("svc"), 64).await.unwrap();
+    other.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    other.window("work".into(), 1, 0).await.unwrap();
+    let second = assignment(&mut others).await;
+    assert_eq!(second.event.id, event.id, "the logical id does not change");
+    let late = worker.complete(event.id, first.token, Vec::new()).await.unwrap();
+    worker.committed(late).await.unwrap();
+    assert_eq!(observer.stats().await.unwrap().claimed, 1, "the stale completion changed nothing");
+    // Completion: the right attempt removes it once.
+    let done = other.complete(event.id, second.token, Vec::new()).await.unwrap();
+    other.committed(done).await.unwrap();
+    assert_eq!(observer.stats().await.unwrap().claimed + observer.stats().await.unwrap().waiting, 0);
 }
 
 /// > 5. 워커의 실패시 이벤트는 완료처리됨. 이후 처리를 위한 것은 새로운 이벤트로 등록됨
@@ -120,33 +130,38 @@ async fn a_timed_out_claim_is_returned_to_waiting_at_the_next_registration_with_
 #[tokio::test]
 async fn a_failure_is_a_completion_and_what_follows_is_new_events_the_worker_chose() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (client, mut inbox) = connect(&engine, "svc", 64).await.unwrap();
-    client.subscribe("failures".into(), None).await.unwrap();
-    client.subscribe("retry".into(), None).await.unwrap();
-    let (id, _) = client.register_claimable(work()).await.unwrap();
-    let claimed = client.claim(id, 1, Duration::from_secs(30)).await.unwrap();
+    let ((producer, _), (worker, mut assignments), (observer, mut inbox)) = roles(&engine, "svc").await;
+    observer.subscribe(Target::Channel("failures".into()), None).await.unwrap();
+    observer.subscribe(Target::Channel("retry".into()), None).await.unwrap();
+    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    worker.window("work".into(), 1, 0).await.unwrap();
+    let (_, id) = producer.register(work()).await.unwrap();
+    let claimed = assignment(&mut assignments).await;
     // The worker failed, and decided: report it, and try again as a new event.
-    let follow_ups = vec![Envelope::dispatch("failures", "work.failed", Bytes::from_static(b"boom")), Envelope::claimable("retry", "do", claimed.payload.clone())];
-    client.complete(id, claimed.claim.unwrap().token, follow_ups).await.unwrap();
+    let follow_ups = vec![Envelope::dispatch("failures", "work.failed", Bytes::from_static(b"boom")), Envelope::claimable("retry", "do", claimed.event.payload.clone())];
+    worker.complete(id, claimed.token, follow_ups).await.unwrap();
     let mut seen = [next(&mut inbox).await, next(&mut inbox).await];
     seen.sort_by_key(|incoming| matches!(incoming, Incoming::Notice(_)));
     assert!(matches!(&seen[0], Incoming::Delivery(event) if &*event.event_type == "work.failed"));
-    assert!(matches!(&seen[1], Incoming::Notice(event) if event.retry == 0 && event.id != id));
-    assert!(client.subscribe("work".into(), None).await.unwrap().notices.is_empty(), "the failed event itself is completed");
+    assert!(matches!(&seen[1], Incoming::Notice(event) if event.failures == 0 && event.id != id));
+    assert!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.is_empty(), "the failed event itself is completed");
 }
 
 /// > ID가 같은 이벤트는 등록될 수 없고 ID는 영원히 고유하지 않아도 충분하지만 비용이 저렴한 UUID7 등을 쓰는 것이 성능에 문제가 없다면 사용한다.
 #[tokio::test]
-async fn an_id_in_the_queue_cannot_be_registered_again_ids_are_uuidv7_and_a_departed_id_may_return() {
+async fn an_active_id_is_not_registered_twice_ids_are_uuidv7_and_a_departed_id_may_return() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (client, _) = connect(&engine, "svc", 64).await.unwrap();
-    let (id, _) = client.register_claimable(work()).await.unwrap();
+    let ((producer, mut producer_inbox), (worker, _), (observer, _)) = roles(&engine, "svc").await;
+    let (_, id) = producer.register_committed(work()).await.unwrap();
     assert_eq!(id.0[6] >> 4, 7, "a UUIDv7");
-    assert_eq!(client.register_claimable(work().with_id(id)).await, Err(Refusal::Duplicate));
-    assert_eq!(client.register_dispatch(Envelope::dispatch("x", "t", Bytes::new()).with_id(id)).await, Err(Refusal::Duplicate));
-    let token = client.claim(id, 1, Duration::from_secs(5)).await.unwrap().claim.unwrap().token;
-    client.complete(id, token, Vec::new()).await.unwrap();
-    assert_eq!(client.register_claimable(work().with_id(id)).await.unwrap().0, id, "not unique forever: once gone it may be used again");
+    producer.register_committed(Envelope::claimable("work", "do", Bytes::from_static(b"other")).with_id(id)).await.unwrap();
+    assert!(matches!(next(&mut producer_inbox).await, Incoming::Fault { kind: ruvent::FaultKind::IdConflict, .. }), "other content under an active id is a conflict, told");
+    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 1);
+    let claimed = worker.claim(id, Duration::from_secs(5)).await.unwrap();
+    let seq = worker.complete(id, claimed.token, Vec::new()).await.unwrap();
+    worker.committed(seq).await.unwrap();
+    producer.register_committed(work().with_id(id)).await.unwrap();
+    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices[0].id, id, "not unique forever: once gone it may be used again");
 }
 
 /// > 이벤트에는 발송 전용 이벤트와 워커가 접수할 이벤트가 다르다. 발송전용 이벤트는 발송을 통해 큐에서 제거되어야하기 때문이다. 아니면 언제 큐에서 제거할지 판단하기 어렵다.
@@ -154,15 +169,14 @@ async fn an_id_in_the_queue_cannot_be_registered_again_ids_are_uuidv7_and_a_depa
 #[tokio::test]
 async fn a_dispatch_event_goes_to_whoever_is_connected_at_that_moment_and_is_gone() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (sender, _) = connect(&engine, "svc", 64).await.unwrap();
-    let (early, mut early_inbox) = connect(&engine, "svc", 64).await.unwrap();
-    let (late, mut late_inbox) = connect(&engine, "svc", 64).await.unwrap();
-    early.subscribe("feed".into(), None).await.unwrap();
-    let id = sender.register_dispatch(Envelope::dispatch("feed", "news", Bytes::new())).await.unwrap();
-    assert!(matches!(next(&mut early_inbox).await, Incoming::Delivery(event) if event.id == id));
-    let backlog = late.subscribe("feed".into(), None).await.unwrap();
+    let (sender, _) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
+    let (early, mut early_inbox) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
+    let (late, mut late_inbox) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
+    early.subscribe(Target::Channel("feed".into()), None).await.unwrap();
+    sender.register(Envelope::dispatch("feed", "news", Bytes::new())).await.unwrap();
+    assert!(matches!(next(&mut early_inbox).await, Incoming::Delivery(event) if &*event.event_type == "news"));
+    let backlog = late.subscribe(Target::Channel("feed".into()), None).await.unwrap();
     assert!(backlog.notices.is_empty() && quiet(&mut late_inbox).await, "sent once to who was there, kept nowhere");
-    assert_eq!(sender.delete(id, "feed".into(), EventId::new_v7(), None).await, Ok(false), "already sent: nothing to delete");
 }
 
 /// > 저널링은 메소드가 아니다. 서버는 저널링을 유지하고 비정상적, 정상적 종료 후 다시 재기동할 때 미처리 이벤트를 메모리에 로드하기 위한 목적을 최우선으로 저널링을 운영한다. 그외에는 서버 설정에 따라 특정 채널이나 이벤트를 일정 단위로 모아 스냅샷화하여 저장한다. 이런 기능은 메소드가 아니다.
@@ -174,15 +188,16 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
         runtime.block_on(async {
             let (journal, recovered) = FileJournal::open(&path).unwrap();
             let engine = Engine::start(EngineConfig { durability: Durability::Strict, ..EngineConfig::default() }, journal, recovered).await.unwrap();
-            let (client, _) = connect(&engine, "svc", 64).await.unwrap();
+            let ((producer, _), (worker, _), _) = roles(&engine, "svc").await;
             for _ in 0..3 {
-                client.register_claimable(work()).await.unwrap();
+                producer.register_committed(work()).await.unwrap();
             }
-            let (done, _) = client.register_claimable(work()).await.unwrap();
-            let token = client.claim(done, 1, Duration::from_secs(5)).await.unwrap().claim.unwrap().token;
-            client.complete(done, token, Vec::new()).await.unwrap();
+            let (_, done) = producer.register_committed(work()).await.unwrap();
+            let claimed = worker.claim(done, Duration::from_secs(5)).await.unwrap();
+            let seq = worker.complete(done, claimed.token, Vec::new()).await.unwrap();
+            worker.committed(seq).await.unwrap();
             if !crash {
-                drop(client);
+                drop((producer, worker));
                 engine.shutdown().await.unwrap();
             }
         });
@@ -191,8 +206,8 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
         runtime.block_on(async {
             let (journal, recovered) = FileJournal::open(&path).unwrap();
             let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
-            let (client, _) = connect(&engine, "svc", 64).await.unwrap();
-            assert_eq!(client.subscribe("work".into(), None).await.unwrap().notices.len(), 3, "crash={crash}: the three unprocessed events, not the completed one");
+            let (observer, _) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
+            assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 3, "crash={crash}: the three unprocessed events, not the completed one");
         });
     }
 }
@@ -201,32 +216,33 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
 /// > 발송전용 이벤트도 이벤트 자체는 한가지 타입의 엔벨롭만 사용한다.
 /// > 특히 서버나 클라이언트를 특정하지 않기 때문에 큰 내용은 필요없다
 #[tokio::test]
-async fn one_small_envelope_carries_id_channel_retry_and_the_claim_for_both_kinds() {
+async fn one_small_envelope_carries_id_channel_failures_and_the_attempt_for_both_kinds() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (client, mut inbox) = connect(&engine, "svc", 64).await.unwrap();
-    let (id, _) = client.register_claimable(Envelope::claimable("work", "do", Bytes::new())).await.unwrap();
-    let claimed: Envelope = client.claim(id, 7, Duration::from_secs(30)).await.unwrap();
-    assert_eq!((claimed.id, &*claimed.channel, claimed.retry, claimed.is_claimed()), (id, "work", 0, true));
-    assert_eq!(codec::size(&claimed, Layout::Claimed) - codec::size(&Envelope { principal: None, ..claimed.clone() }, Layout::Claimed), 4, "the principal is the only optional field the server adds");
-    assert_eq!(codec::size(&Envelope { principal: None, ..claimed.clone() }, Layout::Claimed), 63, "the claim information is 24 bytes of small numbers, no names or addresses");
-    client.subscribe("feed".into(), None).await.unwrap();
-    client.register_dispatch(Envelope::dispatch("feed", "news", Bytes::new())).await.unwrap();
+    let ((producer, _), (worker, _), (observer, mut inbox)) = roles(&engine, "svc").await;
+    let (_, id) = producer.register(Envelope::claimable("work", "do", Bytes::new())).await.unwrap();
+    let claimed = worker.claim(id, Duration::from_secs(30)).await.unwrap();
+    assert_eq!((claimed.event.id, &*claimed.event.channel, claimed.event.failures), (id, "work", 0));
+    assert!(claimed.token.seq < u64::MAX && claimed.until > 0, "the attempt: a token and the time it runs out at");
+    let bare = Envelope { principal: None, ..claimed.event.clone() };
+    assert_eq!(codec::size(&bare, Layout::Assigned), 37, "28-byte head, a 5-byte work key, a 4-byte payload length: no names or addresses");
+    observer.subscribe(Target::Channel("feed".into()), None).await.unwrap();
+    producer.register(Envelope::dispatch("feed", "news", Bytes::new())).await.unwrap();
     let Incoming::Delivery(sent) = next(&mut inbox).await else { panic!() };
-    // The same type, `Envelope`, for a dispatch event; 31 bytes without the server's principal.
+    // The same type, `Envelope`, for a dispatch event; 32 bytes without the server's principal.
     let sent: Envelope = sent;
-    assert_eq!(codec::size(&Envelope { principal: None, ..sent }, Layout::Delivery), 31);
+    assert_eq!(codec::size(&Envelope { principal: None, ..sent }, Layout::Delivery), 32);
 }
 
 /// > 변하지 않는 원칙중에 하나는 이벤트는 반드시 하나의 워커가 가져간다는것이다. 혹은 발송되거나. 만약 둘이상의 워커나 프로세스에 할당되어야하면 이벤트 자체를 여러개 발급해야해.
 #[tokio::test]
 async fn of_many_workers_racing_for_one_event_exactly_one_takes_it() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let (producer, _) = connect(&engine, "svc", 64).await.unwrap();
-    let (id, _) = producer.register_claimable(work()).await.unwrap();
+    let (producer, _) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
+    let (_, id) = producer.register_committed(work()).await.unwrap();
     let mut racers = Vec::new();
-    for worker in 0..16u32 {
-        let (client, _) = connect(&engine, "svc", 64).await.unwrap();
-        racers.push(tokio::spawn(async move { client.claim(id, worker, Duration::from_secs(30)).await.is_ok() }));
+    for _ in 0..16 {
+        let (client, _) = connect(&engine, Hello::worker("svc"), 64).await.unwrap();
+        racers.push(tokio::spawn(async move { client.claim(id, Duration::from_secs(30)).await.is_ok() }));
     }
     let mut winners = 0;
     for racer in racers {
@@ -238,20 +254,23 @@ async fn of_many_workers_racing_for_one_event_exactly_one_takes_it() {
 /// > 근데 말야..아주 엄밀하게 워커서버란 존재하지 않아. 왜냐면 이벤트 서버입장에서는 딱히 클라이언트와 워커서버를 구분할 이유가 없단말이지.
 /// > 그저 메소드로 이벤트 등록, 채널 수신, 이벤트착수, 이벤트 완료 라는 기능을 제공해줄 뿐이고 다 자기에게 달라붙은 클라이언트일뿐이야. 인프로세스 워커조차 메소드로 호출하고 통신층을 안거칠 뿐인거지
 #[tokio::test]
-async fn every_connection_gets_the_same_methods_and_the_server_never_asks_what_it_is() {
+async fn any_program_may_open_any_role_and_the_server_never_asks_what_it_is() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    // A "client", a "worker" and a "proxy" are three connections opened the same way.
-    let (client, _) = connect(&engine, "client", 64).await.unwrap();
-    let (worker, _) = connect(&engine, "worker", 64).await.unwrap();
-    let (proxy, mut proxied) = connect(&engine, "proxy", 64).await.unwrap();
-    proxy.subscribe("done".into(), None).await.unwrap();
-    let (id, _) = client.register_claimable(work()).await.unwrap();
-    let token = worker.claim(id, 1, Duration::from_secs(30)).await.unwrap().claim.unwrap().token;
-    worker.complete(id, token, vec![Envelope::dispatch("done", "ok", Bytes::new())]).await.unwrap();
+    // A "client", a "worker" and a "proxy" credential each open every role the same way.
+    let ((client, _), (_, _), (_, _)) = roles(&engine, "client").await;
+    let ((_, _), (worker, mut assigned), (_, _)) = roles(&engine, "worker").await;
+    let ((proxy_producer, _), (proxy_worker, _), (proxy, mut proxied)) = roles(&engine, "proxy").await;
+    proxy.subscribe(Target::Channel("done".into()), None).await.unwrap();
+    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    worker.window("work".into(), 1, 0).await.unwrap();
+    let (_, id) = client.register(work()).await.unwrap();
+    let claimed = assignment(&mut assigned).await;
+    worker.complete(id, claimed.token, vec![Envelope::dispatch("done", "ok", Bytes::new())]).await.unwrap();
     assert!(matches!(next(&mut proxied).await, Incoming::Delivery(event) if &*event.channel == "done"));
     // And any of them may do what another did.
-    let (again, _) = proxy.register_claimable(work()).await.unwrap();
-    assert!(client.claim(again, 2, Duration::from_secs(30)).await.is_ok());
+    let (_, again) = proxy_producer.register_committed(work()).await.unwrap();
+    assert!(proxy_worker.claim(again, Duration::from_secs(30)).await.is_err(), "the worker's open window took it first");
+    assert_eq!(assignment(&mut assigned).await.event.id, again);
 }
 
 /// > 매우 섬세하게 사이사이 사소한 로직도 귀찮다고 가장 안전하고 무거운 구현을 하면 안된다.
@@ -264,28 +283,79 @@ async fn a_claim_does_not_wait_for_the_disk_even_under_strict() {
     }
     #[ruvent::async_trait]
     impl ruvent::Journal for Stuck {
-        async fn append(&mut self, _: Vec<ruvent::Record>) -> std::io::Result<()> {
+        async fn append(&mut self, _: ruvent::Batch) -> std::io::Result<()> {
             if self.good > 0 {
                 self.good -= 1;
                 return Ok(());
             }
             std::future::pending().await
         }
-        async fn rewrite(&mut self, _: Vec<ruvent::Record>) -> std::io::Result<()> {
+        async fn rewrite(&mut self, _: ruvent::Batch) -> std::io::Result<()> {
             std::future::pending().await
         }
     }
     // The startup write and the registration's write pass; then the disk is stuck.
     let engine = Engine::start(EngineConfig { durability: Durability::Strict, ..EngineConfig::default() }, Stuck { good: 2 }, Recovered::default()).await.unwrap();
-    let (client, _) = connect(&engine, "svc", 64).await.unwrap();
-    let (id, _) = client.register_claimable(work()).await.unwrap();
-    let claimed = tokio::time::timeout(Duration::from_secs(2), client.claim(id, 1, Duration::from_secs(30))).await;
+    let ((producer, _), (worker, _), _) = roles(&engine, "svc").await;
+    let (_, id) = producer.register_committed(work()).await.unwrap();
+    let claimed = tokio::time::timeout(Duration::from_secs(2), worker.claim(id, Duration::from_secs(30))).await;
     assert!(matches!(claimed, Ok(Ok(_))), "the disk is stuck and the claim is answered anyway");
-    // A registration now waits for the stuck disk, as Strict says it must.
-    let registering = tokio::spawn({
-        let client = client.clone();
-        async move { client.register_claimable(work()).await }
-    });
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(!registering.is_finished());
+    // A registration's acknowledgement now waits for the stuck disk, as it must.
+    let (seq, _) = producer.register(work()).await.unwrap();
+    let acknowledged = tokio::time::timeout(Duration::from_millis(80), producer.committed(seq)).await;
+    assert!(acknowledged.is_err());
+}
+
+/// > 나는 초 고성능 이벤트 서버를 통해 이벤트가 들어차고 신속하게 비워지는걸 원해.
+#[tokio::test]
+async fn an_open_window_takes_work_as_it_arrives_without_a_request_per_event() {
+    let engine = Engine::volatile(EngineConfig::default()).await;
+    let ((producer, _), (worker, mut assignments), (observer, _)) = roles(&engine, "svc").await;
+    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    worker.window("work".into(), 64, 0).await.unwrap();
+    for _ in 0..200 {
+        producer.register(work()).await.unwrap();
+    }
+    let mut done = 0;
+    while done < 200 {
+        let claimed = assignment(&mut assignments).await;
+        worker.complete(claimed.event.id, claimed.token, Vec::new()).await.unwrap();
+        done += 1;
+    }
+    let stats = observer.stats().await.unwrap();
+    assert_eq!((stats.waiting, stats.claimed), (0, 0), "filled and emptied: assignment, claim and delivery are one step, nothing is asked per event");
+}
+
+/// > 헌데 고성능 이벤트서버는 모든 이벤트 수신에 대해 수신완료 반송을 하지 않는다.
+#[tokio::test]
+async fn registrations_are_not_answered_one_by_one_but_acknowledged_cumulatively() {
+    let engine = Engine::volatile(EngineConfig::default()).await;
+    let (producer, mut inbox) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
+    let mut last = 0;
+    for _ in 0..100 {
+        last = producer.register(work()).await.unwrap().0;
+    }
+    producer.committed(last).await.unwrap();
+    assert!(quiet(&mut inbox).await, "no answer per registration; the acknowledgement is one number");
+}
+
+/// > 거절은 안보내. 그런것들은 전부 부하를 일으켜 … 모든 부하를 클라이언트로 옮겨야 서버가 고가용상태가 된다.
+#[tokio::test]
+async fn a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_channel_to_hold() {
+    let memory = ruvent::MemoryConfig { limit: Some(40_000), slot_bytes: 1_000, ..ruvent::MemoryConfig::default() };
+    let engine = Engine::volatile(EngineConfig { memory, ..EngineConfig::default() }).await;
+    let (producer, mut inbox) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
+    let (observer, _) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
+    let mut last = 0;
+    for _ in 0..40 {
+        last = producer.register(work()).await.unwrap().0;
+    }
+    producer.committed(last).await.unwrap();
+    // The root paused at the end of a batch; the next registration to it is told.
+    let (more, _) = producer.register(work()).await.unwrap();
+    producer.committed(more).await.unwrap();
+    assert_eq!(next(&mut inbox).await, Incoming::Paused("work".into()), "flow control, not a refusal");
+    let stats = observer.stats().await.unwrap();
+    assert_eq!(stats.waiting, 41, "every registration was applied");
+    assert!(stats.roots.iter().any(|root| root.root.as_str() == "work" && root.paused));
 }

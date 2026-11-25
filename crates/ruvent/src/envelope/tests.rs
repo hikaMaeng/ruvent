@@ -1,4 +1,4 @@
-use super::codec::{self, decode, encode, Layout, Malformed, Reader};
+use super::codec::{self, decode, encode, put_varint, Layout, Malformed, Reader};
 use super::*;
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -38,37 +38,34 @@ fn sample() -> Envelope {
 }
 
 const KEY: WorkKey = WorkKey { generation: 3, arrival: 9 };
-const CLAIM: Claim = Claim { token: ClaimToken { generation: 3, seq: 1 }, claimer: 2, worker: 7, deadline: 30_000 };
 
 #[test]
-fn the_three_sizes_are_31_39_and_63_bytes_plus_payload() {
+fn the_head_is_28_bytes_and_the_key_adds_four_plus_a_varint() {
     let dispatch = Envelope::dispatch("orders", "created", Bytes::new());
-    assert_eq!(codec::size(&dispatch, Layout::Delivery), 31);
+    assert_eq!(codec::size(&dispatch, Layout::Delivery), 32, "head 28 + payload length 4");
     let waiting = Envelope { key: Some(KEY), ..sample() };
-    assert_eq!(codec::size(&waiting, Layout::Journal), 39);
-    let claimed = Envelope { claim: Some(CLAIM), ..waiting.clone() };
-    assert_eq!(codec::size(&claimed, Layout::Claimed), 63);
-    assert_eq!(codec::size(&waiting, Layout::Notice), 35);
-    for (envelope, layout) in [(&dispatch, Layout::Delivery), (&waiting, Layout::Journal), (&claimed, Layout::Claimed), (&waiting, Layout::Notice)] {
+    assert_eq!(codec::size(&waiting, Layout::Journal), 37, "a small arrival is one varint byte");
+    assert_eq!(codec::size(&waiting, Layout::Notice), 33);
+    let late = Envelope { key: Some(WorkKey { generation: 3, arrival: u64::MAX }), ..sample() };
+    assert_eq!(codec::size(&late, Layout::Assigned), 46, "u64::MAX takes ten varint bytes");
+    for (envelope, layout) in [(&dispatch, Layout::Delivery), (&waiting, Layout::Journal), (&late, Layout::Assigned), (&waiting, Layout::Notice)] {
         assert_eq!(roundtrip(envelope, layout).unwrap().0.len(), codec::size(envelope, layout));
     }
 }
 
 /// The byte layout, pinned: changing it breaks every peer and every journal.
 #[test]
-fn a_claim_response_has_these_exact_bytes() {
-    let event = Envelope { retry: 2, key: Some(KEY), claim: Some(CLAIM), payload: Bytes::from_static(b"hi"), ..sample() };
-    let (bytes, _) = roundtrip(&event, Layout::Claimed).unwrap();
+fn an_assigned_event_has_these_exact_bytes() {
+    let event = Envelope { failures: 2, key: Some(KEY), not_before: Some(300), group: Some([0x44; 16]), payload: Bytes::from_static(b"hi"), ..sample() };
+    let (bytes, _) = roundtrip(&event, Layout::Assigned).unwrap();
     let mut expected = vec![0x11; 16];
     expected.extend_from_slice(&[0, 0, 0, 0]); // channel: name 0
     expected.extend_from_slice(&[1, 0, 0, 0]); // type: name 1
-    expected.push(codec::CLAIMED);
-    expected.extend_from_slice(&[2, 0]); // retry
-    expected.extend_from_slice(&[3, 0, 0, 0, 9, 0, 0, 0]); // work key
-    expected.extend_from_slice(&[3, 0, 0, 0, 1, 0, 0, 0]); // token
-    expected.extend_from_slice(&[2, 0, 0, 0]); // claimer
-    expected.extend_from_slice(&[7, 0, 0, 0]); // worker
-    expected.extend_from_slice(&30_000u64.to_le_bytes()); // deadline
+    expected.extend_from_slice(&(codec::NOT_BEFORE | codec::GROUP).to_le_bytes());
+    expected.extend_from_slice(&[2, 0]); // failures
+    expected.extend_from_slice(&[3, 0, 0, 0, 9]); // work key: generation, arrival varint
+    expected.extend_from_slice(&[0xac, 0x02]); // not_before 300 as a varint
+    expected.extend_from_slice(&[0x44; 16]); // group
     expected.extend_from_slice(&[2, 0, 0, 0, b'h', b'i']); // payload
     assert_eq!(bytes, expected);
 }
@@ -79,7 +76,7 @@ fn a_dispatch_delivery_has_these_exact_bytes() {
     let (bytes, _) = roundtrip(&event, Layout::Delivery).unwrap();
     let mut expected = vec![0x22; 16];
     expected.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
-    expected.push(codec::KIND | codec::CORRELATION);
+    expected.extend_from_slice(&(codec::KIND | codec::CORRELATION).to_le_bytes());
     expected.extend_from_slice(&[0, 0]);
     expected.extend_from_slice(&[0x33; 16]);
     expected.extend_from_slice(&[1, 0, 0, 0, b'x']);
@@ -88,12 +85,24 @@ fn a_dispatch_delivery_has_these_exact_bytes() {
 
 #[test]
 fn layouts_refuse_what_they_must_not_carry() {
-    let claimed = Envelope { key: Some(KEY), claim: Some(CLAIM), ..sample() };
     assert_eq!(roundtrip(&Envelope { principal: Some("svc".into()), ..sample() }, Layout::Request).unwrap_err(), Malformed::Forbidden("principal"));
-    assert_eq!(roundtrip(&claimed, Layout::Journal).map(|(_, event)| event.claim), Ok(None), "the journal never writes the claim block");
     assert_eq!(roundtrip(&sample(), Layout::Delivery).unwrap_err(), Malformed::Forbidden("claimable"));
-    assert_eq!(roundtrip(&Envelope { key: Some(KEY), ..sample() }, Layout::Claimed).unwrap_err(), Malformed::Forbidden("unclaimed"));
+    assert_eq!(roundtrip(&Envelope::dispatch("c", "t", Bytes::new()).with_id(EventId::new_v7()), Layout::Assigned).unwrap_err(), Malformed::Forbidden("dispatch"));
     assert_eq!(roundtrip(&sample(), Layout::Journal).unwrap_err(), Malformed::Missing("work key"));
+    assert_eq!(roundtrip(&Envelope { failures: 1, ..sample() }, Layout::Request).map(|(_, event)| event.failures), Ok(0), "a request never carries failures");
+}
+
+#[test]
+fn timing_and_group_are_claimable_only() {
+    for dispatch in [
+        Envelope::dispatch("c", "t", Bytes::new()).with_not_before(std::time::Duration::from_secs(1)),
+        Envelope::dispatch("c", "t", Bytes::new()).with_expires(std::time::Duration::from_secs(1)),
+        Envelope::dispatch("c", "t", Bytes::new()).with_group([1; 16]),
+    ] {
+        assert_eq!(roundtrip(&dispatch, Layout::Request).unwrap_err(), Malformed::Forbidden("timing or group on a dispatch event"));
+    }
+    let timed = sample().with_not_before(std::time::Duration::from_millis(5)).with_expires(std::time::Duration::from_secs(60)).with_group([7; 16]);
+    assert_eq!(roundtrip(&timed, Layout::Request).unwrap().1, timed);
 }
 
 fn decode_raw(bytes: Vec<u8>, layout: Layout) -> Result<Envelope, Malformed> {
@@ -104,10 +113,11 @@ fn decode_raw(bytes: Vec<u8>, layout: Layout) -> Result<Envelope, Malformed> {
     Ok(event)
 }
 
-fn raw(flags: u8, retry: u16, tail: &[u8]) -> Vec<u8> {
+fn raw(flags: u16, failures: u16, tail: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0x11; 16];
-    bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0, flags]);
-    bytes.extend_from_slice(&retry.to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
+    bytes.extend_from_slice(&flags.to_le_bytes());
+    bytes.extend_from_slice(&failures.to_le_bytes());
     bytes.extend_from_slice(tail);
     bytes
 }
@@ -115,11 +125,11 @@ fn raw(flags: u8, retry: u16, tail: &[u8]) -> Vec<u8> {
 #[test]
 fn the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers() {
     let payload = [0u8, 0, 0, 0];
-    assert_eq!(decode_raw(raw(codec::KIND | codec::CLAIMED, 0, &payload), Layout::Request).unwrap_err(), Malformed::ClaimedDispatch);
-    assert_eq!(decode_raw(raw(0x40, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved);
-    assert_eq!(decode_raw(raw(0x80, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved);
-    assert_eq!(decode_raw(raw(0, 1, &payload), Layout::Request).unwrap_err(), Malformed::Forbidden("retry"));
-    assert_eq!(decode_raw(raw(codec::KIND, 1, &payload), Layout::Delivery).unwrap_err(), Malformed::Forbidden("retry"));
+    assert_eq!(decode_raw(raw(1 << 1, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved, "bit 1 was 'claimed' and is reserved now");
+    assert_eq!(decode_raw(raw(1 << 9, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved);
+    assert_eq!(decode_raw(raw(1 << 15, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved);
+    assert_eq!(decode_raw(raw(0, 1, &payload), Layout::Request).unwrap_err(), Malformed::Forbidden("failures"));
+    assert_eq!(decode_raw(raw(codec::KIND, 1, &payload), Layout::Delivery).unwrap_err(), Malformed::Forbidden("failures"));
     assert_eq!(decode_raw(raw(codec::REPLY, 0, &[0; 8]), Layout::Notice).unwrap_err(), Malformed::Forbidden("optional field"));
     assert_eq!(decode_raw(raw(0, 0, &[0, 0, 0, 0, 9]), Layout::Request).unwrap_err(), Malformed::Trailing);
     assert_eq!(decode_raw(raw(0, 0, &[5, 0, 0, 0, 1]), Layout::Request).unwrap_err(), Malformed::Short);
@@ -130,10 +140,27 @@ fn the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers() {
 }
 
 #[test]
-fn retry_saturates_at_65535() {
-    let event = Envelope { retry: u16::MAX, key: Some(KEY), ..sample() };
-    assert_eq!(roundtrip(&event, Layout::Journal).unwrap().1.retry, u16::MAX);
-    assert_eq!(event.retry.saturating_add(1), u16::MAX);
+fn varints_round_trip_and_refuse_overlong_encodings() {
+    for value in [0u64, 1, 127, 128, 300, u64::from(u32::MAX), u64::MAX] {
+        let mut out = Vec::new();
+        put_varint(&mut out, value);
+        assert_eq!(out.len(), codec::varint_len(value));
+        let bytes = Bytes::from(out);
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.varint(), Ok(value));
+        assert!(reader.finish().is_ok());
+    }
+    let overlong = Bytes::from(vec![0xff; 11]);
+    assert_eq!(Reader::new(&overlong).varint(), Err(Malformed::Overlong));
+    let past_u64 = Bytes::from(vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]);
+    assert_eq!(Reader::new(&past_u64).varint(), Err(Malformed::Overlong));
+}
+
+#[test]
+fn failures_saturate_at_65535() {
+    let event = Envelope { failures: u16::MAX, key: Some(KEY), ..sample() };
+    assert_eq!(roundtrip(&event, Layout::Journal).unwrap().1.failures, u16::MAX);
+    assert_eq!(event.failures.saturating_add(1), u16::MAX);
 }
 
 #[test]
@@ -152,31 +179,25 @@ fn name() -> impl Strategy<Value = Name> {
 
 fn envelope() -> impl Strategy<Value = Envelope> {
     (
-        any::<[u8; 16]>(),
-        name(),
-        name(),
-        any::<bool>(),
-        any::<u16>(),
-        any::<(u32, u32)>(),
-        proptest::option::of(any::<(u32, u32, u32, u32, u64)>()),
-        proptest::option::of(name()),
-        proptest::option::of(any::<[u8; 16]>()),
-        proptest::option::of(name()),
-        proptest::option::of(name()),
+        (any::<[u8; 16]>(), name(), name(), any::<bool>(), any::<u16>(), any::<(u32, u64)>()),
+        (proptest::option::of(name()), proptest::option::of(any::<[u8; 16]>()), proptest::option::of(name()), proptest::option::of(name())),
+        (proptest::option::of(any::<u64>()), proptest::option::of(any::<u64>()), proptest::option::of(any::<[u8; 16]>())),
         proptest::collection::vec(any::<u8>(), 0..64),
     )
-        .prop_map(|(id, channel, event_type, dispatch, retry, key, claim, reply, correlation, principal, delegate, payload)| Envelope {
+        .prop_map(|((id, channel, event_type, dispatch, failures, key), (reply, correlation, principal, delegate), (not_before, expires, group), payload)| Envelope {
             id: EventId(id),
             channel,
             event_type,
             kind: if dispatch { Kind::Dispatch } else { Kind::Claimable },
-            retry,
+            failures,
             key: Some(WorkKey { generation: key.0, arrival: key.1 }),
-            claim: if dispatch { None } else { claim.map(|(generation, seq, claimer, worker, deadline)| Claim { token: ClaimToken { generation, seq }, claimer, worker, deadline }) },
             reply,
             correlation: correlation.map(EventId),
             principal,
             delegate,
+            not_before,
+            expires,
+            group,
             payload: Bytes::from(payload),
         })
 }
@@ -187,11 +208,8 @@ fn kept(event: &Envelope, layout: Layout) -> Envelope {
     if !layout.has_key() {
         event.key = None;
     }
-    if layout != Layout::Claimed {
-        event.claim = None;
-    }
     if matches!(layout, Layout::Request | Layout::Delivery) {
-        event.retry = 0;
+        event.failures = 0;
     }
     if !layout.has_optional() {
         event = event.notice();
@@ -199,11 +217,13 @@ fn kept(event: &Envelope, layout: Layout) -> Envelope {
     event
 }
 
+const LAYOUTS: [Layout; 5] = [Layout::Request, Layout::Notice, Layout::Assigned, Layout::Delivery, Layout::Journal];
+
 proptest! {
     /// Every flag combination either round-trips to what the layout keeps or is refused on encode.
     #[test]
     fn every_envelope_round_trips_through_every_layout_that_accepts_it(event in envelope()) {
-        for layout in [Layout::Request, Layout::Notice, Layout::Claimed, Layout::Delivery, Layout::Journal] {
+        for layout in LAYOUTS {
             match roundtrip(&event, layout) {
                 Ok((bytes, decoded)) => {
                     prop_assert_eq!(bytes.len(), codec::size(&event, layout));
@@ -218,7 +238,7 @@ proptest! {
     /// No byte string makes the decoder panic.
     #[test]
     fn arbitrary_bytes_never_panic_the_decoder(bytes in proptest::collection::vec(any::<u8>(), 0..128)) {
-        for layout in [Layout::Request, Layout::Notice, Layout::Claimed, Layout::Delivery, Layout::Journal] {
+        for layout in LAYOUTS {
             let _ = decode_raw(bytes.clone(), layout);
         }
     }

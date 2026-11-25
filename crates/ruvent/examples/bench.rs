@@ -7,9 +7,12 @@
 //!
 //! What is measured, exactly:
 //!
-//! * `cycles/s` — completed lifecycles per second: register a claimable event,
-//!   claim it, complete it, each call waiting for its answer, from `workers`
-//!   concurrent tasks. The numerator counts completions that returned `Ok`.
+//! * `cycles/s` — completed lifecycles per second: each of `workers` tasks
+//!   holds a production and a work connection; it registers a claimable event
+//!   with its own id and waits for the cumulative `Committed`, claims it by id,
+//!   completes it and waits for `Committed` again. The numerator counts
+//!   completions whose `Committed` arrived. Measurement is out of scope of the
+//!   overhaul's implementation; this only keeps the example compiling (M0~M7 are not here).
 //! * `encode ns` — nanoseconds to encode one envelope body in the given
 //!   layout (names already numbered), averaged over a loop. No framing.
 //! * `bytes` — the encoded size of that body with a 16-byte payload.
@@ -17,7 +20,7 @@
 #![allow(clippy::print_stdout)]
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{connect, Bytes, Claim, ClaimToken, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Methods, WorkKey};
+use ruvent::{connect, Bytes, Durability, Engine, EngineConfig, Envelope, EventId, FileJournal, Hello, Methods, WorkKey};
 use std::time::{Duration, Instant};
 
 const WORKERS: usize = 64;
@@ -26,14 +29,16 @@ async fn lifecycles(engine: &Engine, total: usize) -> (usize, Duration) {
     let started = Instant::now();
     let mut tasks = Vec::new();
     for _ in 0..WORKERS {
-        let (client, _) = connect(engine, "bench", 1024).await.expect("connect");
+        let (producer, _) = connect(engine, Hello::producer("bench"), 1024).await.expect("connect");
+        let (worker, _) = connect(engine, Hello::worker("bench"), 1024).await.expect("connect");
         let share = total / WORKERS;
         tasks.push(tokio::spawn(async move {
             let mut done = 0;
             for _ in 0..share {
-                let (id, _) = client.register_claimable(Envelope::claimable("work", "do", Bytes::from_static(&[0; 16]))).await.expect("register");
-                let claimed = client.claim(id, 1, Duration::from_secs(60)).await.expect("claim");
-                if client.complete(id, claimed.claim.expect("claimed").token, Vec::new()).await.is_ok() {
+                let (_, id) = producer.register_committed(Envelope::claimable("work", "do", Bytes::from_static(&[0; 16]))).await.expect("register");
+                let claimed = worker.claim(id, Duration::from_secs(60)).await.expect("claim");
+                let seq = worker.complete(id, claimed.token, Vec::new()).await.expect("complete");
+                if worker.committed(seq).await.is_ok() {
                     done += 1;
                 }
             }
@@ -79,13 +84,12 @@ async fn main() {
     }
 
     let key = WorkKey { generation: 1, arrival: 1 };
-    let claim = Claim { token: ClaimToken { generation: 1, seq: 1 }, claimer: 1, worker: 1, deadline: 30_000 };
     let payload = Bytes::from_static(&[0; 16]);
     let dispatch = Envelope::dispatch("feed", "news", payload.clone()).with_id(EventId::new_v7());
     let waiting = Envelope { key: Some(key), ..Envelope::claimable("work", "do", payload.clone()).with_id(EventId::new_v7()) };
-    let claimed = Envelope { claim: Some(claim), ..waiting.clone() };
+    let claimed = Envelope { failures: 1, ..waiting.clone() };
     for (label, event, layout) in
-        [("dispatch/delivery", &dispatch, Layout::Delivery), ("waiting/journal", &waiting, Layout::Journal), ("claimed/claim-answer", &claimed, Layout::Claimed), ("notice", &waiting, Layout::Notice)]
+        [("dispatch/delivery", &dispatch, Layout::Delivery), ("waiting/journal", &waiting, Layout::Journal), ("assigned", &claimed, Layout::Assigned), ("notice", &waiting, Layout::Notice)]
     {
         let (bytes, nanos) = encode_cost(event, layout);
         println!("envelope={label} bytes={bytes} encode_ns={nanos:.1}");

@@ -1,20 +1,64 @@
-//! The engine's state and the rules the server keeps — nothing else.
+//! The ledger: the engine's state and the rules the server keeps — nothing else.
 //!
-//! The rules: refuse an id that is in the claimable queue, compare the claim
-//! token, reclaim after a deadline, send dispatch events, journal. Retry
-//! limits, failure handling and follow-ups are the workers' business.
+//! The rules: producer sequences and cumulative commit acknowledgement,
+//! windows and round-robin assignment, leases, delays and expiries,
+//! isolation at a failure threshold, Strict visibility, root-channel pause.
+//! How often and how long to retry is the workers' business (0.3).
 //!
 //! This is a plain state machine: calls go in, [`Effects`] come out. It owns
-//! no task, no socket and no clock; the engine feeds it the time.
+//! no task, no socket and no clock; the engine feeds it the time, the commit
+//! number of the batch it is filling (`carrying`) and the last one on disk
+//! (`durable`).
+//!
+//! ## State (2.10, the ledger's rows)
+//!
+//! | state | key | scope | lifetime | bound | cleared by |
+//! | --- | --- | --- | --- | --- | --- |
+//! | ledger metadata | slot (`Slots`, id → slot) | server | registration ~ completion, deletion, expiry | managed memory (root pause) | ledger |
+//! | waiting order | (channel, type) → work key (`Lane`) | server | while waiting | as the metadata | ledger |
+//! | root accounting | root → events, bytes, ended lineages, share at pause (`Root`) | server | while it holds events or is paused | roots with events | ledger |
+//! | drained roots | root (`drained`) | server | emptied after draining ~ refilled | `pause::DRAINED` | ledger (cleared whole at the bound) |
+//! | pause-notice record | (production connection, root) → bytes since (`Paused::notified`) | server | `Paused` ~ `Resumed`, close | connections writing to paused roots | ledger |
+//! | net-growth counters | (channel, type) → recent parents and follow-ups (`Growth`) | server | while the lane has members or events | lanes × four counters | ledger |
+//! | hold lanes | (root, channel, type) → work key (`holds`) | server | while the root is paused | the root's waiting events | ledger (released first when the share comes down) |
+//! | groups being assigned | (channel, group) → attempts (`groups`) | server | assignment ~ completion, release, reclaim | the channel's attempts | ledger; only on `serialize_group` channels |
+//! | uptime | server | server, in every journal batch | from the first start | 8 bytes | ledger |
+//! | producer table | producer id (`Producers`) | server, journaled | first connection ~ last close + linger | `max_entries` × entry bytes | ledger |
+//! | unacknowledged commits | producer (`Producers::acks`, `Producer::waits`) | ledger | apply ~ `Committed` | connected producers | ledger (landing batch and batch end) |
+//! | joins and windows | (work connection, channel) → window, held, signal bit (`Join`) | server | `Join` ~ close | the window | ledger |
+//! | timing wheel | (time, slot, generation) (`Wheel`) | server | assignment, delay, expiry ~ due | claimed + delayed + expiring | ledger |
+//! | subscriptions | channel or prefix → connections (`Subscribers`) | server | subscribe ~ unsubscribe, close | subscriptions | ledger |
+//! | isolated events | logical id, on `isolated.<channel>` | server | isolation ~ completion, deletion, keep time | counted to the original root | workers, expiry |
+//! | reply-channel results | logical id, on `reply.<instance>` | server | follow-up ~ completion or expiry | counted to the request's root | requesters, expiry |
+//! | drain mark | server | server | `Drain` ~ stop | 1 | operator |
+//!
+//! Fault dedup per (connection, kind) lives in `Session::faults`: the
+//! connection owner may dedup again; the ledger does it so a misconfigured
+//! producer cannot fill the send buffer with faults.
 
-use super::config::{EngineConfig, Grants, Method, SnapshotConfig};
-use super::ops::{Call, DeleteFailure, Outbound, Refusal, Reply, SessionId, DELETED, DELETE_FAILED};
-use crate::envelope::{Claim, ClaimToken, Envelope, EventId, Kind, WorkKey};
+mod consume;
+mod lanes;
+mod lifecycle;
+mod observe;
+mod pause;
+mod produce;
+mod producers;
+mod recover;
+mod roots;
+mod slots;
+mod wheel;
+
+use super::config::{EngineConfig, Grants, Method};
+use super::ops::{ByeReason, Call, Counters, FaultKind, Hello, Outbound, Refusal, Role, SessionId, Target, Welcome};
+use crate::envelope::{ClaimToken, Envelope, EventId, GroupId, ProducerId, WorkKey};
 use crate::journal::Record;
 use crate::names::{Name, Names};
-use bytes::{BufMut, Bytes, BytesMut};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use lanes::{Join, Lane, LaneKey};
+use producers::Producers;
+use roots::Root;
+use slots::{Index, JoinId, Slots};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use wheel::Wheel;
 
 /// Where fresh ids come from. UUIDv7 unless a test supplies its own.
 pub trait IdSource: Send + 'static {
@@ -34,630 +78,582 @@ impl IdSource for V7 {
 #[derive(Debug)]
 pub struct Outgoing {
     pub session: SessionId,
-    pub message: Outbound,
-    /// Under `Strict`, released only after this batch's records are on disk.
-    pub gated: bool,
+    /// `None`: close the connection after everything before it.
+    pub message: Option<Outbound>,
+    /// Released only once the batch with this commit number is on disk.
+    pub gate: Option<u64>,
 }
 
-/// What one batch of calls produced.
+/// What the ledger produced since the last [`State::take`].
 #[derive(Default, Debug)]
 pub struct Effects {
     pub records: Vec<Record>,
+    /// The serial of `records[0]`.
+    pub first_serial: u64,
     pub sends: Vec<Outgoing>,
     /// Copies for the operational snapshot.
     pub observed: Vec<Envelope>,
-    /// The generation advanced in this batch: nothing of it may leave before
-    /// the new generation is on disk, under any durability.
-    pub gate_all: bool,
-    /// The generation counter is exhausted; the engine must stop.
-    pub fatal: Option<&'static str>,
+    /// Production connections whose reading must stop (`false`) or resume (`true`), 2.6.
+    pub reading: Vec<(SessionId, bool)>,
 }
 
-struct Session {
-    credential: Name,
-    channels: HashSet<Name>,
-    attribution: Option<u32>,
-}
-
-/// One claim attribution: the credential and connection a claim was made under.
+/// One open connection.
 ///
-/// | key | attribution number (the claim block's `claimer`) |
+/// | key | session id |
 /// | --- | --- |
-/// | scope | one engine run |
-/// | lifetime | while its connection is open or an active claim names it |
-/// | bound | open connections + active claims |
-/// | cleared by | `release` (last claim gone, connection closed) and `close` |
-struct Attribution {
+/// | lifetime | `open` to `close` |
+/// | bound | open connections |
+/// | cleared by | `State::close` |
+struct Session {
+    role: Role,
     credential: Name,
-    session: Option<SessionId>,
-    claims: u32,
+    producer: Option<ProducerId>,
+    acks: bool,
+    targets: HashSet<Target>,
+    joins: Vec<Name>,
+    /// Fault kinds already told on this connection (2.7).
+    faults: u8,
+}
+
+/// Who receives what on a channel.
+///
+/// | key | channel (exact), prefix, channel (dispatch joins) |
+/// | --- | --- |
+/// | lifetime | subscribe or join ~ unsubscribe or close |
+/// | bound | subscriptions + dispatch joins |
+/// | cleared by | `State::unsubscribe_from`, `State::close` |
+#[derive(Default)]
+struct Subscribers {
+    exact: HashMap<Name, Vec<SessionId>>,
+    prefix: HashMap<Name, Vec<SessionId>>,
+    dispatch: HashMap<Name, Vec<SessionId>>,
+}
+
+fn remove_from(map: &mut HashMap<Name, Vec<SessionId>>, name: &Name, session: SessionId) {
+    if let Some(list) = map.get_mut(name) {
+        list.retain(|held| *held != session);
+        if list.is_empty() {
+            map.remove(name);
+        }
+    }
+}
+
+impl Subscribers {
+    fn add(&mut self, target: &Target, session: SessionId) {
+        let (map, name) = match target {
+            Target::Channel(name) => (&mut self.exact, name),
+            Target::Prefix(name) => (&mut self.prefix, name),
+        };
+        let list = map.entry(name.clone()).or_default();
+        if !list.contains(&session) {
+            list.push(session);
+        }
+    }
+
+    fn remove(&mut self, target: &Target, session: SessionId) {
+        match target {
+            Target::Channel(name) => remove_from(&mut self.exact, name, session),
+            Target::Prefix(name) => remove_from(&mut self.prefix, name, session),
+        }
+    }
+
+    /// Subscribers of `channel`: exact, and every prefix at a `.` boundary.
+    /// With `dispatch`, also the joins that take the channel's dispatch events.
+    fn of(&self, channel: &str, dispatch: bool) -> Vec<SessionId> {
+        let mut found: Vec<SessionId> = self.exact.get(channel).cloned().unwrap_or_default();
+        if !self.prefix.is_empty() {
+            for (at, _) in channel.match_indices('.') {
+                if let Some(list) = self.prefix.get(&channel[..at]) {
+                    found.extend(list);
+                }
+            }
+        }
+        if dispatch {
+            if let Some(list) = self.dispatch.get(channel) {
+                found.extend(list);
+            }
+        }
+        if found.len() > 1 {
+            found.sort_unstable();
+            found.dedup();
+        }
+        found
+    }
 }
 
 pub struct State {
+    config: EngineConfig,
     names: Names,
+    server_id: [u8; 16],
     generation: u32,
-    arrival: u32,
-    claim_seq: u32,
-    next_attribution: u32,
-    /// Every claimable event, waiting or claimed, in work-key (FIFO) order.
-    queue: BTreeMap<WorkKey, Envelope>,
-    /// id → registration, for every event in `queue`.
-    ids: HashMap<EventId, WorkKey>,
-    /// Waiting (unclaimed) registrations per channel, for subscription backlogs.
-    waiting: HashMap<Name, BTreeSet<WorkKey>>,
-    /// Claims by deadline. Entries of claims that ended are skipped when popped.
-    deadlines: BinaryHeap<Reverse<(u64, WorkKey, ClaimToken)>>,
-    subscribers: HashMap<Name, Vec<SessionId>>,
-    sessions: HashMap<SessionId, Session>,
-    attributions: HashMap<u32, Attribution>,
-    id_source: Box<dyn IdSource>,
-    grants: Option<Grants>,
-    snapshot: Option<SnapshotConfig>,
-    backlog_page: usize,
+    arrival: u64,
+    claim_seq: u64,
+    /// Accumulated uptime (ms) of the batch being applied.
     now: u64,
-    swept: bool,
+    /// The last commit number on disk.
+    durable: u64,
+    /// The commit number of the batch this batch's records go in.
+    carrying: u64,
+    /// The serial the next record takes.
+    serial: u64,
+    journaled: bool,
+    strict: bool,
+    memory_limit: u64,
+    slots: Slots,
+    lanes: HashMap<LaneKey, Lane>,
+    /// Hold lanes: events of a paused root skipped in net-growth lanes.
+    holds: HashMap<(Name, LaneKey), BTreeMap<WorkKey, Index>>,
+    wheel: Wheel,
+    /// Groups with an attempt out, on `serialize_group` channels.
+    groups: HashMap<(Name, GroupId), u32>,
+    producers: Producers,
+    roots: HashMap<Name, Root>,
+    /// Roots that are paused, for the per-batch resume check.
+    paused: BTreeSet<Name>,
+    /// Roots that grew in this batch, for the early-pause and max-backlog checks.
+    grown: Vec<Name>,
+    /// Roots that emptied after a lineage of theirs ended: refilled, they do
+    /// not count as never drained. Bound `pause::DRAINED`; cleared whole past it.
+    drained: HashSet<Name>,
+    /// Bytes counted for every slot.
+    slot_bytes: u64,
+    over_limit: bool,
+    sessions: HashMap<SessionId, Session>,
+    joins: HashMap<JoinId, Join>,
+    /// Joins by channel, in join order.
+    channel_joins: HashMap<Name, Vec<JoinId>>,
+    next_order: u64,
+    subscribers: Subscribers,
+    /// Lanes that got events still waiting for the disk (Strict): offered when it lands.
+    awaiting: VecDeque<(u64, LaneKey)>,
+    /// Work for the end of the current step.
+    to_fill: Vec<JoinId>,
+    to_offer: Vec<LaneKey>,
+    draining: bool,
+    counters: Counters,
+    id_source: Box<dyn IdSource>,
     effects: Effects,
-}
-
-fn delete_payload(id: EventId, failure: Option<DeleteFailure>) -> Bytes {
-    let mut payload = BytesMut::with_capacity(17);
-    payload.put_slice(&id.0);
-    if let Some(failure) = failure {
-        payload.put_u8(failure as u8);
-    }
-    payload.freeze()
 }
 
 impl State {
     pub fn new(config: &EngineConfig, id_source: Box<dyn IdSource>) -> Self {
         State {
+            config: config.clone(),
             names: Names::default(),
+            server_id: config.server_id.unwrap_or_else(|| EventId::new_v7().0),
             generation: 0,
             arrival: 0,
             claim_seq: 0,
-            next_attribution: 0,
-            queue: BTreeMap::new(),
-            ids: HashMap::new(),
-            waiting: HashMap::new(),
-            deadlines: BinaryHeap::new(),
-            subscribers: HashMap::new(),
-            sessions: HashMap::new(),
-            attributions: HashMap::new(),
-            id_source,
-            grants: config.grants.clone(),
-            snapshot: config.snapshot.clone(),
-            backlog_page: config.backlog_page.max(1),
             now: 0,
-            swept: false,
+            durable: 0,
+            carrying: 1,
+            serial: 0,
+            journaled: true,
+            strict: config.durability == super::config::Durability::Strict,
+            memory_limit: config.memory.resolved_limit(),
+            slots: Slots::default(),
+            lanes: HashMap::new(),
+            holds: HashMap::new(),
+            wheel: Wheel::default(),
+            groups: HashMap::new(),
+            producers: Producers::default(),
+            roots: HashMap::new(),
+            paused: BTreeSet::new(),
+            grown: Vec::new(),
+            drained: HashSet::new(),
+            slot_bytes: 0,
+            over_limit: false,
+            sessions: HashMap::new(),
+            joins: HashMap::new(),
+            channel_joins: HashMap::new(),
+            next_order: 0,
+            subscribers: Subscribers::default(),
+            awaiting: VecDeque::new(),
+            to_fill: Vec::new(),
+            to_offer: Vec::new(),
+            draining: false,
+            counters: Counters::default(),
+            id_source,
             effects: Effects::default(),
         }
-    }
-
-    /// Rebuilds the queue from journal records and starts a new generation.
-    ///
-    /// Returns the records that must be durable before the first answer: the
-    /// new generation, and a reclaim (new id, retry + 1) for every event that
-    /// was claimed when the server stopped.
-    pub fn recover(&mut self, records: Vec<Record>) -> Result<Vec<Record>, &'static str> {
-        let mut last_generation = 0u32;
-        let mut claimed = BTreeSet::new();
-        for record in records {
-            match record {
-                Record::Register(event) => {
-                    let event = self.adopt(event);
-                    let key = event.key.ok_or("a journal registration without a work key")?;
-                    if let Some(old) = self.queue.insert(key, event.clone()) {
-                        self.ids.remove(&old.id);
-                    }
-                    self.ids.insert(event.id, key);
-                    claimed.remove(&key);
-                }
-                Record::Claim(key) => {
-                    if self.queue.contains_key(&key) {
-                        claimed.insert(key);
-                    }
-                }
-                Record::Reclaim { key, id, retry } => {
-                    if let Some(event) = self.queue.get_mut(&key) {
-                        self.ids.remove(&event.id);
-                        event.id = id;
-                        event.retry = retry;
-                        self.ids.insert(id, key);
-                        claimed.remove(&key);
-                    }
-                }
-                Record::Remove(key) => {
-                    if let Some(event) = self.queue.remove(&key) {
-                        self.ids.remove(&event.id);
-                    }
-                    claimed.remove(&key);
-                }
-                Record::Generation(generation) => last_generation = last_generation.max(generation),
-            }
-        }
-        self.generation = last_generation.checked_add(1).ok_or("the generation counter is exhausted; the server cannot start")?;
-        self.arrival = 0;
-        self.claim_seq = 0;
-        let mut startup = vec![Record::Generation(self.generation)];
-        for key in claimed {
-            let id = self.fresh_id();
-            let event = self.queue.get_mut(&key).ok_or("lost a recovered registration")?;
-            self.ids.remove(&event.id);
-            event.id = id;
-            event.retry = event.retry.saturating_add(1);
-            self.ids.insert(id, key);
-            startup.push(Record::Reclaim { key, id, retry: event.retry });
-        }
-        for (key, event) in &self.queue {
-            self.waiting.entry(event.channel.clone()).or_default().insert(*key);
-        }
-        Ok(startup)
-    }
-
-    /// Replaces every name of a decoded envelope with the dictionary's handle.
-    fn adopt(&mut self, mut event: Envelope) -> Envelope {
-        event.channel = self.names.adopt(&event.channel);
-        event.event_type = self.names.adopt(&event.event_type);
-        for name in [&mut event.reply, &mut event.principal, &mut event.delegate].into_iter().flatten() {
-            *name = self.names.adopt(name);
-        }
-        event
     }
 
     pub fn generation(&self) -> u32 {
         self.generation
     }
 
-    /// Claimable events held, waiting or claimed.
+    pub fn server_id(&self) -> [u8; 16] {
+        self.server_id
+    }
+
+    /// Claimable events held, in any state.
     pub fn live(&self) -> usize {
-        self.queue.len()
+        self.slots.len()
     }
 
-    /// The current state as journal records: what a rewrite writes.
-    pub fn snapshot(&self) -> Vec<Record> {
-        let mut records = Vec::with_capacity(self.queue.len() + 1);
-        records.push(Record::Generation(self.generation));
-        let mut claimed = Vec::new();
-        for (key, event) in &self.queue {
-            records.push(Record::Register(Envelope { claim: None, ..event.clone() }));
-            if event.claim.is_some() {
-                claimed.push(Record::Claim(*key));
-            }
+    pub fn draining(&self) -> bool {
+        self.draining
+    }
+
+    /// The earliest uptime at which a lease ends or a delay is over.
+    pub fn next_due(&self) -> Option<u64> {
+        self.wheel.next()
+    }
+
+    /// Starts a batch at uptime `now`. `durable` is the last commit number on
+    /// disk; `carrying` the one this batch's records will be written under.
+    pub fn begin(&mut self, now: u64, durable: u64, carrying: u64) {
+        self.now = self.now.max(now);
+        self.durable = durable;
+        self.carrying = carrying;
+        if self.effects.records.is_empty() {
+            self.effects.first_serial = self.serial;
         }
-        records.extend(claimed);
-        records
     }
 
-    /// Starts a batch at `now` (milliseconds on the server's monotonic clock).
-    pub fn begin(&mut self, now: u64) {
-        self.now = now;
-        self.swept = false;
-    }
-
-    /// Ends a batch and hands over what it produced.
+    /// Ends a batch: what is due, expired, the producers' sequences and
+    /// acknowledgements, the memory check; then hands over what it produced.
     pub fn take(&mut self) -> Effects {
-        std::mem::take(&mut self.effects)
+        self.process_due();
+        self.purge_expired();
+        self.settle();
+        self.flush_producers();
+        self.check_memory();
+        self.settle();
+        let effects = std::mem::take(&mut self.effects);
+        self.effects.first_serial = self.serial;
+        effects
     }
 
-    pub fn open(&mut self, session: SessionId, credential: &Name) {
-        let credential = self.names.adopt(credential);
-        self.sessions.insert(session, Session { credential, channels: HashSet::new(), attribution: None });
-    }
-
-    pub fn close(&mut self, session: SessionId) {
-        let Some(gone) = self.sessions.remove(&session) else { return };
-        for channel in gone.channels {
-            self.unsubscribe_from(session, &channel);
-        }
-        if let Some(number) = gone.attribution {
-            if let Some(attribution) = self.attributions.get_mut(&number) {
-                attribution.session = None;
-                if attribution.claims == 0 {
-                    self.attributions.remove(&number);
+    /// The batch with commit number `commit` is on disk.
+    pub fn landed(&mut self, commit: u64) {
+        self.durable = self.durable.max(commit);
+        while self.producers.acks.front().is_some_and(|(waiting, _)| *waiting <= commit) {
+            let Some((_, id)) = self.producers.acks.pop_front() else { break };
+            if let Some(producer) = self.producers.entries.get_mut(&id) {
+                producer.landed(commit);
+                let session = producer.session;
+                let quiet = producer.quiet;
+                if let Some(seq) = producer.ack(self.config.ack_every) {
+                    if let (Some(session), false) = (session, quiet) {
+                        self.send(session, Outbound::Committed { seq }, None);
+                    }
                 }
             }
         }
+        while self.awaiting.front().is_some_and(|(waiting, _)| *waiting <= commit) {
+            let Some((_, lane)) = self.awaiting.pop_front() else { break };
+            self.to_offer.push(lane);
+        }
+        self.settle();
     }
 
-    fn unsubscribe_from(&mut self, session: SessionId, channel: &Name) {
-        if let Some(subscribers) = self.subscribers.get_mut(channel) {
-            subscribers.retain(|subscriber| *subscriber != session);
-            if subscribers.is_empty() {
-                self.subscribers.remove(channel);
-            }
+    fn record(&mut self, record: Record) -> u64 {
+        let serial = self.serial;
+        self.serial += 1;
+        self.effects.records.push(record);
+        serial
+    }
+
+    /// Records a change of the slot at `index` and stamps it with the commit
+    /// number and serial (2.1: the last change's).
+    fn record_for(&mut self, index: Index, record: Record) {
+        let serial = self.record(record);
+        let carrying = self.carrying;
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.commit = carrying;
+            slot.serial = serial;
         }
     }
 
-    /// Takes a registration off its channel's waiting set, and the set off the
-    /// map once it is empty, so one-off channels leave nothing behind.
-    fn unwait(&mut self, channel: &Name, key: WorkKey) {
-        if let Some(waiting) = self.waiting.get_mut(channel) {
-            waiting.remove(&key);
-            if waiting.is_empty() {
-                self.waiting.remove(channel);
+    fn send(&mut self, session: SessionId, message: Outbound, gate: Option<u64>) {
+        self.effects.sends.push(Outgoing { session, message: Some(message), gate });
+    }
+
+    /// Tells the connection why, closes it after everything sent before, and
+    /// forgets it now: nothing it sent later is applied.
+    fn close_session(&mut self, session: SessionId, bye: Option<ByeReason>) {
+        if let Some(reason) = bye {
+            self.send(session, Outbound::Bye(reason), None);
+        }
+        self.effects.sends.push(Outgoing { session, message: None, gate: None });
+        self.close(session, &[]);
+    }
+
+    /// A fault, told once per (connection, kind) and counted always.
+    fn fault(&mut self, session: SessionId, kind: FaultKind, detail: &'static str) {
+        self.counters.faults += 1;
+        if let Some(open) = self.sessions.get_mut(&session) {
+            if open.faults & kind.bit() == 0 {
+                open.faults |= kind.bit();
+                self.send(session, Outbound::Fault { kind, detail }, None);
             }
         }
-    }
-
-    fn send(&mut self, session: SessionId, message: Outbound, gated: bool) {
-        self.effects.sends.push(Outgoing { session, message, gated });
-    }
-
-    fn reply(&mut self, session: SessionId, req: u32, reply: Reply, gated: bool) {
-        self.send(session, Outbound::Reply { req, reply }, gated);
     }
 
     fn allowed(&self, credential: &Name, method: Method, channel: &str) -> bool {
-        match &self.grants {
-            None => true,
-            Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.allows(method, channel)),
-        }
+        allowed(&self.config.grants, credential, method, channel)
     }
 
     fn may_delegate(&self, credential: &Name) -> bool {
-        match &self.grants {
+        match &self.config.grants {
             None => true,
             Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.delegate),
         }
     }
 
-    /// Applies one call from `session`. A call from a connection that is no
-    /// longer open has nobody to answer and is dropped.
-    pub fn call(&mut self, session: SessionId, req: u32, call: Call) {
-        let Some(credential) = self.sessions.get(&session).map(|session| session.credential.clone()) else { return };
-        let (reply, gated) = match call {
-            Call::RegisterClaimable(event) => self.register(&credential, event, Kind::Claimable),
-            Call::RegisterDispatch(event) => self.register(&credential, event, Kind::Dispatch),
-            Call::Claim { id, worker, lease_ms } => (self.claim(session, &credential, id, worker, lease_ms), false),
-            Call::Complete { id, token, follow_ups } => self.complete(&credential, id, token, follow_ups),
-            Call::Delete { id, result, tag, key } => self.delete(&credential, id, &result, tag, key),
-            Call::Subscribe { channel, after } => (self.subscribe(session, &credential, &channel, after), false),
-            Call::Unsubscribe { channel } => {
-                let channel = self.names.adopt(&channel);
-                if let Some(open) = self.sessions.get_mut(&session) {
-                    open.channels.remove(&channel);
-                }
-                self.unsubscribe_from(session, &channel);
-                (Reply::Unsubscribed, false)
-            }
-        };
-        self.reply(session, req, reply, gated);
-    }
-
-    /// Checks a registration request (method 1 or 2, or a follow-up) and
-    /// resolves its names. Does not assign an id or change the queue.
-    fn admit(&mut self, credential: &Name, event: Envelope) -> Result<Envelope, Refusal> {
-        if event.claim.is_some() || event.retry != 0 || event.key.is_some() || event.principal.is_some() || event.channel.is_empty() {
-            return Err(Refusal::Malformed);
-        }
-        if !event.id.is_nil() {
-            if !event.id.is_uuid() {
-                return Err(Refusal::InvalidId);
-            }
-            if self.ids.contains_key(&event.id) {
-                return Err(Refusal::Duplicate);
-            }
-        }
-        let method = match event.kind {
-            Kind::Claimable => Method::RegisterClaimable,
-            Kind::Dispatch => Method::RegisterDispatch,
-        };
-        if !self.allowed(credential, method, &event.channel) || (event.delegate.is_some() && !self.may_delegate(credential)) {
-            return Err(Refusal::Forbidden);
-        }
-        let mut event = self.adopt(event);
-        event.principal = Some(credential.clone());
-        Ok(event)
-    }
-
     fn fresh_id(&mut self) -> EventId {
         loop {
             let id = self.id_source.next();
-            if !id.is_nil() && !self.ids.contains_key(&id) {
+            if !id.is_nil() && !self.slots.contains_id(&id) {
                 return id;
             }
         }
     }
 
-    /// Moves to the next generation, because a sequence ran out.
-    fn advance_generation(&mut self) {
-        match self.generation.checked_add(1) {
-            Some(next) => self.generation = next,
-            None => self.effects.fatal = Some("the generation counter is exhausted"),
-        }
-        self.arrival = 0;
-        self.claim_seq = 0;
-        self.effects.records.push(Record::Generation(self.generation));
-        self.effects.gate_all = true;
-    }
-
     fn next_key(&mut self) -> WorkKey {
-        if self.arrival == u32::MAX {
-            self.advance_generation();
-        }
         let key = WorkKey { generation: self.generation, arrival: self.arrival };
         self.arrival += 1;
         key
     }
 
     fn next_token(&mut self) -> ClaimToken {
-        if self.claim_seq == u32::MAX {
-            self.advance_generation();
-        }
         let token = ClaimToken { generation: self.generation, seq: self.claim_seq };
         self.claim_seq += 1;
         token
     }
 
-    fn observe(&mut self, event: &Envelope) {
-        if self.snapshot.as_ref().is_some_and(|snapshot| snapshot.wants(&event.channel, &event.event_type)) {
-            self.effects.observed.push(event.clone());
-        }
+    /// The commit number a send about this slot must wait for under Strict.
+    fn gate_for(&self, index: Index) -> Option<u64> {
+        let slot = self.slots.get(index)?;
+        (self.strict && slot.fixed.durable && slot.fixed.visible_from > self.durable).then_some(slot.fixed.visible_from)
     }
 
-    fn subscribers_of(&self, channel: &Name) -> Vec<SessionId> {
-        self.subscribers.get(channel).cloned().unwrap_or_default()
-    }
-
-    fn announce(&mut self, event: &Envelope, gated: bool) {
-        let notice = event.notice();
-        for session in self.subscribers_of(&event.channel) {
-            self.send(session, Outbound::Notice(notice.clone()), gated);
-        }
-    }
-
-    /// Queues an admitted claimable event (its id already assigned).
-    fn enqueue(&mut self, mut event: Envelope, gated: bool) -> WorkKey {
-        let key = self.next_key();
-        event.key = Some(key);
-        self.ids.insert(event.id, key);
-        self.waiting.entry(event.channel.clone()).or_default().insert(key);
-        self.effects.records.push(Record::Register(event.clone()));
-        self.announce(&event, gated);
-        self.observe(&event);
-        self.queue.insert(key, event);
-        key
-    }
-
-    /// Hands an admitted dispatch event (its id already assigned) to the
-    /// channel's subscribers as of now, and forgets it.
-    fn deliver(&mut self, event: Envelope, gated: bool) {
-        for session in self.subscribers_of(&event.channel) {
-            self.send(session, Outbound::Delivery(event.clone()), gated);
-        }
-        self.observe(&event);
-    }
-
-    /// Methods 1 and 2.
-    fn register(&mut self, credential: &Name, event: Envelope, kind: Kind) -> (Reply, bool) {
-        self.sweep();
-        if event.kind != kind {
-            return (Reply::Refused(Refusal::Malformed), false);
-        }
-        let mut event = match self.admit(credential, event) {
-            Ok(event) => event,
-            Err(refusal) => return (Reply::Refused(refusal), false),
-        };
-        if event.id.is_nil() {
-            event.id = self.fresh_id();
-        }
-        let id = event.id;
-        match kind {
-            Kind::Claimable => {
-                let key = self.enqueue(event, true);
-                (Reply::Registered { id, key }, true)
+    /// Opens a connection. Its first message is `Welcome`, or `Bye`.
+    pub fn open(&mut self, session: SessionId, hello: Hello) {
+        let credential = self.names.adopt(&hello.credential);
+        self.sessions.insert(session, Session { role: hello.role, credential: credential.clone(), producer: None, acks: hello.acks, targets: HashSet::new(), joins: Vec::new(), faults: 0 });
+        let mut resume = 0;
+        let mut superseded = false;
+        let mut gate = None;
+        if hello.role != Role::Observe {
+            let Some(id) = hello.producer else {
+                return self.close_session(session, Some(ByeReason::Protocol));
+            };
+            if hello.role == Role::Produce && self.draining {
+                return self.close_session(session, Some(ByeReason::Draining));
             }
-            Kind::Dispatch => {
-                self.deliver(event, false);
-                (Reply::Accepted { id }, false)
+            let writes = |method| hello.channels.iter().all(|channel| self.allowed(&credential, method, channel));
+            if hello.role == Role::Produce && !(writes(Method::RegisterClaimable) || writes(Method::RegisterDispatch)) {
+                return self.close_session(session, Some(ByeReason::Forbidden));
+            }
+            let linger = hello.linger_ms.unwrap_or(millis(self.config.producers.linger)).min(millis(self.config.producers.linger_max));
+            if !self.producers.entries.contains_key(&id) {
+                self.producers.make_room(self.config.producers.max_entries);
+                self.producers.entries.insert(id, producers::Producer::new(hello.nonce, linger));
+            }
+            let previous = self.producers.entries.get(&id).and_then(|producer| producer.session.map(|old| (old, producer.nonce)));
+            if let Some((old, nonce)) = previous {
+                // The same process reconnecting replaces its old connection
+                // quietly; another instance under the same id pushes it out.
+                if nonce == hello.nonce {
+                    self.close_session(old, None);
+                } else {
+                    superseded = true;
+                    self.close_session(old, Some(ByeReason::Superseded));
+                }
+            }
+            self.producers.attach(&id, session);
+            if let Some(producer) = self.producers.entries.get_mut(&id) {
+                producer.nonce = hello.nonce;
+                producer.linger_ms = producer.linger_ms.max(linger);
+                producer.quiet = !hello.acks;
+                resume = producer.applied;
+                gate = producer.last_wait();
+            }
+            if let Some(open) = self.sessions.get_mut(&session) {
+                open.producer = Some(id);
             }
         }
+        let welcome = Welcome { server_id: self.server_id, generation: self.generation, credential, resume, superseded };
+        self.send(session, Outbound::Welcome(welcome), gate);
     }
 
-    /// Reclaims every claim whose deadline has passed. Runs once per batch,
-    /// right before the batch's first external registration.
-    fn sweep(&mut self) {
-        if self.swept {
+    /// A connection closed. `unwritten` are the tokens of assignments its
+    /// owner had not finished writing: they go back to waiting at once, with
+    /// their failure count unchanged. Fully written ones are due within the
+    /// reconnect grace (2.4).
+    pub fn close(&mut self, session: SessionId, unwritten: &[ClaimToken]) {
+        let Some(gone) = self.sessions.remove(&session) else { return };
+        for target in &gone.targets {
+            self.subscribers.remove(target, session);
+        }
+        for channel in gone.joins {
+            self.part(session, channel, unwritten);
+        }
+        if let Some(id) = gone.producer {
+            self.producers.detach(&id, session, self.now);
+        }
+        for root in &self.paused {
+            if let Some(paused) = self.roots.get_mut(root).and_then(|root| root.paused.as_mut()) {
+                paused.notified.remove(&session);
+            }
+        }
+        self.settle();
+    }
+
+    /// Applies one call from `session`. A call from a connection that is no
+    /// longer open has nobody to answer and is dropped.
+    pub fn call(&mut self, session: SessionId, call: Call) {
+        let Some((role, credential, producer)) = self.sessions.get(&session).map(|open| (open.role, open.credential.clone(), open.producer)) else { return };
+        let fits = matches!(
+            (role, &call),
+            (Role::Produce, Call::Register { seq: Some(_), .. } | Call::Delete { .. })
+                | (Role::Work, Call::Register { seq: None, .. } | Call::Join { .. } | Call::Window { .. } | Call::Complete { .. } | Call::Extend { .. } | Call::Release { .. } | Call::Claim { .. })
+                | (Role::Observe, Call::Subscribe { .. } | Call::Unsubscribe { .. } | Call::Stats { .. } | Call::Drain { .. })
+        );
+        if !fits {
+            self.fault(session, FaultKind::Malformed, "this call is not one this connection's role sends");
+            if let Some(req) = answered(&call) {
+                self.send(session, Outbound::Refused { req, reason: Refusal::Malformed }, None);
+            }
             return;
         }
-        self.swept = true;
-        while let Some(Reverse((deadline, key, token))) = self.deadlines.peek().copied() {
-            if deadline > self.now {
-                break;
+        // Sequenced calls: drop retransmissions, close on a gap.
+        let sequenced = match &call {
+            Call::Register { seq: Some(seq), .. } | Call::Delete { seq, .. } | Call::Complete { seq, .. } => Some(*seq),
+            _ => None,
+        };
+        let mut numbered = None;
+        if let (Some(seq), Some(id)) = (sequenced, producer) {
+            let applied = self.producers.entries.get(&id).map_or(0, |producer| producer.applied);
+            if seq <= applied {
+                self.counters.retransmits += 1;
+                return;
             }
-            self.deadlines.pop();
-            let current = self.queue.get(&key).and_then(|event| event.claim).map(|claim| claim.token);
-            if current == Some(token) {
-                self.reclaim(key);
+            if seq > applied + 1 {
+                self.fault(session, FaultKind::SequenceGap, "sequence number skipped ahead");
+                return self.close_session(session, Some(ByeReason::Protocol));
             }
-        }
-    }
-
-    fn reclaim(&mut self, key: WorkKey) {
-        let id = self.fresh_id();
-        let Some(event) = self.queue.get_mut(&key) else { return };
-        let claim = event.claim.take();
-        self.ids.remove(&event.id);
-        event.id = id;
-        event.retry = event.retry.saturating_add(1);
-        let retry = event.retry;
-        let channel = event.channel.clone();
-        let notice = event.notice();
-        self.ids.insert(id, key);
-        self.waiting.entry(channel).or_default().insert(key);
-        if let Some(claim) = claim {
-            self.release(claim.claimer);
-        }
-        self.effects.records.push(Record::Reclaim { key, id, retry });
-        self.announce(&notice, false);
-    }
-
-    /// The attribution number for claims made by `session`.
-    fn attribution(&mut self, session: SessionId, credential: &Name) -> u32 {
-        if let Some(number) = self.sessions.get(&session).and_then(|open| open.attribution) {
-            return number;
-        }
-        loop {
-            if self.next_attribution == u32::MAX {
-                self.next_attribution = 0;
-                self.advance_generation();
+            if let Some(entry) = self.producers.entries.get_mut(&id) {
+                entry.applied = seq;
             }
-            let number = self.next_attribution;
-            self.next_attribution += 1;
-            if let std::collections::hash_map::Entry::Vacant(free) = self.attributions.entry(number) {
-                free.insert(Attribution { credential: credential.clone(), session: Some(session), claims: 0 });
+            self.producers.touch(id);
+            numbered = Some((id, seq));
+        }
+        let before = self.effects.records.len();
+        match call {
+            Call::Register { event, .. } => self.register(session, role, &credential, event),
+            Call::Delete { id, result, tag, key, .. } => self.delete(session, &credential, id, &result, tag, key),
+            Call::Join { req, channel, types, lease_ms, dispatch } => self.join(session, &credential, req, &channel, types, lease_ms, dispatch),
+            Call::Window { channel, count, bytes } => self.window(session, &channel, count, bytes),
+            Call::Complete { id, token, follow_ups, .. } => self.complete(session, &credential, id, token, follow_ups),
+            Call::Extend { id, token } => self.extend(session, &credential, id, token),
+            Call::Release { id, token, delay_ms, failed } => self.give_back(session, &credential, id, token, delay_ms, failed),
+            Call::Claim { req, id, lease_ms } => self.claim(session, &credential, req, id, lease_ms),
+            Call::Subscribe { req, target, after } => self.subscribe(session, &credential, req, target, after),
+            Call::Unsubscribe { req, target } => {
+                let target = self.adopt_target(target);
                 if let Some(open) = self.sessions.get_mut(&session) {
-                    open.attribution = Some(number);
+                    open.targets.remove(&target);
                 }
-                return number;
+                self.subscribers.remove(&target, session);
+                self.send(session, Outbound::Unsubscribed { req }, None);
             }
+            Call::Stats { req } => self.stats(session, &credential, req),
+            Call::Drain { req } => self.drain(session, &credential, req),
+        }
+        if let Some((id, seq)) = numbered {
+            if self.effects.records.len() > before {
+                let carrying = self.carrying;
+                self.producers.wait_for(id, carrying, seq);
+            }
+        }
+        self.settle();
+    }
+
+    fn adopt_target(&mut self, target: Target) -> Target {
+        match target {
+            Target::Channel(name) => Target::Channel(self.names.adopt(&name)),
+            Target::Prefix(name) => Target::Prefix(self.names.adopt(&name)),
         }
     }
 
-    fn release(&mut self, number: u32) {
-        if let Some(attribution) = self.attributions.get_mut(&number) {
-            attribution.claims = attribution.claims.saturating_sub(1);
-            if attribution.claims == 0 && attribution.session.is_none() {
-                self.attributions.remove(&number);
-            }
-        }
-    }
-
-    /// Method 3.
-    fn claim(&mut self, session: SessionId, credential: &Name, id: EventId, worker: u32, lease_ms: u64) -> Reply {
-        let Some(key) = self.ids.get(&id).copied() else { return Reply::Refused(Refusal::Missing) };
-        let Some(event) = self.queue.get(&key) else { return Reply::Refused(Refusal::Missing) };
-        if event.claim.is_some() {
-            return Reply::Refused(Refusal::AlreadyClaimed);
-        }
-        if !self.allowed(credential, Method::Claim, &event.channel.clone()) {
-            return Reply::Refused(Refusal::Forbidden);
-        }
-        let token = self.next_token();
-        let claimer = self.attribution(session, credential);
-        if let Some(attribution) = self.attributions.get_mut(&claimer) {
-            attribution.claims += 1;
-        }
-        let deadline = self.now.saturating_add(lease_ms);
-        let Some(event) = self.queue.get_mut(&key) else { return Reply::Refused(Refusal::Missing) };
-        event.claim = Some(Claim { token, claimer, worker, deadline });
-        let answer = event.clone();
-        self.unwait(&answer.channel, key);
-        self.deadlines.push(Reverse((deadline, key, token)));
-        self.effects.records.push(Record::Claim(key));
-        Reply::Claimed(answer)
-    }
-
-    /// Method 4. Everything is checked before anything changes: either the
-    /// event goes and every follow-up is registered, or nothing happens.
-    fn complete(&mut self, credential: &Name, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>) -> (Reply, bool) {
-        let refused = |refusal| (Reply::Refused(refusal), false);
-        let Some(key) = self.ids.get(&id).copied() else { return refused(Refusal::Missing) };
-        let Some(event) = self.queue.get(&key) else { return refused(Refusal::Missing) };
-        let Some(claim) = event.claim else { return refused(Refusal::NotClaimed) };
-        if claim.token != token {
-            return refused(Refusal::StaleToken);
-        }
-        if self.attributions.get(&claim.claimer).map(|attribution| &attribution.credential) != Some(credential) {
-            return refused(Refusal::WrongCredential);
-        }
-        if !self.allowed(credential, Method::Complete, &event.channel.clone()) {
-            return refused(Refusal::Forbidden);
-        }
-        let mut admitted = Vec::with_capacity(follow_ups.len());
-        let mut chosen = HashSet::new();
-        for follow_up in follow_ups {
-            match self.admit(credential, follow_up) {
-                Ok(follow_up) => {
-                    if !follow_up.id.is_nil() && !chosen.insert(follow_up.id) {
-                        return refused(Refusal::Duplicate);
-                    }
-                    admitted.push(follow_up);
-                }
-                Err(refusal) => return refused(refusal),
-            }
-        }
-
-        let Some(parent) = self.queue.remove(&key) else { return refused(Refusal::Missing) };
-        self.ids.remove(&parent.id);
-        self.release(claim.claimer);
-        self.effects.records.push(Record::Remove(key));
-        for mut follow_up in admitted {
-            if follow_up.id.is_nil() {
-                follow_up.id = loop {
-                    let candidate = self.fresh_id();
-                    if !chosen.contains(&candidate) {
-                        break candidate;
+    /// Puts the producers' sequences in this batch and tells them `Committed`
+    /// where the rule says so (2.3).
+    fn flush_producers(&mut self) {
+        let touched = std::mem::take(&mut self.producers.touched);
+        for id in touched {
+            let Some(producer) = self.producers.entries.get_mut(&id) else { continue };
+            if std::mem::take(&mut producer.durable_now) && self.journaled {
+                let seq = producer.applied;
+                let (number, define) = match producer.number {
+                    Some(number) => (number, false),
+                    None => {
+                        let number = self.producers.next_number;
+                        producer.number = Some(number);
+                        (number, true)
                     }
                 };
-            }
-            match follow_up.kind {
-                Kind::Claimable => {
-                    self.enqueue(follow_up, true);
+                if define {
+                    self.producers.next_number += 1;
+                    self.record(Record::ProducerDef { number, id });
                 }
-                Kind::Dispatch => self.deliver(follow_up, true),
+                self.record(Record::Producer { number, seq });
             }
+            self.ack_producer(&id);
         }
-        (Reply::Completed, true)
     }
 
-    /// Method 5.
-    fn delete(&mut self, credential: &Name, id: EventId, result: &Name, tag: EventId, key: Option<WorkKey>) -> (Reply, bool) {
-        let result = self.names.adopt(result);
-        let found = self.ids.get(&id).copied();
-        let channel = found.and_then(|found| self.queue.get(&found)).map(|event| event.channel.clone());
-        if !self.allowed(credential, Method::Delete, &result) || channel.as_ref().is_some_and(|channel| !self.allowed(credential, Method::Delete, channel)) {
-            return (Reply::Refused(Refusal::Forbidden), false);
-        }
-        let failure = match found {
-            None => Some(DeleteFailure::Missing),
-            Some(found) if key.is_some_and(|key| key != found) => Some(DeleteFailure::OtherRegistration),
-            Some(found) if self.queue.get(&found).is_some_and(|event| event.claim.is_some()) => Some(DeleteFailure::Claimed),
-            Some(_) => None,
-        };
-        if let (None, Some(found)) = (failure, found) {
-            if let Some(event) = self.queue.remove(&found) {
-                self.ids.remove(&event.id);
-                self.unwait(&event.channel, found);
+    fn ack_producer(&mut self, id: &ProducerId) {
+        let every = self.config.ack_every;
+        let Some(producer) = self.producers.entries.get_mut(id) else { return };
+        let session = producer.session;
+        let quiet = producer.quiet;
+        if let Some(seq) = producer.ack(every) {
+            if let (Some(session), false) = (session, quiet) {
+                self.send(session, Outbound::Committed { seq }, None);
             }
-            self.effects.records.push(Record::Remove(found));
         }
-        let removed = failure.is_none();
-        let event_type = self.names.intern(if removed { DELETED } else { DELETE_FAILED });
-        let notice = Envelope { id: self.fresh_id(), principal: Some(credential.clone()), correlation: Some(tag), ..Envelope::dispatch(result, event_type, delete_payload(id, failure)) };
-        self.deliver(notice, removed);
-        (Reply::Deleted { removed }, removed)
     }
 
-    /// Method 6.
-    fn subscribe(&mut self, session: SessionId, credential: &Name, channel: &Name, after: Option<WorkKey>) -> Reply {
-        if !self.allowed(credential, Method::Subscribe, channel) {
-            return Reply::Refused(Refusal::Forbidden);
-        }
-        let channel = self.names.adopt(channel);
-        if let Some(open) = self.sessions.get_mut(&session) {
-            if open.channels.insert(channel.clone()) {
-                self.subscribers.entry(channel.clone()).or_default().push(session);
+    /// Runs the work a step left: fills joins that got room, then offers the
+    /// lanes that got events.
+    fn settle(&mut self) {
+        loop {
+            if let Some(join) = self.to_fill.pop() {
+                self.fill(&join);
+                continue;
+            }
+            if self.to_offer.is_empty() {
+                break;
+            }
+            let mut lanes = std::mem::take(&mut self.to_offer);
+            lanes.sort();
+            lanes.dedup();
+            for lane in lanes {
+                self.offer(&lane);
             }
         }
-        let mut backlog = Vec::new();
-        let mut more = false;
-        if let Some(waiting) = self.waiting.get(&channel) {
-            let start = match after {
-                Some(after) => std::ops::Bound::Excluded(after),
-                None => std::ops::Bound::Unbounded,
-            };
-            for key in waiting.range((start, std::ops::Bound::Unbounded)) {
-                if backlog.len() == self.backlog_page {
-                    more = true;
-                    break;
-                }
-                if let Some(event) = self.queue.get(key) {
-                    backlog.push(event.notice());
-                }
-            }
-        }
-        Reply::Subscribed { channel, backlog, more }
+    }
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn allowed(grants: &Option<Grants>, credential: &Name, method: Method, channel: &str) -> bool {
+    match grants {
+        None => true,
+        Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.allows(method, channel)),
+    }
+}
+
+/// The request number of a call that is answered.
+fn answered(call: &Call) -> Option<u32> {
+    match call {
+        Call::Join { req, .. } | Call::Claim { req, .. } | Call::Subscribe { req, .. } | Call::Unsubscribe { req, .. } | Call::Stats { req } | Call::Drain { req } => Some(*req),
+        _ => None,
     }
 }
 

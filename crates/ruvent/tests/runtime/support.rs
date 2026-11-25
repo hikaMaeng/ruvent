@@ -1,6 +1,6 @@
 //! Journals that can be held, failed or watched, and small helpers.
 
-use ruvent::{async_trait, Bytes, Envelope, Inbox, Incoming, Journal, Record};
+use ruvent::{async_trait, connect, Batch, Bytes, Client, Engine, Envelope, Hello, Inbox, Incoming, Journal};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 /// Writes only when a permit is released, and remembers what it wrote.
 #[derive(Clone)]
 pub struct Gate {
-    pub written: Arc<Mutex<Vec<Vec<Record>>>>,
+    pub written: Arc<Mutex<Vec<Batch>>>,
     pub permits: Arc<Semaphore>,
 }
 
@@ -28,14 +28,14 @@ impl Gate {
 
 #[async_trait]
 impl Journal for Gate {
-    async fn append(&mut self, records: Vec<Record>) -> io::Result<()> {
+    async fn append(&mut self, batch: Batch) -> io::Result<()> {
         self.permits.acquire().await.map_err(io::Error::other)?.forget();
-        self.written.lock().unwrap().push(records);
+        self.written.lock().unwrap().push(batch);
         Ok(())
     }
 
-    async fn rewrite(&mut self, records: Vec<Record>) -> io::Result<()> {
-        self.append(records).await
+    async fn rewrite(&mut self, batch: Batch) -> io::Result<()> {
+        self.append(batch).await
     }
 }
 
@@ -46,7 +46,7 @@ pub struct Failing {
 
 #[async_trait]
 impl Journal for Failing {
-    async fn append(&mut self, _records: Vec<Record>) -> io::Result<()> {
+    async fn append(&mut self, _batch: Batch) -> io::Result<()> {
         if self.good == 0 {
             return Err(io::Error::other("disk on fire"));
         }
@@ -54,8 +54,8 @@ impl Journal for Failing {
         Ok(())
     }
 
-    async fn rewrite(&mut self, records: Vec<Record>) -> io::Result<()> {
-        self.append(records).await
+    async fn rewrite(&mut self, batch: Batch) -> io::Result<()> {
+        self.append(batch).await
     }
 }
 
@@ -71,15 +71,38 @@ pub fn work(channel: &str) -> Envelope {
     Envelope::claimable(channel, "do", Bytes::from_static(b"p"))
 }
 
+pub async fn producer(engine: &Engine) -> (Client, Inbox) {
+    connect(engine, Hello::producer("svc"), 64).await.unwrap()
+}
+
+pub async fn worker(engine: &Engine) -> (Client, Inbox) {
+    connect(engine, Hello::worker("svc"), 64).await.unwrap()
+}
+
+pub async fn observer(engine: &Engine) -> (Client, Inbox) {
+    connect(engine, Hello::observer("svc"), 64).await.unwrap()
+}
+
 /// How long "nothing arrives" is watched for. Only for asserting absence.
 pub const QUIET: Duration = Duration::from_millis(80);
 
-/// The next notice or delivery, skipping subscription markers.
+/// The next message, skipping subscription markers.
 pub async fn next_event(inbox: &mut Inbox) -> Option<Incoming> {
     loop {
         match tokio::time::timeout(Duration::from_secs(5), inbox.recv()).await.ok()?? {
             Incoming::Subscribed(_) => continue,
             other => return Some(other),
+        }
+    }
+}
+
+/// The next assignment, skipping everything else.
+pub async fn next_assignment(inbox: &mut Inbox) -> ruvent::Assignment {
+    loop {
+        match next_event(inbox).await {
+            Some(Incoming::Assign(assignment)) => return assignment,
+            Some(_) => continue,
+            None => panic!("no assignment arrived"),
         }
     }
 }
