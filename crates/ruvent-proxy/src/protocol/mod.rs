@@ -2,7 +2,7 @@
 //!
 //! | feature | routes |
 //! | --- | --- |
-//! | always | `GET /health`: 200 while the upstream connection is up, 503 otherwise |
+//! | always | `GET /health`: 200 while every listed server's connections are up, 503 otherwise; the body is the [`crate::Health`] JSON, one row per server |
 //! | `ws` | `GET /v1/ws` ([`ws`]) |
 //! | `http` | `POST /v1/events`, `GET /v1/stream` ([`http`]) |
 //!
@@ -21,8 +21,9 @@ use crate::message::Cause;
 use axum::extract::{ConnectInfo, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use std::net::SocketAddr;
 
 /// Every route of the protocols this crate was built with.
@@ -35,12 +36,10 @@ pub fn router(proxy: Proxy) -> Router {
     routes.with_state(proxy)
 }
 
-async fn health(State(proxy): State<Proxy>) -> StatusCode {
-    if proxy.is_ready() {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
+async fn health(State(proxy): State<Proxy>) -> Response {
+    let health = proxy.health();
+    let status = if health.ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status, Json(health)).into_response()
 }
 
 /// The handshake of a request; `token` is left to the protocol.

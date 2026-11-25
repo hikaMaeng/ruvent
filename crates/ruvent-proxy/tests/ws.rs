@@ -1,9 +1,11 @@
 //! The WebSocket protocol over real TCP, upstream in-process.
 
+mod support;
+
 use futures_util::{SinkExt, StreamExt};
-use ruvent::{Bytes, Engine, EngineConfig, Envelope, Methods};
+use ruvent::Engine;
 use ruvent_proxy::config::{AuthMode, StaticToken};
-use ruvent_proxy::{InProcess, Proxy, ProxyConfig, Server};
+use ruvent_proxy::{Proxy, ProxyConfig, Server};
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -22,8 +24,8 @@ struct Running {
 }
 
 async fn start(config: ProxyConfig) -> Running {
-    let engine = Engine::volatile(EngineConfig::default()).await;
-    let bound = Server::new().config(config).upstream(InProcess { engine: engine.clone(), credential: "proxy".into() }).bind().await.unwrap();
+    let (engine, upstream) = support::one().await;
+    let bound = Server::new().config(config).upstream(upstream).bind().await.unwrap();
     assert!(bound.proxy().ready().await);
     let address = bound.local_addr().unwrap();
     let proxy = bound.proxy().clone();
@@ -33,7 +35,7 @@ async fn start(config: ProxyConfig) -> Running {
 
 /// Static tokens: `t` is user `u` with every channel.
 fn static_config() -> ProxyConfig {
-    let mut config = ProxyConfig::open("127.0.0.1:0", "in-process");
+    let mut config = ProxyConfig::open("127.0.0.1:0", "s0");
     config.auth.mode = AuthMode::Static;
     config.auth.tokens = vec![StaticToken { token: "t".into(), user: "u".into(), channels: vec![] }];
     config
@@ -87,8 +89,7 @@ async fn a_websocket_user_subscribes_receives_and_publishes() {
     send(&mut socket, r#"{"op":"subscribe","channel":"room","ref":1}"#).await;
     let subscribed = read_json(&mut socket).await;
     assert_eq!((subscribed["ref"].clone(), subscribed["ok"].clone()), (Value::from(1), Value::from(true)));
-    let (peer, _inbox) = ruvent::connect(&running.engine, "peer", 64).await.unwrap();
-    peer.register_dispatch(Envelope::dispatch("room", "said", Bytes::from_static(br#"{"text":"hi"}"#))).await.unwrap();
+    support::dispatch(&running.engine, "room", &br#"{"text":"hi"}"#[..]).await;
     let event = read_json(&mut socket).await;
     assert_eq!(event["op"], "event");
     assert_eq!(event["payload"]["text"], "hi");
@@ -168,19 +169,21 @@ async fn a_wrong_in_band_token_is_rejected_without_asking_again() {
 /// In `none` mode no token is needed and none is asked for.
 #[tokio::test]
 async fn mode_none_needs_no_token() {
-    let running = start(ProxyConfig::open("127.0.0.1:0", "in-process")).await;
+    let running = start(ProxyConfig::open("127.0.0.1:0", "s0")).await;
     let mut socket = connect(running.address, "").await;
     assert_eq!(read_json(&mut socket).await["ok"], true);
 }
 
 // ── health and stopping ──────────────────────────────────────────────────
 
-/// `/health` answers 200 once the upstream is connected.
+/// `/health` answers 200 once every listed server's connections are up, and its body says so per server.
 #[tokio::test]
 async fn health_is_ok_while_the_upstream_is_up() {
-    let running = start(ProxyConfig::open("127.0.0.1:0", "in-process")).await;
+    let running = start(ProxyConfig::open("127.0.0.1:0", "s0")).await;
     let response = get(running.address, "/health").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"ready":true,"servers":[{"server":"s0","observing":true,"replying":true}]}));
 }
 
 /// Once the hub stopped, `/health` answers 503 and connected sockets are closed.

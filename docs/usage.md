@@ -97,7 +97,9 @@ let response = requester.request(Envelope::claimable("orders", "price", body), R
 
 워커 핸들러에서 결과는 `cx.reply(payload)`(응답 채널의 후속, `expires` 60초), 조각은 `cx.fragment(payload).await`
 (작업 연결로 바로 방출)로 낸다. 관찰자(`observer::Observer`)는 구독을 연결마다 다시 내고 발송 엔벨롭을 그대로
-넘긴다. 끊긴 동안의 발송은 `Observed::Gap`으로 알린다.
+넘긴다. 끊긴 동안의 발송은 `Observed::Gap`으로 알린다. 서버의 구독 확인은 `Observed::Subscribed { server, target, ticket }`로
+스트림에 들어온다. ticket은 관찰자가 처리한 `subscribe` 호출의 순번이고, k번째 호출은 그 서버에서 ticket ≥ k인 첫 확인부터
+효력이 있다(그 뒤의 발송은 구독이 선 뒤에 보내진 것). 요청자의 응답 채널 참여 변화는 `Requester::watch_joined()`로 기다린다.
 
 | `Bye` 사유 | SDK |
 | --- | --- |
@@ -126,13 +128,24 @@ cargo run --release -p ruvent-proxy --example plain -- crates/ruvent-proxy/proxy
 cargo run --release -p ruvent-proxy --example custom -- crates/ruvent-proxy/proxy.example.json
 ```
 
-* WS: `GET /v1/ws?token=…` 뒤에 JSON 메시지(`publish`, `subscribe`, `unsubscribe`)를 주고받는다.
-* HTTP: `POST /v1/events`(Bearer 토큰)로 등록, `GET /v1/stream?channel=…`(SSE)로 받는다.
-* 훅: `authenticate`, `subscribe`, `publish`, `deliver` 중 필요한 것만 쓴다. 쓰지 않은 훅은 설정의 인증 모드
-  (`none`, `static`, `worker`)와 채널 범위를 따른다. 훅, 메시지 형식, 설정은
+* 상향: 설정의 `upstream.servers`에 적은 **모든 서버**에 붙는다. 서버마다 관찰(구독), 생산(등록), 작업(응답 채널)
+  연결이 하나씩이고 모두 SDK의 것이다(재접속, keepalive, `Bye` 사유표). 라우터가 관리하는 목록이나 같은 프로세스
+  엔진은 `Server::upstream(Upstream { connector, servers, credential })`로 넘긴다.
+* WS: `GET /v1/ws?token=…` 뒤에 JSON 메시지(`publish`, `subscribe`, `unsubscribe`)를 주고받는다. 구독은 정확한
+  `channel` 또는 `prefix`(그 아래 `.` 경계의 모든 채널) 하나를 적는다.
+* HTTP: `POST /v1/events`(Bearer 토큰)로 등록하고 커밋되면 200이다. `GET /v1/stream?channel=…&prefix=…`(SSE)로 받는다.
+* `/health`: 목록의 모든 서버에서 관찰 연결과 응답 채널 참여가 살아 있으면 200, 아니면 503. 본문에 서버별 상태가 있다.
+* 요청–응답: `Proxy::exchange(event)`(또는 훅의 `cx.upstream()?.exchange(…)`). 결과는 프록시 인스턴스의 응답 채널
+  `reply.<인스턴스 id>`에 착수용 이벤트로 오고, 상향이 끊겨도 기다리던 결과는 다시 붙으면 온다. 조각은 결과보다
+  앞서 같은 연결로 온다(`exchange_stream`).
+* 원 엔벨롭: 자기 프로토콜을 붙이는 프로그램은 `Proxy::attach_raw`로 `Outgoing::Event(Arc<Envelope>)`를 받는다.
+  payload를 JSON 텍스트로 바꾸지 않는다.
+* 훅: `authenticate`, `subscribe`(대상이 채널 또는 접두사), `publish`, `deliver` 중 필요한 것만 쓴다. 쓰지 않은 훅은
+  설정의 인증 모드(`none`, `static`, `worker`)와 채널 범위를 따른다. `worker` 인증은 요청–응답 하나이고, 워커는
+  요청의 `reply` 채널에 착수용 후속으로 답한다. 훅, 메시지 형식, 설정, 오류 → 상태 코드는
   [crates/ruvent-proxy/README.md](../crates/ruvent-proxy/README.md).
-* 멈추기: `run()`은 Ctrl-C에, `run_until(신호)`는 그 신호에 끝난다. 끝나면 사용자 연결이 모두 닫히고 상위 연결도
-  놓는다. 바인드만 하고 직접 서비스하려면 `bind()` 뒤 `Bound::serve_until(신호)`.
+* 멈추기: `run()`은 Ctrl-C에, `run_until(신호)`는 그 신호에 끝난다. 끝나면 사용자 연결이 모두 닫히고 상향 연결도
+  모두 놓는다. 바인드만 하고 직접 서비스하려면 `bind()` 뒤 `Bound::serve_until(신호)`.
 
 ## 워커가 정하는 것
 

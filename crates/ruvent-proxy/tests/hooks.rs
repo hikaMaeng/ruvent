@@ -1,10 +1,12 @@
 //! The proxy built the way a user builds it: `Server`, a configuration, and
 //! hooks. Real TCP, both protocols on one listener, upstream in-process.
 
+mod support;
+
 use futures_util::{SinkExt, StreamExt};
-use ruvent::{Bytes, Engine, EngineConfig, Envelope, Incoming, Methods};
+use ruvent::{Engine, Envelope, Target};
 use ruvent_proxy::hooks::publish_within_scope;
-use ruvent_proxy::{async_trait, Context, Denied, Handshake, Hooks, InProcess, Publish, Rejection, Server, User};
+use ruvent_proxy::{async_trait, Context, Denied, Handshake, Hooks, Publish, Rejection, Server, Upstream, User};
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,11 +30,7 @@ async fn serve(server: Server) -> SocketAddr {
 }
 
 fn listen_anywhere() -> ruvent_proxy::ProxyConfig {
-    ruvent_proxy::ProxyConfig::open("127.0.0.1:0", "in-process")
-}
-
-fn in_process(engine: &Engine) -> InProcess {
-    InProcess { engine: engine.clone(), credential: "proxy".into() }
+    ruvent_proxy::ProxyConfig::open("127.0.0.1:0", "s0")
 }
 
 async fn socket(address: SocketAddr, query: &str, cookie: Option<&str>) -> Socket {
@@ -75,11 +73,11 @@ async fn a_configuration_file_and_nothing_else_is_a_running_proxy_for_both_proto
     let directory = std::env::temp_dir().join(format!("ruvent-proxy-hooks-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("proxy.json");
-    let text = r#"{"listen":"127.0.0.1:0","upstream":{"address":"unused","token":"unused"},
+    let text = r#"{"listen":"127.0.0.1:0","upstream":{"servers":["s0"],"token":"unused"},
         "auth":{"mode":"static","tokens":[{"token":"t","user":"u","channels":["room*"]}]}}"#;
     std::fs::write(&path, text).unwrap();
-    let engine = Engine::volatile(EngineConfig::default()).await;
-    let address = serve(Server::new().config_file(&path).upstream(in_process(&engine))).await;
+    let (_engine, upstream) = support::one().await;
+    let address = serve(Server::new().config_file(&path).upstream(upstream)).await;
 
     assert_eq!(http(address, "GET", "/health", "X: y", "").await.0, 200);
     let mut ws = socket(address, "?token=t", None).await;
@@ -111,9 +109,9 @@ impl Hooks for Domain {
         }
     }
 
-    async fn subscribe(&self, _cx: Context<'_>, user: &User, channel: &str) -> Result<(), Rejection> {
+    async fn subscribe(&self, _cx: Context<'_>, user: &User, target: &Target) -> Result<(), Rejection> {
         let tenant = user.data::<Tenant>().map(|tenant| tenant.0).unwrap_or_default();
-        if channel.starts_with(&format!("tenant.{tenant}.")) {
+        if format!("{}.", target.name()).starts_with(&format!("tenant.{tenant}.")) {
             Ok(())
         } else {
             Err(Rejection::forbidden("other tenant"))
@@ -137,8 +135,8 @@ impl Hooks for Domain {
 }
 
 async fn domain() -> (Engine, SocketAddr) {
-    let engine = Engine::volatile(EngineConfig::default()).await;
-    let address = serve(Server::new().config(listen_anywhere()).hooks(Domain).upstream(in_process(&engine))).await;
+    let (engine, upstream) = support::one().await;
+    let address = serve(Server::new().config(listen_anywhere()).hooks(Domain).upstream(upstream)).await;
     (engine, address)
 }
 
@@ -164,19 +162,13 @@ async fn custom_hooks_decide_who_comes_in_and_carry_the_domains_data() {
 #[tokio::test]
 async fn a_publish_hook_refuses_with_its_own_cause_and_rewrites_what_it_allows() {
     let (engine, address) = domain().await;
-    let (peer, mut inbox) = ruvent::connect(&engine, "peer", 64).await.unwrap();
-    peer.subscribe("tenant.acme.room".into(), None).await.unwrap();
+    let (_watcher, mut inbox) = support::watch_target(&engine, Target::Channel("tenant.acme.room".into())).await;
 
     let (status, result) = http(address, "POST", "/v1/events", "Cookie: session=s-bob", r#"{"kind":"dispatch","channel":"room","type":"admin.reset","payload":1}"#).await;
     assert_eq!((status, result["error"].clone()), (403, Value::from("operators only")));
     let (status, result) = http(address, "POST", "/v1/events", "Cookie: session=s-bob", r#"{"kind":"dispatch","channel":"room","type":"said","payload":{"n":2}}"#).await;
     assert_eq!((status, result["ok"].clone()), (200, Value::from(true)));
-    let delivered = loop {
-        match tokio::time::timeout(WAIT, inbox.recv()).await.expect("timed out").expect("closed") {
-            Incoming::Delivery(event) => break event,
-            _ => continue,
-        }
-    };
+    let delivered = support::next_delivery(&mut inbox).await;
     assert_eq!(&*delivered.channel, "tenant.acme.room");
     assert_eq!(delivered.delegate.as_deref(), Some("bob"));
 }
@@ -193,9 +185,8 @@ async fn a_deliver_hook_picks_which_users_see_an_event() {
         assert_eq!(read_json(&mut user).await["ok"], true);
         users.push(user);
     }
-    let (peer, _inbox) = ruvent::connect(&engine, "peer", 64).await.unwrap();
-    peer.register_dispatch(Envelope::dispatch("tenant.acme.room", "said", Bytes::from_static(br#"{"to":"alice","n":1}"#))).await.unwrap();
-    peer.register_dispatch(Envelope::dispatch("tenant.acme.room", "said", Bytes::from_static(br#"{"n":2}"#))).await.unwrap();
+    support::dispatch(&engine, "tenant.acme.room", &br#"{"to":"alice","n":1}"#[..]).await;
+    support::dispatch(&engine, "tenant.acme.room", &br#"{"n":2}"#[..]).await;
     let (alice, bob) = users.split_at_mut(1);
     assert_eq!(read_json(&mut alice[0]).await["payload"]["n"], 1);
     assert_eq!(read_json(&mut alice[0]).await["payload"]["n"], 2);
@@ -207,19 +198,13 @@ async fn a_deliver_hook_picks_which_users_see_an_event() {
 #[tokio::test]
 async fn a_rewriting_publish_hook_still_checks_the_reply_channel() {
     let (engine, address) = domain().await;
-    let (peer, mut inbox) = ruvent::connect(&engine, "peer", 64).await.unwrap();
-    peer.subscribe("tenant.acme.room".into(), None).await.unwrap();
+    let (_watcher, mut inbox) = support::watch_target(&engine, Target::Channel("tenant.acme.room".into())).await;
     let foreign = r#"{"kind":"dispatch","channel":"room","type":"ask","payload":1,"reply":"tenant.other.inbox"}"#;
     let (status, result) = http(address, "POST", "/v1/events", "Cookie: session=s-bob", foreign).await;
     assert_eq!((status, result["error"].clone()), (403, Value::from("forbidden reply channel")));
     let own = r#"{"kind":"dispatch","channel":"room","type":"ask","payload":2,"reply":"tenant.acme.inbox"}"#;
     assert_eq!(http(address, "POST", "/v1/events", "Cookie: session=s-bob", own).await.0, 200);
-    let delivered = loop {
-        match tokio::time::timeout(WAIT, inbox.recv()).await.expect("timed out").expect("closed") {
-            Incoming::Delivery(event) => break event,
-            _ => continue,
-        }
-    };
+    let delivered = support::next_delivery(&mut inbox).await;
     assert_eq!((&*delivered.channel, delivered.reply.as_deref()), ("tenant.acme.room", Some("tenant.acme.inbox")));
     assert_eq!(&delivered.payload[..], b"2", "only the allowed registration reached the event server");
 }
@@ -239,9 +224,9 @@ impl Hooks for NeverSure {
 /// A WebSocket asks the authenticate hook at most twice: with the handshake, and once more with an in-band token.
 #[tokio::test]
 async fn the_authenticate_hook_is_asked_at_most_twice_per_websocket() {
-    let engine = Engine::volatile(EngineConfig::default()).await;
+    let (_engine, upstream): (Engine, Upstream) = support::one().await;
     let hooks = Arc::new(NeverSure::default());
-    let address = serve(Server::new().config(listen_anywhere()).hooks(Shared(hooks.clone())).upstream(in_process(&engine))).await;
+    let address = serve(Server::new().config(listen_anywhere()).hooks(Shared(hooks.clone())).upstream(upstream)).await;
     let mut socket = socket(address, "", None).await;
     send(&mut socket, r#"{"op":"auth","token":"anything"}"#).await;
     assert_eq!(read_json(&mut socket).await["error"], "authentication required");

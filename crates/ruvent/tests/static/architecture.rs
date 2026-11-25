@@ -197,8 +197,10 @@ fn workspace_library() -> Vec<Source> {
 /// | `ruvent-client/worker/run.rs` `time::timeout(` | a handler's run limit: past it the run is cut off and released (B7; the lease is no longer the run limit) |
 /// | `ruvent-server/connection/handshake.rs` `time::timeout(` | how long a new connection has to say hello |
 /// | `ruvent-server/connection/close.rs` `time::timeout(` | the deadline of a staged close after `Bye` (2.2, S20) |
-/// | `ruvent-proxy/hub/mod.rs` `time::timeout(` | how long an authentication worker has to answer |
-/// | `ruvent-proxy/hub/task.rs` `time::sleep(` | back-off before reconnecting to the upstream server |
+///
+/// The proxy declares none of its own: it reconnects through the SDK's lines
+/// and waits for an authentication worker's answer with the SDK requester's
+/// call deadline.
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
     ("ruvent/engine/mod.rs", "time::sleep(", 1),
@@ -209,8 +211,6 @@ const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent-client/worker/run.rs", "time::timeout(", 1),
     ("ruvent-server/connection/handshake.rs", "time::timeout(", 1),
     ("ruvent-server/connection/close.rs", "time::timeout(", 1),
-    ("ruvent-proxy/hub/mod.rs", "time::timeout(", 1),
-    ("ruvent-proxy/hub/task.rs", "time::sleep(", 1),
 ];
 
 /// Ways of finding out by asking again. None may appear in a library, except

@@ -1,11 +1,12 @@
 //! Build a proxy server for end users.
 //!
-//! A proxy holds one connection to the event server and one upstream
-//! subscription per channel, however many users it serves, so the event
-//! server's connection count is "proxies + worker servers" (proposal §4.3,
-//! §6.5). This crate is the whole proxy: there is no separate binary per
-//! protocol. You pick the protocols as features and write a three-line
-//! `main`:
+//! A proxy is the event servers' dispatch fan-out layer (plan 4장): it
+//! connects to every event server of a list, holds one upstream
+//! subscription per channel (or prefix) per server however many users it
+//! serves, and hands each event to its users. A server's dispatch cost is
+//! then proportional to the number of proxies, not of users. This crate is
+//! the whole proxy: there is no separate binary per protocol. You pick the
+//! protocols as features and write a three-line `main`:
 //!
 //! ```no_run
 //! # #[cfg(any(feature = "ws", feature = "http"))]
@@ -55,16 +56,18 @@
 //! | [`handshake`] | what a user's connection or request carried: headers, query, peer, token |
 //! | [`config`] | the JSON file |
 //! | [`auth`] | end users, and the configured modes: `none`, `static` tokens (Q1(c)), an authentication worker (Q1(a)) |
-//! | [`hub`] | the upstream subscriptions and the fan-out to users |
-//! | [`message`] | the user-facing JSON, the same for every protocol |
-//! | [`upstream`] | where the upstream connection comes from |
+//! | [`hub`] | the upstream subscriptions and the fan-out to users; publishing and request–response |
+//! | [`health`] | what `/health` reports: each listed server's connections |
+//! | [`message`] | the user-facing JSON, the same for every protocol, and the raw event stream |
+//! | [`upstream`] | where the upstream connections go: connector, server list, credential |
 //!
-//! A user that was disconnected misses what was sent meanwhile (Q8(a)); a
-//! user whose send buffer fills is disconnected.
+//! A user that was disconnected misses what was sent meanwhile (dispatch is
+//! one-shot, 0.3); a user whose send buffer fills is disconnected.
 
 pub mod auth;
 pub mod config;
 pub mod handshake;
+pub mod health;
 pub mod hooks;
 pub mod hub;
 pub mod message;
@@ -78,12 +81,14 @@ pub mod server;
 pub use auth::{Denied, User};
 pub use config::ProxyConfig;
 pub use handshake::Handshake;
+pub use health::{Health, ServerHealth};
 pub use hooks::{Context, Defaults, Hooks, UpstreamCalls};
 pub use hub::{bad_request, Proxy, UserHandle, UserId};
-pub use message::{Cause, Outcome, Publish, PublishKind, Rejection, Request};
+pub use message::{Cause, Outcome, Outgoing, Publish, PublishKind, Rejection, Request};
 #[cfg(any(feature = "ws", feature = "http"))]
 pub use protocol::router;
-pub use ruvent::{async_trait, Envelope};
+pub use ruvent::{async_trait, Envelope, Target};
+pub use ruvent_client::requester::{Part, RequestError, RequestOptions, Response, Stream};
 #[cfg(any(feature = "ws", feature = "http"))]
 pub use server::{Bound, LaunchError, Server};
-pub use upstream::{Connector, InProcess, Remote};
+pub use upstream::{Connector, Local, ServerList, Servers, Tcp, Upstream};

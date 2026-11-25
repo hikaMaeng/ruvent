@@ -7,13 +7,13 @@
 //!           once, byte bound, stale assignments dropped) → records → vectored write ─► socket
 //! ```
 //!
-//! * [`handshake`]: the first record, version 1 recognised and refused.
-//! * [`read`]: the read task. A production connection stops reading only
+//! * `handshake`: the first record, version 1 recognised and refused.
+//! * `read`: the read task. A production connection stops reading only
 //!   while the engine says so (`Session::reading`, a connection that kept
 //!   writing to a paused root); a work connection never stops.
 //! * [`write`]: the owner. It holds the connection's unsent messages and is
 //!   the only one that encodes and writes.
-//! * [`close`]: every `Bye` is followed by a staged close under one deadline.
+//! * `close`: every `Bye` is followed by a staged close under one deadline.
 //! * [`socket`]: TCP keepalive (S13).
 //!
 //! The engine never waits on this socket: it hands the owner what it has and

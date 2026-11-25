@@ -1,8 +1,10 @@
 //! The HTTP protocol over real TCP, upstream in-process.
 
-use ruvent::{Engine, EngineConfig};
+mod support;
+
+use ruvent::{Engine, Hello, Methods, Target};
 use ruvent_proxy::config::{AuthMode, StaticToken};
-use ruvent_proxy::{InProcess, Proxy, ProxyConfig, Server};
+use ruvent_proxy::{Proxy, ProxyConfig, Server};
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,16 +16,21 @@ const ID: &str = "0190f5b2-6f1e-7c4a-9d2b-3a4b5c6d7e8f";
 
 /// Static token `t` is user `u` on `room*`.
 async fn start() -> (SocketAddr, Proxy) {
-    let engine = Engine::volatile(EngineConfig::default()).await;
-    let mut config = ProxyConfig::open("127.0.0.1:0", "in-process");
+    let (address, proxy, _engine) = start_with_engine().await;
+    (address, proxy)
+}
+
+async fn start_with_engine() -> (SocketAddr, Proxy, Engine) {
+    let (engine, upstream) = support::one().await;
+    let mut config = ProxyConfig::open("127.0.0.1:0", "s0");
     config.auth.mode = AuthMode::Static;
     config.auth.tokens = vec![StaticToken { token: "t".into(), user: "u".into(), channels: vec!["room*".into()] }];
-    let bound = Server::new().config(config).upstream(InProcess { engine, credential: "proxy".into() }).bind().await.unwrap();
+    let bound = Server::new().config(config).upstream(upstream).bind().await.unwrap();
     assert!(bound.proxy().ready().await);
     let address = bound.local_addr().unwrap();
     let proxy = bound.proxy().clone();
     tokio::spawn(bound.serve());
-    (address, proxy)
+    (address, proxy, engine)
 }
 
 /// One request with `Connection: close`; returns the status and the JSON body.
@@ -125,14 +132,19 @@ async fn a_malformed_id_is_400_even_when_the_reply_channel_is_forbidden() {
     assert_eq!((status, result["error"].clone()), (403, Value::from("forbidden reply channel")));
 }
 
-/// A claimable event whose id is already waiting is 409.
+/// 2.3: re-posting a claimable event whose id is still waiting, with the same content, is accepted
+/// (a resend) and registers nothing twice — no per-registration answer, no 409.
 #[tokio::test]
-async fn a_duplicate_waiting_id_is_409() {
-    let (address, _proxy) = start().await;
+async fn a_repeated_waiting_id_is_accepted_and_registered_once() {
+    let (address, _proxy, engine) = start_with_engine().await;
     let body = format!(r#"{{"kind":"claimable","channel":"room.jobs","type":"run","payload":1,"id":"{ID}"}}"#);
-    assert_eq!(post(address, "t", &body).await.0, 200);
-    let (status, result) = post(address, "t", &body).await;
-    assert_eq!((status, result["error"].clone()), (409, Value::from("duplicate")));
+    let (status, first) = post(address, "t", &body).await;
+    assert_eq!((status, first["id"].clone()), (200, Value::from(ID)));
+    let (status, second) = post(address, "t", &body).await;
+    assert_eq!((status, second["id"].clone()), (200, Value::from(ID)));
+    let (observer, _inbox) = ruvent::connect(&engine, Hello::observer("operator"), 16).await.unwrap();
+    let backlog = observer.subscribe(Target::Channel("room.jobs".into()), None).await.unwrap();
+    assert_eq!(backlog.notices.len(), 1, "one event waits under that id");
 }
 
 // ── subscribe ────────────────────────────────────────────────────────────
@@ -141,11 +153,24 @@ async fn a_duplicate_waiting_id_is_409() {
 #[tokio::test]
 async fn a_stream_naming_no_channel_is_400() {
     let (address, _proxy) = start().await;
-    for query in ["", "?channel=", "?other=room"] {
+    for query in ["", "?channel=", "?prefix=", "?other=room"] {
         let (status, result) = request(address, "GET", &format!("/v1/stream{query}"), "Authorization: Bearer t\r\n", "").await;
         assert_eq!(status, 400, "{query}");
-        assert_eq!(result["error"], "name at least one channel: ?channel=…");
+        assert_eq!(result["error"], "name at least one channel: ?channel=… or ?prefix=…");
     }
+}
+
+/// `?prefix=` subscribes to every channel below it; a prefix outside the user's scope is 403, shown as `prefix.*`.
+#[tokio::test]
+async fn an_sse_stream_takes_a_prefix() {
+    let (address, _proxy) = start().await;
+    let (mut stream, status) = open_stream(address, "?prefix=room").await;
+    assert_eq!(status, 200);
+    post(address, "t", r#"{"kind":"dispatch","channel":"room","type":"t","payload":"not below"}"#).await;
+    post(address, "t", r#"{"kind":"dispatch","channel":"room.a.b","type":"t","payload":"below"}"#).await;
+    assert_eq!(next_event(&mut stream).await["payload"], "below");
+    let (status, result) = request(address, "GET", "/v1/stream?prefix=admin", "Authorization: Bearer t\r\n", "").await;
+    assert_eq!((status, result["error"].clone()), (403, Value::from("admin.*: forbidden channel")));
 }
 
 /// A stream asking for a channel outside the user's scope is 403, naming the channel.

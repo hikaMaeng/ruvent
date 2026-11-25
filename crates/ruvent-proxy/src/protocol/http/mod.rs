@@ -6,9 +6,15 @@
 //!   registered, 401 when authentication fails, and for a rejection the
 //!   status of its [`crate::Cause`]: 400 invalid, 403 forbidden, 409 conflict,
 //!   503 unavailable.
-//! * `GET /v1/stream?channel=a&channel=b` — subscribes and streams events as
-//!   SSE `data:` lines, one event JSON each. The stream starts only after
-//!   every subscription took effect; it ends when the user's buffer fills.
+//! * `GET /v1/stream?channel=a&channel=b&prefix=c` — subscribes and streams
+//!   events as SSE `data:` lines, one event JSON each. `prefix=c` takes every
+//!   channel below `c` at a `.` boundary. The stream starts only after every
+//!   subscription took effect; it ends when the user's buffer fills.
+//!
+//! `POST /v1/events` answers once the registration is committed on the
+//! server the proxy's producer picked (2.3). There is no per-registration
+//! answer from the event server: re-posting an id that is still waiting, with
+//! the same content, is accepted and registers nothing twice.
 //!
 //! Every request authenticates on its own; with the `worker` mode that is
 //! one event round trip per request. A missing or empty bearer token is
@@ -31,6 +37,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
+use ruvent::{Name, Target};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -69,18 +76,25 @@ async fn subscribe(State(proxy): State<Proxy>, parts: Parts) -> Response {
         Ok(user) => user,
         Err(error) => return denied(error),
     };
-    // An empty `channel=` names nothing and is skipped.
-    let wanted: Vec<String> = query_values(parts.uri.query().unwrap_or_default(), "channel").into_iter().filter(|channel| !channel.is_empty()).collect();
+    // An empty `channel=` or `prefix=` names nothing and is skipped.
+    let query = parts.uri.query().unwrap_or_default();
+    let named = |key: &str| query_values(query, key).into_iter().filter(|name| !name.is_empty());
+    let channels = named("channel").map(|channel| Target::Channel(Name::new(&channel)));
+    let wanted: Vec<Target> = channels.chain(named("prefix").map(|prefix| Target::Prefix(Name::new(&prefix)))).collect();
     if wanted.is_empty() {
-        return answer(Outcome::failed(None, "name at least one channel: ?channel=…"));
+        return answer(Outcome::failed(None, "name at least one channel: ?channel=… or ?prefix=…"));
     }
     let (handle, events) = match proxy.attach(user).await {
         Ok(attached) => attached,
         Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Outcome::failed(None, error))).into_response(),
     };
-    for channel in &wanted {
-        if let Err(mut rejection) = handle.subscribe(channel).await {
-            rejection.message = format!("{channel}: {}", rejection.message);
+    for target in wanted {
+        let shown = match &target {
+            Target::Channel(name) => name.to_string(),
+            Target::Prefix(name) => format!("{name}.*"),
+        };
+        if let Err(mut rejection) = handle.subscribe_to(target).await {
+            rejection.message = format!("{shown}: {}", rejection.message);
             return answer(Outcome::rejected(None, rejection));
         }
     }

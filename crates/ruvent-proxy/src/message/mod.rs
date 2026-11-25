@@ -6,9 +6,13 @@
 //! {"op":"auth","token":"…"}
 //! {"op":"publish","kind":"claimable"|"dispatch","channel":"…","type":"…","payload":<any JSON>,
 //!  "id":"<uuid>"?,"reply":"…"?,"correlation":"<uuid>"?,"ref":<any JSON>?}
-//! {"op":"subscribe","channel":"…","ref":<any JSON>?}
-//! {"op":"unsubscribe","channel":"…","ref":<any JSON>?}
+//! {"op":"subscribe","channel":"…"|"prefix":"…","ref":<any JSON>?}
+//! {"op":"unsubscribe","channel":"…"|"prefix":"…","ref":<any JSON>?}
 //! ```
+//!
+//! A subscribe names one exact `channel`, or one `prefix`: every channel
+//! below it at a `.` boundary (`"prefix":"room"` takes `room.1` and
+//! `room.a.b`, not `room` or `roomy`) — the event server's prefix target.
 //!
 //! Proxy → user:
 //!
@@ -19,8 +23,15 @@
 //!
 //! A payload travels as the JSON bytes the user sent. An event payload that
 //! is not JSON is shown as a JSON string of its bytes, decoded lossily.
+//!
+//! That text is for the JSON protocols. A program of its own can take the
+//! events as they are instead ([`Outgoing::Event`], [`crate::Proxy::attach_raw`]):
+//! the envelope the event server sent, shared by every user, its payload
+//! never turned into text.
 
-use ruvent::{Bytes, Envelope, EventId, Refusal};
+use ruvent::{ByeReason, Bytes, Envelope, EventId, FaultKind, Name, Refusal, Target};
+use ruvent_client::producer::ProducerError;
+use ruvent_client::requester::RequestError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -33,8 +44,8 @@ use std::sync::Arc;
 pub enum Request {
     Auth { token: String },
     Publish(Publish),
-    Subscribe { channel: String, reference: Option<Value> },
-    Unsubscribe { channel: String, reference: Option<Value> },
+    Subscribe { target: Target, reference: Option<Value> },
+    Unsubscribe { target: Target, reference: Option<Value> },
 }
 
 #[derive(Deserialize)]
@@ -49,9 +60,25 @@ struct Token {
 
 #[derive(Deserialize)]
 struct ChannelRequest {
-    channel: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
     #[serde(rename = "ref", default)]
     reference: Option<Value>,
+}
+
+impl ChannelRequest {
+    /// Exactly one of `channel` and `prefix`; an empty prefix names nothing.
+    fn target(self) -> Result<(Target, Option<Value>), serde_json::Error> {
+        let target = match (self.channel, self.prefix) {
+            (Some(channel), None) => Target::Channel(Name::new(&channel)),
+            (None, Some(prefix)) if !prefix.is_empty() => Target::Prefix(Name::new(&prefix)),
+            (None, Some(_)) => return Err(serde::de::Error::custom("an empty prefix names no channel")),
+            _ => return Err(serde::de::Error::custom("name exactly one of `channel` and `prefix`")),
+        };
+        Ok((target, self.reference))
+    }
 }
 
 impl Request {
@@ -64,12 +91,12 @@ impl Request {
             "auth" => Request::Auth { token: serde_json::from_str::<Token>(text)?.token },
             "publish" => Request::Publish(serde_json::from_str(text)?),
             "subscribe" => {
-                let request: ChannelRequest = serde_json::from_str(text)?;
-                Request::Subscribe { channel: request.channel, reference: request.reference }
+                let (target, reference) = serde_json::from_str::<ChannelRequest>(text)?.target()?;
+                Request::Subscribe { target, reference }
             }
             "unsubscribe" => {
-                let request: ChannelRequest = serde_json::from_str(text)?;
-                Request::Unsubscribe { channel: request.channel, reference: request.reference }
+                let (target, reference) = serde_json::from_str::<ChannelRequest>(text)?.target()?;
+                Request::Unsubscribe { target, reference }
             }
             other => return Err(serde::de::Error::custom(format!("unknown op `{other}`"))),
         })
@@ -116,6 +143,7 @@ impl Publish {
     }
 
     /// The event this registration becomes, carrying `delegate` when given.
+    /// A missing id stays nil here; [`crate::Proxy::publish`] gives one.
     pub fn envelope(&self, delegate: Option<&str>) -> Result<Envelope, Rejection> {
         let (id, correlation) = self.ids()?;
         let payload = Bytes::from(self.payload.get().as_bytes().to_vec());
@@ -153,13 +181,22 @@ impl Publish {
 
 /// Why a request was turned down. A protocol picks its status from it
 /// (HTTP: 400, 403, 409, 503); the user sees the message.
+///
+/// Registrations get no answer of their own from the event server (2.3): a
+/// send is committed, or waits. What can still turn a request down is the
+/// proxy itself (shape, hooks), a server ending the proxy's producer
+/// ([`Rejection::from_producer`]), a refused subscribe
+/// ([`Rejection::from_refusal`]), a request–response that found no answer
+/// ([`Rejection::from_request`]). The event server tells its [`FaultKind`]s
+/// to the proxy's own connection, once per connection and kind (2.7);
+/// [`Rejection::from_fault`] is what each would mean to a user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cause {
     /// The request is wrong in itself.
     Invalid,
     /// The user may not do this.
     Forbidden,
-    /// It clashes with what is there (an event with this id is waiting).
+    /// It clashes with what is there (an active event has this id with other content).
     Conflict,
     /// The proxy or the event server cannot take it now.
     Unavailable,
@@ -189,16 +226,52 @@ impl Rejection {
         Rejection::new(Cause::Unavailable, message)
     }
 
-    /// What the event server's refusal means to a user.
+    /// What the event server's refusal of an answered call (a subscribe, a
+    /// join, an explicit claim) means to a user. The message is the
+    /// refusal's lowercase name.
     pub fn from_refusal(refusal: Refusal) -> Self {
         // No wildcard: a new refusal is a decision about its status.
         let cause = match refusal {
-            Refusal::Duplicate | Refusal::AlreadyClaimed | Refusal::NotClaimed | Refusal::StaleToken => Cause::Conflict,
-            Refusal::Forbidden | Refusal::WrongCredential => Cause::Forbidden,
+            Refusal::Forbidden => Cause::Forbidden,
+            Refusal::Missing | Refusal::AlreadyClaimed => Cause::Conflict,
+            Refusal::Malformed => Cause::Invalid,
             Refusal::Closed => Cause::Unavailable,
-            Refusal::InvalidId | Refusal::Malformed | Refusal::Missing => Cause::Invalid,
         };
         Rejection::new(cause, refusal.to_string().to_lowercase())
+    }
+
+    /// What a [`FaultKind`] (2.7) means to a user. The message is the kind's lowercase name.
+    pub fn from_fault(kind: FaultKind) -> Self {
+        // No wildcard, as above.
+        let cause = match kind {
+            FaultKind::Forbidden => Cause::Forbidden,
+            FaultKind::Malformed | FaultKind::InvalidId => Cause::Invalid,
+            FaultKind::IdConflict | FaultKind::FollowUpConflict => Cause::Conflict,
+            FaultKind::SequenceGap => Cause::Unavailable,
+        };
+        Rejection::new(cause, kind.to_string().to_lowercase())
+    }
+
+    /// A send the proxy's producer could not make. A server that refused the
+    /// proxy's token or grant is a deployment fault no user can fix:
+    /// forbidden. Everything else is the proxy being unable now.
+    pub fn from_producer(error: ProducerError) -> Self {
+        // No wildcard, as above.
+        let cause = match error {
+            ProducerError::Refused(ByeReason::Token | ByeReason::Forbidden) => Cause::Forbidden,
+            ProducerError::Refused(ByeReason::Version | ByeReason::Superseded | ByeReason::Slow | ByeReason::Draining | ByeReason::Protocol) | ProducerError::BudgetSpent | ProducerError::Closed => {
+                Cause::Unavailable
+            }
+        };
+        Rejection::new(cause, error.to_string())
+    }
+
+    /// A request–response ([`crate::Proxy::exchange`]) that ended without its result.
+    pub fn from_request(error: RequestError) -> Self {
+        match error {
+            RequestError::Producer(error) => Rejection::from_producer(error),
+            RequestError::Timeout | RequestError::Closed => Rejection::unavailable(error.to_string()),
+        }
     }
 }
 
@@ -244,6 +317,15 @@ impl Outcome {
     pub fn text(&self) -> Arc<str> {
         Arc::from(serde_json::to_string(self).unwrap_or_else(|_| r#"{"op":"result","ok":false,"error":"unencodable"}"#.into()))
     }
+}
+
+/// What one user's stream carries, in order: events and results.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outgoing {
+    /// A delivered event as the event server sent it, shared by every user it goes to.
+    Event(Arc<Envelope>),
+    /// A JSON text: a result ([`Outcome::text`]).
+    Text(Arc<str>),
 }
 
 #[derive(Serialize)]

@@ -7,7 +7,7 @@
 //! | hook | called | default |
 //! | --- | --- | --- |
 //! | [`Hooks::authenticate`] | once per HTTP request; once per WebSocket, twice when the first answer is [`Denied::Missing`] and the token then comes in band | `auth.mode` of the configuration ([`Context::authenticate_by_config`]) |
-//! | [`Hooks::subscribe`] | before a user's subscription is sent upstream | the user's channel scope ([`within_scope`]) |
+//! | [`Hooks::subscribe`] | before a user's subscription is sent upstream; the target is a channel or a prefix | the user's scope covers the target ([`within_scope`]) |
 //! | [`Hooks::publish`] | after the request's own shape is checked, before it is registered; may change it | the user's scope on the channel and the reply channel ([`publish_within_scope`]) |
 //! | [`Hooks::deliver`] | in the hub, for each event and each user subscribed to its channel | every event goes through |
 //!
@@ -34,7 +34,7 @@ pub use rules::{publish_within_scope, within_scope};
 use crate::auth::{Denied, User};
 use crate::handshake::Handshake;
 use crate::message::{Publish, Rejection};
-use ruvent::{async_trait, Envelope};
+use ruvent::{async_trait, Envelope, Target};
 
 #[async_trait]
 pub trait Hooks: Send + Sync + 'static {
@@ -44,10 +44,10 @@ pub trait Hooks: Send + Sync + 'static {
         cx.authenticate_by_config(handshake.token.as_deref()).await
     }
 
-    /// May `user` subscribe to `channel`?
-    async fn subscribe(&self, cx: Context<'_>, user: &User, channel: &str) -> Result<(), Rejection> {
+    /// May `user` subscribe to `target`: one channel, or every channel below a prefix?
+    async fn subscribe(&self, cx: Context<'_>, user: &User, target: &Target) -> Result<(), Rejection> {
         let _ = cx;
-        within_scope(user, channel)
+        within_scope(user, target)
     }
 
     /// May `user` register this? The hook may also change it: rename the
@@ -59,7 +59,7 @@ pub trait Hooks: Send + Sync + 'static {
         publish_within_scope(user, publish)
     }
 
-    /// Does `user` see this event? Called for every user subscribed to its channel.
+    /// Does `user` see this event? Called for every user whose subscription takes its channel.
     fn deliver(&self, user: &User, event: &Envelope) -> bool {
         let _ = (user, event);
         true

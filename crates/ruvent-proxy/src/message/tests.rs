@@ -25,8 +25,20 @@ fn a_publish_request_parses_with_its_raw_payload() {
 #[test]
 fn every_op_parses_to_its_request() {
     assert!(matches!(Request::parse(r#"{"op":"auth","token":"t"}"#).unwrap(), Request::Auth { token } if token == "t"));
-    assert!(matches!(Request::parse(r#"{"op":"subscribe","channel":"c","ref":"r"}"#).unwrap(), Request::Subscribe { channel, reference: Some(r) } if channel == "c" && r == "r"));
-    assert!(matches!(Request::parse(r#"{"op":"unsubscribe","channel":"c"}"#).unwrap(), Request::Unsubscribe { channel, reference: None } if channel == "c"));
+    assert!(
+        matches!(Request::parse(r#"{"op":"subscribe","channel":"c","ref":"r"}"#).unwrap(), Request::Subscribe { target: Target::Channel(channel), reference: Some(r) } if &*channel == "c" && r == "r")
+    );
+    assert!(matches!(Request::parse(r#"{"op":"unsubscribe","channel":"c"}"#).unwrap(), Request::Unsubscribe { target: Target::Channel(channel), reference: None } if &*channel == "c"));
+}
+
+/// A subscribe may name a prefix instead of a channel: the event server's `.`-boundary prefix target.
+#[test]
+fn a_subscribe_names_a_channel_or_a_prefix() {
+    assert!(matches!(Request::parse(r#"{"op":"subscribe","prefix":"room"}"#).unwrap(), Request::Subscribe { target: Target::Prefix(prefix), .. } if &*prefix == "room"));
+    assert!(matches!(Request::parse(r#"{"op":"unsubscribe","prefix":"room","ref":1}"#).unwrap(), Request::Unsubscribe { target: Target::Prefix(prefix), reference: Some(_) } if &*prefix == "room"));
+    for text in [r#"{"op":"subscribe","channel":"a","prefix":"b"}"#, r#"{"op":"subscribe","prefix":""}"#, r#"{"op":"unsubscribe"}"#] {
+        assert!(Request::parse(text).is_err(), "{text} parsed");
+    }
 }
 
 /// An unknown op, a missing field, or a message that is not JSON is an error, not a guess.
@@ -85,19 +97,14 @@ fn a_payload_is_read_and_replaced_as_json() {
 
 // ── rejections ───────────────────────────────────────────────────────────
 
-/// Every refusal of the event server maps to a cause; the message is its lowercase name.
+/// Every refusal of an answered call maps to a cause; the message is its lowercase name.
 #[test]
 fn every_refusal_maps_to_a_cause() {
     let expected = [
-        (Refusal::Duplicate, Cause::Conflict),
-        (Refusal::InvalidId, Cause::Invalid),
         (Refusal::Forbidden, Cause::Forbidden),
-        (Refusal::Malformed, Cause::Invalid),
-        (Refusal::Missing, Cause::Invalid),
+        (Refusal::Missing, Cause::Conflict),
         (Refusal::AlreadyClaimed, Cause::Conflict),
-        (Refusal::NotClaimed, Cause::Conflict),
-        (Refusal::StaleToken, Cause::Conflict),
-        (Refusal::WrongCredential, Cause::Forbidden),
+        (Refusal::Malformed, Cause::Invalid),
         (Refusal::Closed, Cause::Unavailable),
     ];
     assert_eq!(expected.len(), Refusal::ALL.len(), "every refusal is listed");
@@ -106,6 +113,39 @@ fn every_refusal_maps_to_a_cause() {
         assert_eq!(rejection.cause, cause, "{refusal:?}");
         assert_eq!(rejection.message, format!("{refusal:?}").to_lowercase());
     }
+}
+
+/// Every fault kind (2.7) maps to a cause; the message is its lowercase name.
+#[test]
+fn every_fault_maps_to_a_cause() {
+    let expected = [
+        (FaultKind::Forbidden, Cause::Forbidden),
+        (FaultKind::Malformed, Cause::Invalid),
+        (FaultKind::InvalidId, Cause::Invalid),
+        (FaultKind::IdConflict, Cause::Conflict),
+        (FaultKind::FollowUpConflict, Cause::Conflict),
+        (FaultKind::SequenceGap, Cause::Unavailable),
+    ];
+    assert_eq!(expected.len(), FaultKind::ALL.len(), "every kind is listed");
+    for (kind, cause) in expected {
+        let rejection = Rejection::from_fault(kind);
+        assert_eq!((rejection.cause, rejection.message), (cause, format!("{kind:?}").to_lowercase()), "{kind:?}");
+    }
+}
+
+/// A server refusing the proxy's token or grant is forbidden; every other producer or request failure is unavailable.
+#[test]
+fn producer_and_request_failures_map_to_a_cause() {
+    for reason in ByeReason::ALL.iter().copied() {
+        let expected = if matches!(reason, ByeReason::Token | ByeReason::Forbidden) { Cause::Forbidden } else { Cause::Unavailable };
+        assert_eq!(Rejection::from_producer(ProducerError::Refused(reason)).cause, expected, "{reason:?}");
+        assert_eq!(Rejection::from_request(RequestError::Producer(ProducerError::Refused(reason))).cause, expected);
+    }
+    for error in [ProducerError::BudgetSpent, ProducerError::Closed] {
+        assert_eq!(Rejection::from_producer(error), Rejection::unavailable(error.to_string()));
+    }
+    assert_eq!(Rejection::from_request(RequestError::Timeout), Rejection::unavailable("the request's deadline passed"));
+    assert_eq!(Rejection::from_request(RequestError::Closed).cause, Cause::Unavailable);
 }
 
 /// The rejection constructors set their cause, and a rejection shows its message.

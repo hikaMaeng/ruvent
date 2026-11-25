@@ -7,16 +7,20 @@
 //! | --- | --- | --- |
 //! | `none` | everyone is `anonymous` with the default channels | none |
 //! | `static` | tokens listed in the configuration (Q1(c)) | a lookup |
-//! | `worker` | an authentication worker, through a claimable event (Q1(a)) | one event round trip |
+//! | `worker` | an authentication worker, through a request–response (Q1(a)) | one request round trip |
 //!
-//! In `worker` mode the proxy registers a claimable event on `auth.worker.channel`
-//! with payload `{"token":…}`, a random correlation and `reply` set to
-//! `auth.worker.reply_channel`, which only this proxy subscribes to. The
-//! worker completes it with a dispatch follow-up on that reply channel, same
-//! correlation, payload `{"ok":true|false,"user":"…","channels":["…"]}`.
+//! In `worker` mode the proxy sends a request ([`crate::Proxy::exchange`]): a
+//! claimable event on `auth.worker.channel` with payload `{"token":…}`, a
+//! random correlation, `reply` set to the proxy's own reply channel
+//! (`reply.<instance id>`, 2.8) and `expires` set to `auth.worker.timeout_ms`.
+//! The worker completes it with a **claimable** follow-up on that reply
+//! channel, same correlation, payload
+//! `{"ok":true|false,"user":"…","channels":["…"]}` — what the SDK worker's
+//! `Context::reply` does. The answer waits on the server if the proxy's
+//! connection drops meanwhile; the user waits at most `timeout_ms`.
 
 use crate::config::{patterns, AuthMode, ProxyConfig};
-use ruvent::Pattern;
+use ruvent::{Pattern, Target};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
@@ -53,6 +57,20 @@ impl User {
 
     pub fn may_use(&self, channel: &str) -> bool {
         self.scope.iter().any(|pattern| pattern.matches(channel))
+    }
+
+    /// Whether the scope covers every channel a subscription target takes: an
+    /// exact channel the user may use, or a prefix every channel below which
+    /// (`<prefix>.…`) one pattern of the scope matches. A star pattern `p*`
+    /// covers prefix `q` when `q.` starts with `p`; an exact name covers no prefix.
+    pub fn covers(&self, target: &Target) -> bool {
+        match target {
+            Target::Channel(name) => self.may_use(name),
+            Target::Prefix(prefix) => {
+                let below = format!("{prefix}.");
+                self.scope.iter().any(|pattern| pattern.0.strip_suffix('*').is_some_and(|start| below.starts_with(start)))
+            }
+        }
     }
 }
 

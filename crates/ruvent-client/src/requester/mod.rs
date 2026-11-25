@@ -202,6 +202,12 @@ impl Requester {
         self.inner.shared.joined.borrow().clone()
     }
 
+    /// [`Requester::joined`] and every later change: whoever reports the
+    /// requester's health waits on this instead of asking again.
+    pub fn watch_joined(&self) -> watch::Receiver<BTreeSet<Server>> {
+        self.inner.shared.joined.subscribe()
+    }
+
     /// The producer requests go out through (its retry budget is the requester's).
     pub fn producer(&self) -> &Producer {
         &self.inner.producer

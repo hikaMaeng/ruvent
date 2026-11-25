@@ -1,0 +1,72 @@
+cargo xtask verify — 개편 계획 v4.6 구현 뒤 (2026-11-25)
+host: MINGW64_NT-10.0-26300 / rustc 1.96.0 / HEAD 1f6b340 + 작업 트리
+
+── format : cargo fmt --all -- --check
+gate name=format status=ok seconds=0.7
+── lint : cargo clippy --workspace --all-targets -- -D warnings
+gate name=lint status=ok seconds=3.7
+── api docs : cargo doc --workspace --no-deps
+gate name=api docs status=ok seconds=5.8
+── static : cargo test -p ruvent --test static
+     Running tests\static\main.rs (target\debug\deps\static-59f4426eaba09e81.exe)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+gate name=static status=ok seconds=1.0
+── state machine : cargo test -p ruvent --lib
+     Running unittests src\lib.rs (target\debug\deps\ruvent-982b375ed5451917.exe)
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s
+gate name=state machine status=ok seconds=2.1
+── runtime : cargo test -p ruvent --test runtime
+     Running tests\runtime\main.rs (target\debug\deps\runtime-56c6872cfc85e560.exe)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+gate name=runtime status=ok seconds=1.3
+── acceptance : cargo test -p ruvent --test acceptance
+     Running tests\acceptance\main.rs (target\debug\deps\acceptance-95a8dd94e1a3a1d3.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+gate name=acceptance status=ok seconds=0.4
+── protocol : cargo test -p ruvent-protocol
+     Running unittests src\lib.rs (target\debug\deps\ruvent_protocol-ef52b805e85bfb6f.exe)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+gate name=protocol status=ok seconds=3.4
+── server : cargo test -p ruvent-server
+     Running unittests src\lib.rs (target\debug\deps\ruvent_server-93db782ff70e3483.exe)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src\main.rs (target\debug\deps\ruvent_server-2ada7a991a7f5556.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\remote.rs (target\debug\deps\remote-c279b371caf9be17.exe)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+gate name=server status=ok seconds=7.7
+── client and workers : cargo test -p ruvent-client
+     Running unittests src\lib.rs (target\debug\deps\ruvent_client-8651047267568059.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\producer.rs (target\debug\deps\producer-621ac70d6595fa11.exe)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+     Running tests\requester.rs (target\debug\deps\requester-df7230d57e827941.exe)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+     Running tests\worker.rs (target\debug\deps\worker-45ba198332b56cbc.exe)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+gate name=client and workers status=ok seconds=11.3
+── proxy : cargo test -p ruvent-proxy
+     Running unittests src\lib.rs (target\debug\deps\ruvent_proxy-0fc6f62b1b8bc47f.exe)
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests\acceptance.rs (target\debug\deps\acceptance-ba49d972c298994d.exe)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+     Running tests\hooks.rs (target\debug\deps\hooks-8cf4d44dd172efec.exe)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests\http.rs (target\debug\deps\http-c5843fb61f9a7918.exe)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\hub.rs (target\debug\deps\hub-7b5fa9e4e150dd3f.exe)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+     Running tests\ws.rs (target\debug\deps\ws-22793ed09d758a57.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+gate name=proxy status=ok seconds=17.5
+── proxy: ws only : cargo clippy -p ruvent-proxy --no-default-features --features ws --all-targets -- -D warnings
+gate name=proxy: ws only status=ok seconds=3.2
+── proxy: http only : cargo clippy -p ruvent-proxy --no-default-features --features http --all-targets -- -D warnings
+gate name=proxy: http only status=ok seconds=1.9
+── proxy: no protocol : cargo clippy -p ruvent-proxy --no-default-features --all-targets -- -D warnings
+gate name=proxy: no protocol status=ok seconds=2.7
+verify status=ok

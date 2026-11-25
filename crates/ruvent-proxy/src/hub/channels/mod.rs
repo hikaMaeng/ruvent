@@ -1,37 +1,61 @@
-//! The subscription book: which users of each channel are active, and what
-//! the hub has to ask upstream. No task, no queue, no clock — each method
-//! takes one input of the hub and returns a [`Step`]: the upstream calls to
-//! make, in order, and the answers owed to users who were waiting.
+//! The subscription book: which users of each target (an exact channel, or
+//! a `.`-boundary prefix) receive what each server sends, and what the hub
+//! has to ask its observer. No task, no queue, no clock — each method takes
+//! one input of the hub and returns a [`Step`]: the observer calls to make,
+//! in order, and the answers owed to users who were waiting.
 //!
 //! The book is generic over `R`, the thing a waiting user is answered
-//! through (the hub uses a `oneshot::Sender`), so it can be driven and
+//! through (the hub uses a one-shot channel), so it can be driven and
 //! checked without any of the hub's machinery.
 //!
-//! **When a subscription takes effect.** Every join issues its own
-//! subscribe, and the joining user waits for the marker of exactly that
-//! subscribe: the `issued` count at join time is the waiter's `target`, and
-//! each marker read raises `seen` by one. A user becomes active when `seen`
-//! reaches its target. A marker arriving when every issued subscribe has
-//! already been seen was not asked for by this book and changes nothing.
+//! **When a subscription takes effect.** Every join of a user not yet in the
+//! target issues its own subscribe, numbered with the next **ticket**: the
+//! observer numbers its `subscribe` calls the same way, in the order it
+//! handles them, and the hub hands it every call in the order the book
+//! issues them. Each server's confirmation comes back as
+//! [`Channels::confirmed`] with the ticket of the subscribe it answers — or,
+//! for the subscriptions said again at a new connection, the number of calls
+//! handled so far. A user becomes active **on that server** at the first
+//! confirmation with `ticket ≥` its own: everything after it in the stream
+//! was sent after its own subscribe took effect there. A confirmation of an
+//! earlier subscribe activates nobody who joined later.
+//!
+//! **When a join is answered.** Once its subscribe call came back without a
+//! refusal ([`Channels::answered`]) and the user is active on at least one
+//! server. The observer puts every confirmation in the stream before it
+//! answers the call, so a user told "subscribed" who then publishes finds
+//! the confirmation ahead of the event. With no server connected the call
+//! comes back at once and the user waits for the first server to connect
+//! and confirm.
+//!
+//! **One upstream subscription per target per server.** The observer keeps
+//! one subscription per target and says it again at each connection; a
+//! second user's subscribe is the same subscription confirmed again, which
+//! is what gives that user its own confirmation.
 
 use crate::message::Rejection;
-use ruvent::Name;
+use ruvent::Target;
+use ruvent_client::servers::Server;
 use std::collections::{HashMap, HashSet};
 
 /// One attached user, numbered by the hub.
 pub type UserId = u64;
 
-/// A call the hub makes on its upstream connection, in this order.
+/// A call the hub makes on its observer, in this order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
-    Subscribe(Name),
-    Unsubscribe(Name),
+    /// The `ticket`-th subscribe call.
+    Subscribe {
+        target: Target,
+        ticket: u64,
+    },
+    Unsubscribe(Target),
 }
 
 /// What one input to the book asks of the hub.
 #[derive(Debug)]
 pub struct Step<R> {
-    /// Upstream calls, in order. Empty while disconnected.
+    /// Observer calls, in order.
     pub calls: Vec<Call>,
     /// Waiting users to answer.
     pub answers: Vec<(R, Result<(), Rejection>)>,
@@ -48,215 +72,178 @@ impl<R> Step<R> {
     }
 }
 
+/// One user in one target.
 #[derive(Debug)]
-struct Waiter<R> {
-    /// The subscribe whose marker activates this user.
-    target: u64,
-    user: UserId,
-    reply: R,
+struct Member<R> {
+    /// The subscribe call that admits this user.
+    ticket: u64,
+    /// Servers on which the subscription is in effect for this user.
+    on: HashSet<Server>,
+    /// The subscribe call came back without a refusal.
+    confirmed: bool,
+    /// The join was answered "subscribed".
+    answered: bool,
+    /// Joins of this user still waiting for that answer.
+    waiting: Vec<R>,
 }
 
 #[derive(Debug)]
-struct Channel<R> {
-    active: HashSet<UserId>,
-    waiting: Vec<Waiter<R>>,
-    /// Subscribes issued on the current upstream connection, and markers (or refusals) seen for them.
-    issued: u64,
-    seen: u64,
-    /// An upstream subscription is wanted (issued and not cancelled).
-    subscribed: bool,
-    /// Kept subscribed with no users (the authentication reply channel).
-    internal: bool,
+struct Entry<R> {
+    members: HashMap<UserId, Member<R>>,
 }
 
-impl<R> Channel<R> {
-    fn new(internal: bool) -> Channel<R> {
-        Channel { active: HashSet::new(), waiting: Vec::new(), issued: 0, seen: 0, subscribed: false, internal }
-    }
-
-    fn wanted(&self) -> bool {
-        self.internal || !self.active.is_empty() || !self.waiting.is_empty()
-    }
-
-    /// Nothing needs this entry any more: no users, no outstanding subscribe.
-    fn idle(&self) -> bool {
-        !self.wanted() && self.seen >= self.issued && !self.subscribed
-    }
-
-    /// Counts one marker or refusal; `None` when every issued subscribe was already answered.
-    fn answered(&mut self) -> Option<u64> {
-        if self.seen >= self.issued {
-            return None;
-        }
-        self.seen += 1;
-        Some(self.seen)
-    }
-
-    fn due(&mut self, seen: u64) -> Vec<Waiter<R>> {
-        let (due, still): (Vec<Waiter<R>>, Vec<Waiter<R>>) = std::mem::take(&mut self.waiting).into_iter().partition(|waiter| waiter.target <= seen);
-        self.waiting = still;
-        due
-    }
-}
-
-/// Every channel the hub's users want, and the reply channel.
+/// Every target the hub's users want.
 ///
-/// | key | channel name |
+/// | key | target (channel or prefix) |
 /// | --- | --- |
-/// | lifetime | while it has users, waiters, an unanswered subscribe, or is internal |
-/// | bound | channels in use by attached users, plus the internal one |
-/// | cleared by | the step that leaves it idle: a leave, a marker, a refusal |
+/// | scope | one hub |
+/// | lifetime | first join ~ the last member leaves or is refused |
+/// | bound | targets in use by attached users; members: their joins |
+/// | cleared by | the step that empties it: a leave, a refusal |
+///
+/// `tickets` counts subscribe calls issued: one counter per hub, never reset.
 #[derive(Debug)]
 pub struct Channels<R> {
-    entries: HashMap<Name, Channel<R>>,
-    connected: bool,
+    entries: HashMap<Target, Entry<R>>,
+    tickets: u64,
+}
+
+impl<R> Default for Channels<R> {
+    fn default() -> Self {
+        Channels { entries: HashMap::new(), tickets: 0 }
+    }
 }
 
 impl<R> Channels<R> {
-    /// An empty book, disconnected; `internal` stays subscribed with no users.
-    pub fn new(internal: Option<Name>) -> Channels<R> {
-        let mut entries = HashMap::new();
-        if let Some(name) = internal {
-            entries.insert(name, Channel::new(true));
+    pub fn new() -> Channels<R> {
+        Channels::default()
+    }
+
+    /// The users who receive what `server` sends on `channel` now: those of
+    /// the exact channel and of every prefix it falls under, each once.
+    pub fn audience(&self, channel: &str, server: &Server) -> Vec<UserId> {
+        let mut found: Vec<UserId> = Vec::new();
+        let mut collect = |target: &Target| {
+            if let Some(entry) = self.entries.get(target) {
+                found.extend(entry.members.iter().filter(|(_, member)| member.on.contains(server)).map(|(user, _)| *user));
+            }
+        };
+        collect(&Target::Channel(channel.into()));
+        for (at, _) in channel.match_indices('.') {
+            collect(&Target::Prefix(channel[..at].into()));
         }
-        Channels { entries, connected: false }
+        found.sort_unstable();
+        found.dedup();
+        found
     }
 
-    /// The users who receive what arrives on `name` now.
-    pub fn audience(&self, name: &Name) -> impl Iterator<Item = UserId> + '_ {
-        self.entries.get(name).into_iter().flat_map(|channel| channel.active.iter().copied())
-    }
-
-    /// Whether `name` has an upstream subscription that took effect.
-    pub fn settled(&self, name: &Name) -> bool {
-        self.entries.get(name).is_some_and(|channel| channel.subscribed && channel.issued > 0 && channel.seen >= channel.issued)
-    }
-
-    /// Whether the book holds an entry for `name`: the tests' view of its bound.
+    /// Whether the book holds an entry for `target`: the tests' view of its bound.
     #[cfg(test)]
-    pub fn contains(&self, name: &Name) -> bool {
-        self.entries.contains_key(name)
+    pub fn contains(&self, target: &Target) -> bool {
+        self.entries.contains_key(target)
     }
 
-    /// Wants an upstream subscription to `name` and, when connected, sends one.
-    /// Returns the target a joiner waits for. Only subscribes actually sent
-    /// are counted: a marker can come back only for those, and
-    /// [`Channels::connected`] issues again for whoever waited meanwhile.
-    fn issue(&mut self, name: &Name, step: &mut Step<R>) -> u64 {
-        let connected = self.connected;
-        let Some(channel) = self.entries.get_mut(name) else { return 0 };
-        channel.subscribed = true;
-        if connected {
-            channel.issued += 1;
-            step.calls.push(Call::Subscribe(name.clone()));
-        }
-        channel.issued
-    }
-
-    /// `user` wants `name`. Answered at once if already active, else when its subscribe's marker arrives.
-    pub fn join(&mut self, user: UserId, name: Name, reply: R) -> Step<R> {
+    /// `user` wants `target`. Answered at once if its join was already
+    /// answered; otherwise when its own subscribe is confirmed.
+    pub fn join(&mut self, user: UserId, target: Target, reply: R) -> Step<R> {
         let mut step = Step::none();
-        let channel = self.entries.entry(name.clone()).or_insert_with(|| Channel::new(false));
-        if channel.active.contains(&user) {
-            step.answers.push((reply, Ok(())));
+        let entry = self.entries.entry(target.clone()).or_insert_with(|| Entry { members: HashMap::new() });
+        if let Some(member) = entry.members.get_mut(&user) {
+            if member.answered {
+                step.answers.push((reply, Ok(())));
+            } else {
+                member.waiting.push(reply);
+            }
             return step;
         }
-        let target = self.issue(&name, &mut step);
-        if let Some(channel) = self.entries.get_mut(&name) {
-            channel.waiting.push(Waiter { target, user, reply });
-        }
+        self.tickets += 1;
+        let ticket = self.tickets;
+        entry.members.insert(user, Member { ticket, on: HashSet::new(), confirmed: false, answered: false, waiting: vec![reply] });
+        step.calls.push(Call::Subscribe { target, ticket });
         step
     }
 
-    /// `user` leaves `name`. A join of its still waiting is answered as cancelled.
-    pub fn leave(&mut self, user: UserId, name: &Name) -> Step<R> {
+    /// `user` leaves `target`. A join of its still waiting is answered as cancelled.
+    pub fn leave(&mut self, user: UserId, target: &Target) -> Step<R> {
         let mut step = Step::none();
-        let connected = self.connected;
-        let Some(channel) = self.entries.get_mut(name) else { return step };
-        channel.active.remove(&user);
-        let (cancelled, still): (Vec<Waiter<R>>, Vec<Waiter<R>>) = std::mem::take(&mut channel.waiting).into_iter().partition(|waiter| waiter.user == user);
-        channel.waiting = still;
-        for waiter in cancelled {
-            step.answers.push((waiter.reply, Err(Rejection::unavailable("unsubscribed before the subscription took effect"))));
-        }
-        if !channel.wanted() && channel.subscribed {
-            channel.subscribed = false;
-            if connected {
-                step.calls.push(Call::Unsubscribe(name.clone()));
+        let Some(entry) = self.entries.get_mut(target) else { return step };
+        if let Some(member) = entry.members.remove(&user) {
+            for reply in member.waiting {
+                step.answers.push((reply, Err(Rejection::unavailable("unsubscribed before the subscription took effect"))));
             }
         }
-        self.tidy(name);
+        self.tidy(target, &mut step);
         step
     }
 
-    /// `user` leaves every channel in `names`.
-    pub fn leave_all(&mut self, user: UserId, names: impl IntoIterator<Item = Name>) -> Step<R> {
+    /// `user` leaves every target in `targets`.
+    pub fn leave_all(&mut self, user: UserId, targets: impl IntoIterator<Item = Target>) -> Step<R> {
         let mut step = Step::none();
-        for name in names {
-            step.absorb(self.leave(user, &name));
+        for target in targets {
+            step.absorb(self.leave(user, &target));
         }
         step
     }
 
-    /// A subscribe to `name` took effect upstream.
-    pub fn marker(&mut self, name: &Name) -> Step<R> {
+    /// `server` confirmed a subscription to `target` sent with `ticket`.
+    pub fn confirmed(&mut self, server: &Server, target: &Target, ticket: u64) -> Step<R> {
         let mut step = Step::none();
-        let Some(channel) = self.entries.get_mut(name) else { return step };
-        let Some(seen) = channel.answered() else { return step };
-        for waiter in channel.due(seen) {
-            channel.active.insert(waiter.user);
-            step.answers.push((waiter.reply, Ok(())));
+        let Some(entry) = self.entries.get_mut(target) else { return step };
+        for member in entry.members.values_mut().filter(|member| member.ticket <= ticket) {
+            member.on.insert(server.clone());
+            settle(member, &mut step);
         }
-        self.tidy(name);
         step
     }
 
-    /// The upstream refused a subscribe to `name`.
-    pub fn refused(&mut self, name: &Name, rejection: &Rejection) -> Step<R> {
+    /// The `ticket`-th subscribe call came back: `Ok` once every connected
+    /// server confirmed it, or the first refusal.
+    pub fn answered(&mut self, target: &Target, ticket: u64, result: Result<(), Rejection>) -> Step<R> {
         let mut step = Step::none();
-        let Some(channel) = self.entries.get_mut(name) else { return step };
-        let Some(seen) = channel.answered() else { return step };
-        if seen >= channel.issued {
-            channel.subscribed = false;
-        }
-        for waiter in channel.due(seen) {
-            step.answers.push((waiter.reply, Err(Rejection::new(rejection.cause, format!("upstream refused: {}", rejection.message)))));
-        }
-        self.tidy(name);
-        step
-    }
-
-    /// The upstream connection dropped: nothing issued on it will be answered.
-    pub fn lost(&mut self) {
-        self.connected = false;
-        for channel in self.entries.values_mut() {
-            channel.issued = 0;
-            channel.seen = 0;
-            channel.subscribed = false;
-        }
-    }
-
-    /// A new upstream connection: every wanted channel is subscribed again,
-    /// and waiting users now wait for the new subscribe's marker.
-    pub fn connected(&mut self) -> Step<R> {
-        self.connected = true;
-        let mut step = Step::none();
-        let mut wanted: Vec<Name> = self.entries.iter().filter(|(_, channel)| channel.wanted()).map(|(name, _)| name.clone()).collect();
-        wanted.sort();
-        for name in wanted {
-            let target = self.issue(&name, &mut step);
-            if let Some(channel) = self.entries.get_mut(&name) {
-                for waiter in &mut channel.waiting {
-                    waiter.target = target;
+        let Some(entry) = self.entries.get_mut(target) else { return step };
+        let Some(user) = entry.members.iter().find(|(_, member)| member.ticket == ticket).map(|(user, _)| *user) else { return step };
+        match result {
+            Ok(()) => {
+                if let Some(member) = entry.members.get_mut(&user) {
+                    member.confirmed = true;
+                    settle(member, &mut step);
                 }
             }
+            Err(rejection) => {
+                if let Some(member) = entry.members.remove(&user) {
+                    for reply in member.waiting {
+                        step.answers.push((reply, Err(Rejection::new(rejection.cause, format!("upstream refused: {}", rejection.message)))));
+                    }
+                }
+                self.tidy(target, &mut step);
+            }
         }
         step
     }
 
-    fn tidy(&mut self, name: &Name) {
-        if self.entries.get(name).is_some_and(Channel::idle) {
-            self.entries.remove(name);
+    /// `server`'s observation connection ended or started again: nothing is
+    /// in effect there until it confirms again.
+    pub fn reset(&mut self, server: &Server) {
+        for member in self.entries.values_mut().flat_map(|entry| entry.members.values_mut()) {
+            member.on.remove(server);
+        }
+    }
+
+    /// Drops `target`'s entry once no user wants it, cancelling the upstream subscription.
+    fn tidy(&mut self, target: &Target, step: &mut Step<R>) {
+        if self.entries.get(target).is_some_and(|entry| entry.members.is_empty()) {
+            self.entries.remove(target);
+            step.calls.push(Call::Unsubscribe(target.clone()));
+        }
+    }
+}
+
+/// Answers a member's waiting joins once its call is confirmed and it is in effect somewhere.
+fn settle<R>(member: &mut Member<R>, step: &mut Step<R>) {
+    if member.confirmed && !member.answered && !member.on.is_empty() {
+        member.answered = true;
+        for reply in member.waiting.drain(..) {
+            step.answers.push((reply, Ok(())));
         }
     }
 }

@@ -3,7 +3,7 @@
 //! ```text
 //! Server::new()            configuration: argv[1] unless .config / .config_file
 //!   .hooks(H)              optional; every hook not written keeps the configured behaviour
-//!   .upstream(C)           optional; default is the event server named in the configuration
+//!   .upstream(U)           optional; default is every server the configuration names, over TCP
 //!   .run()                 bind `listen`, start the hub, serve every compiled-in protocol, stop on Ctrl-C
 //!   .run_until(signal)     the same, stopping when `signal` resolves
 //! ```
@@ -12,13 +12,13 @@
 //! hub, for tests and for programs that serve it their own way.
 //!
 //! Stopping stops the hub too: every user's stream ends, WebSocket users see
-//! their socket close, and the upstream connection is dropped.
+//! their socket close, and every upstream connection is dropped.
 
 use crate::config::ProxyConfig;
 use crate::hooks::{Defaults, Hooks};
 use crate::hub::Proxy;
 use crate::protocol::router;
-use crate::upstream::{Connector, Remote};
+use crate::upstream::Upstream;
 use std::ffi::OsString;
 use std::fmt;
 use std::future::{Future, IntoFuture};
@@ -32,7 +32,7 @@ use tokio::net::TcpListener;
 pub struct Server {
     config: Source,
     hooks: Arc<dyn Hooks>,
-    upstream: Option<Arc<dyn Connector>>,
+    upstream: Option<Upstream>,
 }
 
 enum Source {
@@ -88,9 +88,11 @@ impl Server {
         self
     }
 
-    /// Where the upstream connection comes from, instead of `upstream` in the configuration.
-    pub fn upstream(mut self, connector: impl Connector) -> Server {
-        self.upstream = Some(Arc::new(connector));
+    /// Where the upstream connections go, instead of `upstream` in the
+    /// configuration: another connector (engines in this process), or a
+    /// server list kept elsewhere (a router).
+    pub fn upstream(mut self, upstream: Upstream) -> Server {
+        self.upstream = Some(upstream);
         self
     }
 
@@ -98,7 +100,7 @@ impl Server {
     pub async fn bind(self) -> Result<Bound, LaunchError> {
         let config = self.config.resolve(std::env::args_os())?;
         let listener = TcpListener::bind(&config.listen).await.map_err(|error| LaunchError::Listen { address: config.listen.clone(), error })?;
-        let upstream = self.upstream.unwrap_or_else(|| Arc::new(Remote { address: config.upstream.address.clone(), token: config.upstream.token.clone() }));
+        let upstream = self.upstream.unwrap_or_else(|| Upstream::from_config(&config));
         Ok(Bound { proxy: Proxy::start_with(config, upstream, self.hooks), listener })
     }
 

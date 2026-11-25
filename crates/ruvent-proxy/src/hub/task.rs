@@ -1,50 +1,90 @@
-//! The hub task: the one place that owns the upstream connection's inbox,
-//! the attached users and the subscription book. It turns what arrives —
-//! user commands, upstream traffic, the upstream worker's reports — into
-//! steps of [`Channels`] and carries them out.
+//! The hub task: the one place that owns the observer's stream, the
+//! attached users and the subscription book. It turns what arrives — user
+//! commands, the observer's stream, the subscribe worker's reports, changes
+//! of the server list and of the reply joins — into steps of [`Channels`]
+//! and carries them out.
 //!
 //! ```text
 //! users ──Command──►┐
-//! upstream worker ──Report──► hub (this task) ──try_send──► user streams (full or closed = detach)
-//! upstream inbox ──Incoming──►┘        │
-//!                                      └─ Call, in order ──► upstream worker ──► server
+//! subscribe worker ──Report──► hub (this task) ──try_send──► user streams (full or closed = detach)
+//! observer ──Observed──►┘        │      └──► Health (watch) ──► /health
+//!                                └─ Call, in order ──► subscribe worker ──► observer ──► every server
 //! ```
+//!
+//! The subscribe worker hands the observer one call at a time, in the order
+//! the book issued them, so the observer's tickets are the book's.
 //!
 //! The task ends on [`Command::Stop`] or when every [`super::Proxy`] and
 //! user handle is gone. However it ends — a panic included — the hub's
-//! [`Drop`] marks the proxy not ready, so `/health` stops answering 200.
+//! [`Drop`] marks the proxy not ready, so `/health` stops answering 200,
+//! and lets go of every upstream connection.
 
 use super::channels::{Call, Channels, Step, UserId};
 use super::Core;
-use crate::auth::{AuthAnswer, User};
+use crate::auth::User;
+use crate::health::Health;
 use crate::hooks::Hooks;
-use crate::message::{event_text, Rejection};
-use crate::upstream::Connector;
-use ruvent::{Envelope, EventId, Inbox, Incoming, Methods, Name, Refusal};
-use std::collections::{HashMap, HashSet};
+use crate::message::{event_text, Outgoing, Rejection};
+use ruvent::{Envelope, Refusal, Target};
+use ruvent_client::observer::{Observed, Observer};
+use ruvent_client::servers::Server;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 /// Capacity of the hub's command queue. Callers wait when it is full.
 pub(super) const COMMANDS: usize = 4096;
+
+/// Where one user's stream goes.
+pub(super) enum Sink {
+    /// JSON text: events become [`event_text`], made once per event.
+    Text(mpsc::Sender<Arc<str>>),
+    /// Events as they are; results as text.
+    Raw(mpsc::Sender<Outgoing>),
+}
+
+impl Sink {
+    fn is_closed(&self) -> bool {
+        match self {
+            Sink::Text(out) => out.is_closed(),
+            Sink::Raw(out) => out.is_closed(),
+        }
+    }
+
+    /// Hands over a result; `false` when the stream is full or closed.
+    fn text(&self, text: Arc<str>) -> bool {
+        match self {
+            Sink::Text(out) => out.try_send(text).is_ok(),
+            Sink::Raw(out) => out.try_send(Outgoing::Text(text)).is_ok(),
+        }
+    }
+
+    /// Hands over an event; the text of it is made at most once across users.
+    fn event(&self, event: &Arc<Envelope>, text: &mut Option<Arc<str>>) -> bool {
+        match self {
+            Sink::Text(out) => out.try_send(text.get_or_insert_with(|| event_text(event)).clone()).is_ok(),
+            Sink::Raw(out) => out.try_send(Outgoing::Event(event.clone())).is_ok(),
+        }
+    }
+}
 
 /// What the hub accepts from users, from the proxy handle and from itself.
 pub(super) enum Command {
     Attach {
         user: Arc<User>,
-        out: mpsc::Sender<Arc<str>>,
+        out: Sink,
         reply: oneshot::Sender<UserId>,
     },
     Join {
         user: UserId,
-        channel: Name,
+        target: Target,
         reply: oneshot::Sender<Result<(), Rejection>>,
     },
     Leave {
         user: UserId,
-        channel: Name,
+        target: Target,
     },
     Detach {
         user: UserId,
@@ -54,30 +94,21 @@ pub(super) enum Command {
         user: UserId,
         text: Arc<str>,
     },
-    AuthWait {
-        correlation: EventId,
-        reply: oneshot::Sender<AuthAnswer>,
-    },
-    AuthCancel {
-        correlation: EventId,
-    },
-    Connected {
-        upstream: Arc<dyn Methods>,
-        inbox: Inbox,
-    },
-    /// Ends the hub: every user's stream ends and the upstream connection is dropped.
+    /// Ends the hub: every user's stream ends and the upstream connections are dropped.
     Stop,
 }
 
-/// What the upstream worker reports back.
-enum Report {
-    SubscribeRefused { channel: Name, refusal: Refusal },
+/// What the subscribe worker reports back: the answer of one subscribe call.
+struct Report {
+    target: Target,
+    ticket: u64,
+    result: Result<(), Refusal>,
 }
 
 struct Attached {
     user: Arc<User>,
-    out: mpsc::Sender<Arc<str>>,
-    channels: HashSet<Name>,
+    out: Sink,
+    targets: HashSet<Target>,
 }
 
 type Reply = oneshot::Sender<Result<(), Rejection>>;
@@ -85,13 +116,12 @@ type Reply = oneshot::Sender<Result<(), Rejection>>;
 pub(super) struct Hub {
     core: Arc<Core>,
     commands: mpsc::Receiver<Command>,
-    /// For the reconnect task: weak, so the hub never keeps itself alive.
-    self_commands: mpsc::WeakSender<Command>,
-    reports: Option<mpsc::Receiver<Report>>,
-    /// Subscribe and unsubscribe calls for the upstream worker. Unbounded, but
-    /// each entry stands for one user join or leave already accepted.
-    calls: Option<mpsc::UnboundedSender<Call>>,
-    inbox: Option<Inbox>,
+    stream: mpsc::Receiver<Observed>,
+    reports: mpsc::Receiver<Report>,
+    /// Subscribe and unsubscribe calls for the worker. Unbounded, but each
+    /// entry stands for one user join or leave already accepted.
+    calls: mpsc::UnboundedSender<Call>,
+    worker: JoinHandle<()>,
     channels: Channels<Reply>,
     /// Attached users.
     ///
@@ -102,37 +132,28 @@ pub(super) struct Hub {
     /// | cleared by | `Detach`, `Hub::hand`, `Hub::delivery` |
     users: HashMap<UserId, Attached>,
     next_user: UserId,
-    /// Authentications waiting for the worker's answer.
+    list: watch::Receiver<BTreeSet<Server>>,
+    joined: watch::Receiver<BTreeSet<Server>>,
+    /// Servers whose observation connection is up (between `Up` and `Gap`).
     ///
-    /// | key | correlation of the authentication event |
+    /// | key | server address |
     /// | --- | --- |
-    /// | lifetime | until the answer arrives, or the waiting user times out or fails |
-    /// | bound | authentications in progress |
-    /// | cleared by | the answer, `AuthCancel` |
-    auth_waiters: HashMap<EventId, oneshot::Sender<AuthAnswer>>,
-    reply_channel: Option<Name>,
-    connector: Arc<dyn Connector>,
-    ready: watch::Sender<bool>,
+    /// | lifetime | `Up` ~ `Gap` |
+    /// | bound | servers listed |
+    /// | cleared by | `Gap` |
+    observing: BTreeSet<Server>,
+    health: watch::Sender<Health>,
 }
 
+/// What woke the hub. Lives on the stack for one turn of the loop, so the
+/// envelope of a delivery is moved, not boxed.
+#[allow(clippy::large_enum_variant)]
 enum Wake {
     Report(Option<Report>),
     Command(Option<Command>),
-    Incoming(Option<Incoming>),
-}
-
-async fn next_report(reports: &mut Option<mpsc::Receiver<Report>>) -> Option<Report> {
-    match reports {
-        Some(reports) => reports.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn next_incoming(inbox: &mut Option<Inbox>) -> Option<Incoming> {
-    match inbox {
-        Some(inbox) => inbox.recv().await,
-        None => std::future::pending().await,
-    }
+    Observed(Option<Observed>),
+    List(bool),
+    Joined(bool),
 }
 
 /// The deliver hook's answer; `None` when the hook panicked.
@@ -140,140 +161,115 @@ fn admits(hooks: &dyn Hooks, user: &User, event: &Envelope) -> Option<bool> {
     catch_unwind(AssertUnwindSafe(|| hooks.deliver(user, event))).ok()
 }
 
-impl Hub {
-    pub(super) fn new(core: Arc<Core>, commands: mpsc::Receiver<Command>, self_commands: mpsc::WeakSender<Command>, connector: Arc<dyn Connector>, ready: watch::Sender<bool>) -> Hub {
-        let reply_channel = core.config.auth.worker.as_ref().map(|worker| Name::new(&worker.reply_channel));
-        Hub {
-            core,
-            commands,
-            self_commands,
-            reports: None,
-            calls: None,
-            inbox: None,
-            channels: Channels::new(reply_channel.clone()),
-            users: HashMap::new(),
-            next_user: 1,
-            auth_waiters: HashMap::new(),
-            reply_channel,
-            connector,
-            ready,
+/// Hands the observer one call at a time, in order, and reports each subscribe's answer.
+async fn subscribe_worker(observer: Observer, mut calls: mpsc::UnboundedReceiver<Call>, reports: mpsc::Sender<Report>) {
+    while let Some(call) = calls.recv().await {
+        match call {
+            Call::Subscribe { target, ticket } => {
+                let result = observer.subscribe(target.clone()).await;
+                if reports.send(Report { target, ticket, result }).await.is_err() {
+                    return;
+                }
+            }
+            Call::Unsubscribe(target) => {
+                let _ = observer.unsubscribe(target).await;
+            }
         }
+    }
+}
+
+impl Hub {
+    pub(super) fn new(
+        core: Arc<Core>,
+        commands: mpsc::Receiver<Command>,
+        observer: Observer,
+        stream: mpsc::Receiver<Observed>,
+        list: watch::Receiver<BTreeSet<Server>>,
+        joined: watch::Receiver<BTreeSet<Server>>,
+        health: watch::Sender<Health>,
+    ) -> Hub {
+        let (calls, queue) = mpsc::unbounded_channel();
+        let (report_tx, reports) = mpsc::channel(COMMANDS);
+        let worker = tokio::spawn(subscribe_worker(observer, queue, report_tx));
+        Hub { core, commands, stream, reports, calls, worker, channels: Channels::new(), users: HashMap::new(), next_user: 1, list, joined, observing: BTreeSet::new(), health }
     }
 
     pub(super) async fn run(mut self) {
-        self.reconnect();
+        self.publish_health();
+        let (mut listing, mut joining) = (true, true);
         loop {
-            // Reports first: a refusal is always queued before any marker of a later subscribe.
-            // Commands before the inbox: an auth waiter is queued before its answer can arrive.
+            // Reports first, commands before the stream: nothing here depends on
+            // their order (a join settles on its call's answer and its server's
+            // confirmation, read in either order), but a stopping hub stops first.
             let wake = tokio::select! {
                 biased;
-                report = next_report(&mut self.reports) => Wake::Report(report),
+                report = self.reports.recv() => Wake::Report(report),
                 command = self.commands.recv() => Wake::Command(command),
-                incoming = next_incoming(&mut self.inbox) => Wake::Incoming(incoming),
+                observed = self.stream.recv() => Wake::Observed(observed),
+                changed = self.list.changed(), if listing => Wake::List(changed.is_ok()),
+                changed = self.joined.changed(), if joining => Wake::Joined(changed.is_ok()),
             };
             match wake {
-                Wake::Report(Some(Report::SubscribeRefused { channel, refusal })) => {
-                    let step = self.channels.refused(&channel, &Rejection::from_refusal(refusal));
+                Wake::Report(Some(Report { target, ticket, result })) => {
+                    let step = self.channels.answered(&target, ticket, result.map_err(Rejection::from_refusal));
                     self.apply(step);
                 }
-                Wake::Report(None) => self.reports = None,
-                Wake::Command(Some(Command::Stop) | None) => return,
+                // The worker holds the observer; without it there is nothing to watch.
+                Wake::Report(None) | Wake::Observed(None) | Wake::Command(Some(Command::Stop) | None) => return,
                 Wake::Command(Some(command)) => self.command(command),
-                Wake::Incoming(Some(Incoming::Delivery(event))) => self.delivery(&event),
-                Wake::Incoming(Some(Incoming::Subscribed(channel))) => {
-                    let step = self.channels.marker(&channel);
-                    self.apply(step);
-                    self.mark_ready();
+                Wake::Observed(Some(observed)) => self.observed(observed),
+                Wake::List(alive) => {
+                    listing = alive;
+                    self.publish_health();
                 }
-                Wake::Incoming(Some(Incoming::Notice(_))) => {}
-                Wake::Incoming(Some(Incoming::Closed) | None) => self.lost(),
+                Wake::Joined(alive) => {
+                    joining = alive;
+                    self.publish_health();
+                }
             }
         }
     }
 
-    /// Carries out one step of the book: calls upstream in order, then answers.
+    /// Carries out one step of the book: calls the observer in order, then answers.
     fn apply(&mut self, step: Step<Reply>) {
-        if let Some(calls) = &self.calls {
-            for call in step.calls {
-                let _ = calls.send(call);
-            }
+        for call in step.calls {
+            let _ = self.calls.send(call);
         }
         for (reply, result) in step.answers {
             let _ = reply.send(result);
         }
     }
 
-    /// Connects in the background, waiting longer after each failure, until
-    /// it connects or the hub is gone.
-    fn reconnect(&self) {
-        let connector = self.connector.clone();
-        let commands = self.self_commands.clone();
-        let backoff = self.core.config.reconnect;
-        tokio::spawn(async move {
-            let mut wait = Duration::from_millis(backoff.initial_ms.max(1));
-            while commands.strong_count() > 0 {
-                match connector.connect().await {
-                    Ok((upstream, inbox)) => {
-                        if let Some(commands) = commands.upgrade() {
-                            let _ = commands.send(Command::Connected { upstream, inbox }).await;
-                        }
-                        return;
-                    }
-                    Err(_) => {
-                        // Reconnect backoff: one of the two timers this crate declares.
-                        tokio::time::sleep(wait).await;
-                        wait = (wait * 2).min(Duration::from_millis(backoff.max_ms.max(1)));
-                    }
-                }
+    fn observed(&mut self, observed: Observed) {
+        match observed {
+            Observed::Delivery { server, event } => self.delivery(&server, event),
+            Observed::Subscribed { server, target, ticket } => {
+                let step = self.channels.confirmed(&server, &target, ticket);
+                self.apply(step);
             }
-        });
-    }
-
-    /// The upstream connection dropped. Events sent meanwhile are lost (Q8(a)).
-    fn lost(&mut self) {
-        self.inbox = None;
-        self.calls = None;
-        self.reports = None;
-        *self.core.upstream.write() = None;
-        let _ = self.ready.send(false);
-        self.channels.lost();
-        self.reconnect();
-    }
-
-    fn connected(&mut self, upstream: Arc<dyn Methods>, inbox: Inbox) {
-        let (calls, mut queue) = mpsc::unbounded_channel::<Call>();
-        let (report_tx, reports) = mpsc::channel(COMMANDS);
-        let worker = upstream.clone();
-        // One worker per connection sends subscribe and unsubscribe in issue order.
-        tokio::spawn(async move {
-            while let Some(call) = queue.recv().await {
-                match call {
-                    Call::Subscribe(channel) => {
-                        if let Err(refusal) = worker.subscribe(channel.clone(), None).await {
-                            if report_tx.send(Report::SubscribeRefused { channel, refusal }).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Call::Unsubscribe(channel) => {
-                        let _ = worker.unsubscribe(channel).await;
-                    }
-                }
+            // A fresh connection: nothing is in effect there until it confirms.
+            Observed::Up { server, .. } => {
+                self.channels.reset(&server);
+                self.observing.insert(server);
+                self.publish_health();
             }
-        });
-        self.calls = Some(calls);
-        self.reports = Some(reports);
-        self.inbox = Some(inbox);
-        *self.core.upstream.write() = Some(upstream);
-        let step = self.channels.connected();
-        self.apply(step);
-        self.mark_ready();
+            // What the server dispatched until the next `Up` is lost (0.3).
+            Observed::Gap { server, .. } => {
+                self.channels.reset(&server);
+                self.observing.remove(&server);
+                self.publish_health();
+            }
+            Observed::Notice { .. } => {}
+        }
     }
 
-    /// Ready once connected and, in worker auth mode, once the reply channel's subscription took effect.
-    fn mark_ready(&self) {
-        let reply_ready = self.reply_channel.as_ref().is_none_or(|reply| self.channels.settled(reply));
-        let _ = self.ready.send(self.calls.is_some() && reply_ready);
+    fn publish_health(&self) {
+        let health = Health::of(&self.list.borrow(), &self.observing, &self.joined.borrow());
+        self.health.send_if_modified(|current| {
+            let changed = *current != health;
+            *current = health;
+            changed
+        });
     }
 
     fn command(&mut self, command: Command) {
@@ -281,70 +277,61 @@ impl Hub {
             Command::Attach { user, out, reply } => {
                 let id = self.next_user;
                 self.next_user += 1;
-                self.users.insert(id, Attached { user, out, channels: HashSet::new() });
+                self.users.insert(id, Attached { user, out, targets: HashSet::new() });
                 let _ = reply.send(id);
             }
-            Command::Join { user, channel, reply } => {
+            Command::Join { user, target, reply } => {
                 let Some(attached) = self.users.get_mut(&user) else {
                     let _ = reply.send(Err(Rejection::unavailable("user detached")));
                     return;
                 };
-                attached.channels.insert(channel.clone());
-                let step = self.channels.join(user, channel, reply);
+                attached.targets.insert(target.clone());
+                let step = self.channels.join(user, target, reply);
                 self.apply(step);
             }
-            Command::Leave { user, channel } => {
+            Command::Leave { user, target } => {
                 if let Some(attached) = self.users.get_mut(&user) {
-                    attached.channels.remove(&channel);
+                    attached.targets.remove(&target);
                 }
-                let step = self.channels.leave(user, &channel);
+                let step = self.channels.leave(user, &target);
                 self.apply(step);
             }
             Command::Detach { user } => self.detach(user),
             Command::Send { user, text } => self.hand(user, text),
-            Command::AuthWait { correlation, reply } => {
-                self.auth_waiters.insert(correlation, reply);
-            }
-            Command::AuthCancel { correlation } => {
-                self.auth_waiters.remove(&correlation);
-            }
-            Command::Connected { upstream, inbox } => self.connected(upstream, inbox),
             Command::Stop => {}
         }
     }
 
-    /// Drops a user: its stream ends (the hub held the only sender) and it leaves every channel.
+    /// Drops a user: its stream ends (the hub held the only sender) and it leaves every target.
     fn detach(&mut self, user: UserId) {
         let Some(attached) = self.users.remove(&user) else { return };
-        let step = self.channels.leave_all(user, attached.channels);
+        let step = self.channels.leave_all(user, attached.targets);
         self.apply(step);
     }
 
     fn hand(&mut self, user: UserId, text: Arc<str>) {
-        let failed = self.users.get(&user).is_some_and(|attached| attached.out.try_send(text).is_err());
+        let failed = self.users.get(&user).is_some_and(|attached| !attached.out.text(text));
         if failed {
             self.detach(user);
         }
     }
 
-    fn delivery(&mut self, event: &Envelope) {
-        if self.reply_channel.as_ref() == Some(&event.channel) {
-            if let Some(waiter) = event.correlation.and_then(|correlation| self.auth_waiters.remove(&correlation)) {
-                let answer = serde_json::from_slice(&event.payload).unwrap_or(AuthAnswer { ok: false, user: None, channels: Vec::new() });
-                let _ = waiter.send(answer);
-            }
+    fn delivery(&mut self, server: &Server, event: Envelope) {
+        let audience = self.channels.audience(&event.channel, server);
+        if audience.is_empty() {
             return;
         }
+        let event = Arc::new(event);
         let mut text = None;
         let mut gone = Vec::new();
-        for id in self.channels.audience(&event.channel) {
+        for id in audience {
             let Some(attached) = self.users.get(&id) else { continue };
             // A user that went away is dropped whatever the hook says.
             if attached.out.is_closed() {
                 gone.push(id);
                 continue;
             }
-            match admits(self.core.hooks.as_ref(), &attached.user, event) {
+            match admits(self.core.hooks.as_ref(), &attached.user, &event) {
                 Some(true) => {}
                 Some(false) => continue,
                 // The hook could not decide: the user misses this event, and a
@@ -354,8 +341,7 @@ impl Hub {
                     continue;
                 }
             }
-            let text = text.get_or_insert_with(|| event_text(event));
-            if attached.out.try_send(text.clone()).is_err() {
+            if !attached.out.event(&event, &mut text) {
                 gone.push(id);
             }
         }
@@ -367,7 +353,8 @@ impl Hub {
 
 impl Drop for Hub {
     fn drop(&mut self) {
-        let _ = self.ready.send(false);
-        *self.core.upstream.write() = None;
+        self.health.send_replace(Health::default());
+        self.worker.abort();
+        *self.core.requester.write() = None;
     }
 }

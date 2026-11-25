@@ -3,25 +3,24 @@
 
 use super::*;
 use crate::message::Cause;
+use std::sync::Arc;
 
 type Book = Channels<&'static str>;
 
-fn name(text: &str) -> Name {
-    Name::new(text)
+fn channel(text: &str) -> Target {
+    Target::Channel(text.into())
 }
 
-fn connected() -> Book {
-    let mut book = Book::new(None);
-    assert!(book.connected().calls.is_empty(), "nothing is wanted yet");
-    book
+fn prefix(text: &str) -> Target {
+    Target::Prefix(text.into())
 }
 
-fn sub(channel: &str) -> Call {
-    Call::Subscribe(name(channel))
+fn server(name: &str) -> Server {
+    Arc::from(name)
 }
 
-fn unsub(channel: &str) -> Call {
-    Call::Unsubscribe(name(channel))
+fn sub(target: Target, ticket: u64) -> Call {
+    Call::Subscribe { target, ticket }
 }
 
 fn oks(step: &Step<&'static str>) -> Vec<&'static str> {
@@ -32,278 +31,216 @@ fn errors(step: &Step<&'static str>) -> Vec<(&'static str, Rejection)> {
     step.answers.iter().filter_map(|(label, result)| result.clone().err().map(|rejection| (*label, rejection))).collect()
 }
 
-fn audience(book: &Book, channel: &str) -> Vec<UserId> {
-    let mut users: Vec<UserId> = book.audience(&name(channel)).collect();
-    users.sort_unstable();
-    users
+fn audience(book: &Book, name: &str, on: &str) -> Vec<UserId> {
+    book.audience(name, &server(on))
+}
+
+/// Joins `user` to `target` and runs it to "subscribed" on `on`: confirmation, then the call's answer.
+fn joined(book: &mut Book, user: UserId, target: Target, on: &str, label: &'static str) -> u64 {
+    let step = book.join(user, target.clone(), label);
+    let Some(Call::Subscribe { ticket, .. }) = step.calls.first().cloned() else { panic!("no subscribe issued") };
+    book.confirmed(&server(on), &target, ticket);
+    assert_eq!(oks(&book.answered(&target, ticket, Ok(()))), vec![label]);
+    ticket
 }
 
 // ── joining ──────────────────────────────────────────────────────────────
 
-/// A first join sends one subscribe and the user waits; its marker makes it active.
+/// A first join issues one subscribe with the first ticket; the user is in
+/// the audience from its server's confirmation, and is answered once the call comes back too.
 #[test]
-fn a_join_waits_for_the_marker_of_its_own_subscribe() {
-    let mut book = connected();
-    let step = book.join(1, name("room"), "u1");
-    assert_eq!(step.calls, vec![sub("room")]);
-    assert!(step.answers.is_empty(), "not active before the marker");
-    assert_eq!(audience(&book, "room"), Vec::<UserId>::new());
-    let step = book.marker(&name("room"));
-    assert_eq!(oks(&step), vec!["u1"]);
-    assert_eq!(audience(&book, "room"), vec![1]);
+fn a_join_waits_for_its_own_confirmation_and_its_answer() {
+    let mut book = Book::new();
+    let step = book.join(1, channel("room"), "u1");
+    assert_eq!(step.calls, vec![sub(channel("room"), 1)]);
+    assert!(step.answers.is_empty(), "not in effect before the confirmation");
+    assert_eq!(audience(&book, "room", "s0"), Vec::<UserId>::new());
+    let step = book.confirmed(&server("s0"), &channel("room"), 1);
+    assert!(step.answers.is_empty(), "the call has not come back yet");
+    assert_eq!(audience(&book, "room", "s0"), vec![1], "in effect on s0 from its confirmation");
+    assert_eq!(oks(&book.answered(&channel("room"), 1, Ok(()))), vec!["u1"]);
 }
 
-/// Every join issues its own subscribe, even on a channel already subscribed.
+/// The call's answer and the confirmation may be read in either order; the join is answered after both.
+#[test]
+fn the_answer_and_the_confirmation_settle_in_either_order() {
+    let mut book = Book::new();
+    book.join(1, channel("room"), "u1");
+    assert!(book.answered(&channel("room"), 1, Ok(())).answers.is_empty(), "not in effect anywhere yet");
+    assert_eq!(oks(&book.confirmed(&server("s0"), &channel("room"), 1)), vec!["u1"]);
+}
+
+/// Every join of a new user issues its own subscribe, even on a target already subscribed.
 #[test]
 fn every_join_issues_its_own_subscribe() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.marker(&name("room"));
-    let step = book.join(2, name("room"), "u2");
-    assert_eq!(step.calls, vec![sub("room")]);
+    let mut book = Book::new();
+    joined(&mut book, 1, channel("room"), "s0", "u1");
+    let step = book.join(2, channel("room"), "u2");
+    assert_eq!(step.calls, vec![sub(channel("room"), 2)]);
     assert!(step.answers.is_empty());
 }
 
-/// A marker that answers an earlier subscribe does not activate a later joiner.
+/// A confirmation of an earlier subscribe does not activate a later joiner.
 #[test]
-fn an_earlier_marker_does_not_activate_a_later_joiner() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.join(2, name("room"), "u2");
-    assert_eq!(oks(&book.marker(&name("room"))), vec!["u1"]);
-    assert_eq!(audience(&book, "room"), vec![1], "u2's subscribe is still unanswered");
-    assert_eq!(oks(&book.marker(&name("room"))), vec!["u2"]);
-    assert_eq!(audience(&book, "room"), vec![1, 2]);
+fn an_earlier_confirmation_does_not_activate_a_later_joiner() {
+    let mut book = Book::new();
+    book.join(1, channel("room"), "u1");
+    book.join(2, channel("room"), "u2");
+    book.confirmed(&server("s0"), &channel("room"), 1);
+    assert_eq!(audience(&book, "room", "s0"), vec![1], "u2's subscribe is not confirmed yet");
+    book.confirmed(&server("s0"), &channel("room"), 2);
+    assert_eq!(audience(&book, "room", "s0"), vec![1, 2]);
 }
 
-/// Joining a channel one is already active on is answered at once and sends nothing.
+/// Joining a target one's join was already answered on is answered at once and issues nothing.
 #[test]
 fn joining_twice_is_answered_at_once_without_a_call() {
-    let mut book = connected();
-    book.join(1, name("room"), "first");
-    book.marker(&name("room"));
-    let step = book.join(1, name("room"), "again");
+    let mut book = Book::new();
+    joined(&mut book, 1, channel("room"), "s0", "u1");
+    let step = book.join(1, channel("room"), "again");
     assert!(step.calls.is_empty());
     assert_eq!(oks(&step), vec!["again"]);
 }
 
-/// Channels are independent: a marker on one never activates a waiter on another.
+/// A second join while the first still waits issues nothing and is answered with it.
 #[test]
-fn a_marker_on_one_channel_leaves_other_channels_alone() {
-    let mut book = connected();
-    book.join(1, name("a"), "on a");
-    book.join(1, name("b"), "on b");
-    assert_eq!(oks(&book.marker(&name("a"))), vec!["on a"]);
-    assert_eq!(audience(&book, "b"), Vec::<UserId>::new());
+fn a_second_join_while_waiting_waits_with_the_first() {
+    let mut book = Book::new();
+    book.join(1, channel("room"), "first");
+    assert!(book.join(1, channel("room"), "second").calls.is_empty());
+    book.confirmed(&server("s0"), &channel("room"), 1);
+    assert_eq!(oks(&book.answered(&channel("room"), 1, Ok(()))), vec!["first", "second"]);
 }
 
-// ── markers nobody asked for ─────────────────────────────────────────────
-
-/// A marker when every issued subscribe was already answered changes nothing.
+/// A subscription is in effect per server: a confirmation from one server says nothing about another.
 #[test]
-fn a_marker_nobody_asked_for_activates_nobody() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.marker(&name("room"));
-    book.join(2, name("room"), "u2");
-    book.marker(&name("room"));
-    let step = book.marker(&name("room"));
-    assert!(step.answers.is_empty() && step.calls.is_empty());
-    let step = book.join(3, name("room"), "u3");
-    assert!(step.answers.is_empty(), "the stray marker was not banked for the next joiner");
+fn a_user_is_in_effect_per_server() {
+    let mut book = Book::new();
+    book.join(1, channel("room"), "u1");
+    book.confirmed(&server("s0"), &channel("room"), 1);
+    assert_eq!((audience(&book, "room", "s0"), audience(&book, "room", "s1")), (vec![1], vec![]));
+    book.confirmed(&server("s1"), &channel("room"), 1);
+    assert_eq!(audience(&book, "room", "s1"), vec![1]);
 }
 
-/// A marker for a channel the book does not hold is ignored.
+/// Confirmations and answers for targets or tickets nobody waits for change nothing.
 #[test]
-fn a_marker_for_an_unknown_channel_is_ignored() {
-    let mut book = connected();
-    let step = book.marker(&name("nowhere"));
-    assert!(step.answers.is_empty() && step.calls.is_empty());
-    assert!(!book.contains(&name("nowhere")));
+fn confirmations_and_answers_nobody_asked_for_are_ignored() {
+    let mut book = Book::new();
+    assert!(book.confirmed(&server("s0"), &channel("ghost"), 9).answers.is_empty());
+    assert!(!book.contains(&channel("ghost")), "a confirmation creates no entry");
+    book.join(1, channel("room"), "u1");
+    assert!(book.answered(&channel("room"), 7, Ok(())).answers.is_empty());
+    assert!(book.answered(&channel("room"), 7, Err(Rejection::forbidden("no"))).answers.is_empty());
+    assert!(book.contains(&channel("room")));
 }
 
-// ── leaving ──────────────────────────────────────────────────────────────
+// ── leaving and `0 → 1 → 0 → 1` ─────────────────────────────────────────
 
-/// The last user leaving sends one unsubscribe; a user who is not the last sends nothing.
+/// Only the last user leaving unsubscribes, once, and drops the entry.
 #[test]
 fn only_the_last_user_leaving_unsubscribes() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.join(2, name("room"), "u2");
-    book.marker(&name("room"));
-    book.marker(&name("room"));
-    assert!(book.leave(1, &name("room")).calls.is_empty());
-    assert_eq!(book.leave(2, &name("room")).calls, vec![unsub("room")]);
-    assert!(!book.contains(&name("room")), "an idle channel is dropped from the book");
+    let mut book = Book::new();
+    joined(&mut book, 1, channel("room"), "s0", "u1");
+    joined(&mut book, 2, channel("room"), "s0", "u2");
+    assert!(book.leave(1, &channel("room")).calls.is_empty());
+    assert_eq!(book.leave(2, &channel("room")).calls, vec![Call::Unsubscribe(channel("room"))]);
+    assert!(!book.contains(&channel("room")));
+    assert!(book.leave(2, &channel("room")).calls.is_empty(), "leaving again does nothing");
 }
 
-/// Leaving while the join still waits answers that join as cancelled, not silently.
+/// Leaving before the subscription took effect answers the waiting join as cancelled.
 #[test]
-fn leaving_before_the_marker_answers_the_waiting_join() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    let step = book.leave(1, &name("room"));
-    assert_eq!(step.calls, vec![unsub("room")]);
+fn leaving_before_the_confirmation_answers_the_waiting_join() {
+    let mut book = Book::new();
+    book.join(1, channel("room"), "u1");
+    let step = book.leave(1, &channel("room"));
+    assert_eq!(step.calls, vec![Call::Unsubscribe(channel("room"))]);
     let failed = errors(&step);
     assert_eq!(failed.len(), 1);
     assert_eq!((failed[0].0, failed[0].1.cause), ("u1", Cause::Unavailable));
 }
 
-/// The entry stays while a subscribe is unanswered, so its late marker is counted, then goes.
+/// After `0 → 1 → 0 → 1` the user waits for the second subscribe's confirmation; the first's activates nothing.
 #[test]
-fn an_entry_outlives_its_users_until_its_last_marker() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.leave(1, &name("room"));
-    assert!(book.contains(&name("room")), "one subscribe is still unanswered");
-    assert!(book.marker(&name("room")).answers.is_empty(), "nobody is waiting any more");
-    assert!(!book.contains(&name("room")));
+fn resubscribing_waits_for_the_second_subscribes_confirmation() {
+    let mut book = Book::new();
+    let first = joined(&mut book, 1, channel("room"), "s0", "u1");
+    book.leave(1, &channel("room"));
+    let step = book.join(1, channel("room"), "again");
+    assert_eq!(step.calls, vec![sub(channel("room"), first + 1)]);
+    book.confirmed(&server("s0"), &channel("room"), first);
+    assert_eq!(audience(&book, "room", "s0"), Vec::<UserId>::new(), "a late confirmation of the first subscribe leaks nothing");
+    book.confirmed(&server("s0"), &channel("room"), first + 1);
+    assert_eq!(audience(&book, "room", "s0"), vec![1]);
 }
 
-/// `0 → 1 → 0 → 1`: the second subscription's user waits for the second marker.
+/// Leaving everything leaves every target; leaving what one never joined does nothing.
 #[test]
-fn resubscribing_waits_for_the_second_subscribes_marker() {
-    let mut book = connected();
-    book.join(1, name("room"), "first");
-    book.marker(&name("room"));
-    assert_eq!(book.leave(1, &name("room")).calls, vec![unsub("room")]);
-    assert_eq!(book.join(1, name("room"), "second").calls, vec![sub("room")]);
-    assert_eq!(oks(&book.marker(&name("room"))), vec!["second"]);
-}
-
-/// Leave and rejoin before the first marker: sub, unsub, sub; only the second marker activates.
-#[test]
-fn rejoining_before_the_first_marker_waits_for_the_second() {
-    let mut book = connected();
-    book.join(1, name("room"), "first");
-    let left = book.leave(1, &name("room"));
-    assert_eq!(left.calls, vec![unsub("room")]);
-    book.join(1, name("room"), "second");
-    assert!(oks(&book.marker(&name("room"))).is_empty(), "the first marker answers the cancelled subscribe");
-    assert_eq!(oks(&book.marker(&name("room"))), vec!["second"]);
-}
-
-/// Detaching leaves every channel the user was on.
-#[test]
-fn leaving_all_leaves_every_channel() {
-    let mut book = connected();
-    for channel in ["a", "b"] {
-        book.join(7, name(channel), "j");
-        book.marker(&name(channel));
-    }
-    let step = book.leave_all(7, [name("a"), name("b")]);
-    let mut calls = step.calls;
-    calls.sort_by_key(|call| format!("{call:?}"));
-    assert_eq!(calls, vec![unsub("a"), unsub("b")]);
-}
-
-/// Leaving a channel one never joined is a no-op.
-#[test]
-fn leaving_an_unknown_channel_does_nothing() {
-    let mut book = connected();
-    let step = book.leave(1, &name("nowhere"));
-    assert!(step.calls.is_empty() && step.answers.is_empty());
+fn leaving_all_leaves_every_target_and_unknown_ones_do_nothing() {
+    let mut book = Book::new();
+    joined(&mut book, 1, channel("a"), "s0", "a");
+    joined(&mut book, 1, prefix("b"), "s0", "b");
+    let step = book.leave_all(1, [channel("a"), prefix("b")]);
+    assert_eq!(step.calls, vec![Call::Unsubscribe(channel("a")), Call::Unsubscribe(prefix("b"))]);
+    assert!(book.leave(1, &channel("never")).calls.is_empty());
 }
 
 // ── refusals ─────────────────────────────────────────────────────────────
 
-/// A refused subscribe fails the waiters it answers, with the upstream's cause.
+/// A refused call fails the join it answers, keeps its cause, and the last refused member unsubscribes.
 #[test]
 fn a_refusal_fails_the_join_it_answers() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    let step = book.refused(&name("room"), &Rejection::forbidden("forbidden"));
+    let mut book = Book::new();
+    book.join(1, channel("secret"), "u1");
+    let step = book.answered(&channel("secret"), 1, Err(Rejection::from_refusal(ruvent::Refusal::Forbidden)));
     let failed = errors(&step);
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0].1, Rejection::forbidden("upstream refused: forbidden"));
-    assert!(!book.contains(&name("room")), "nothing is left to keep");
+    assert_eq!((failed[0].0, failed[0].1.cause, failed[0].1.message.as_str()), ("u1", Cause::Forbidden, "upstream refused: forbidden"));
+    assert_eq!(step.calls, vec![Call::Unsubscribe(channel("secret"))]);
+    assert!(!book.contains(&channel("secret")));
 }
 
-/// A refusal answers only the subscribe it is for; a later joiner keeps waiting.
+// ── connections ──────────────────────────────────────────────────────────
+
+/// A server's connection ending (or starting again) takes it out of every audience until it confirms again.
 #[test]
-fn a_refusal_counts_like_a_marker_for_ordering() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.join(2, name("room"), "u2");
-    let step = book.refused(&name("room"), &Rejection::forbidden("no"));
-    assert_eq!(errors(&step).iter().map(|(label, _)| *label).collect::<Vec<_>>(), vec!["u1"]);
-    assert_eq!(oks(&book.marker(&name("room"))), vec!["u2"]);
+fn a_reconnection_resets_a_server_until_it_confirms_again() {
+    let mut book = Book::new();
+    let ticket = joined(&mut book, 1, channel("room"), "s0", "u1");
+    book.confirmed(&server("s1"), &channel("room"), ticket);
+    book.reset(&server("s0"));
+    assert_eq!((audience(&book, "room", "s0"), audience(&book, "room", "s1")), (vec![], vec![1]), "only s0 is reset");
+    assert!(book.confirmed(&server("s0"), &channel("room"), ticket + 5).answers.is_empty(), "already answered: nothing more to say");
+    assert_eq!(audience(&book, "room", "s0"), vec![1], "the subscription said again at the new connection");
 }
 
-/// A refusal nobody asked for is ignored like a stray marker.
+/// With no server connected the call comes back at once; the join waits for the first server to confirm.
 #[test]
-fn a_refusal_nobody_asked_for_is_ignored() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.marker(&name("room"));
-    let step = book.refused(&name("room"), &Rejection::forbidden("no"));
-    assert!(step.answers.is_empty());
-    assert_eq!(audience(&book, "room"), vec![1]);
+fn a_join_with_no_server_connected_waits_for_the_first_confirmation() {
+    let mut book = Book::new();
+    book.join(1, channel("room"), "early");
+    assert!(book.answered(&channel("room"), 1, Ok(())).answers.is_empty());
+    assert_eq!(oks(&book.confirmed(&server("s0"), &channel("room"), 1)), vec!["early"], "said at the connection with the calls handled so far");
 }
 
-// ── the upstream connection ──────────────────────────────────────────────
+// ── prefixes ─────────────────────────────────────────────────────────────
 
-/// While disconnected nothing is sent; a join made then is subscribed on connect and activated by that marker.
+/// A prefix takes every channel below it at a `.` boundary, at any depth, and nothing else.
 #[test]
-fn a_join_before_the_upstream_connects_takes_effect_after_it_connects() {
-    let mut book = Book::new(None);
-    let step = book.join(1, name("room"), "early");
-    assert!(step.calls.is_empty(), "no connection, no call");
-    assert_eq!(book.connected().calls, vec![sub("room")]);
-    assert_eq!(oks(&book.marker(&name("room"))), vec!["early"], "one subscribe sent, one marker awaited");
+fn a_prefix_takes_every_channel_below_it_at_a_dot() {
+    let mut book = Book::new();
+    joined(&mut book, 1, prefix("room"), "s0", "u1");
+    assert_eq!(audience(&book, "room.1", "s0"), vec![1]);
+    assert_eq!(audience(&book, "room.a.b", "s0"), vec![1]);
+    assert!(audience(&book, "room", "s0").is_empty() && audience(&book, "roomy.1", "s0").is_empty());
 }
 
-/// After the connection drops, every wanted channel is subscribed once again and active users stay active.
+/// A user on a channel and on a prefix above it is in that channel's audience once.
 #[test]
-fn a_new_connection_subscribes_every_wanted_channel_once() {
-    let mut book = connected();
-    book.join(1, name("a"), "a1");
-    book.marker(&name("a"));
-    book.join(2, name("b"), "b2");
-    book.lost();
-    assert!(book.leave(9, &name("a")).calls.is_empty(), "nothing is sent while disconnected");
-    assert_eq!(book.connected().calls, vec![sub("a"), sub("b")]);
-    assert_eq!(audience(&book, "a"), vec![1], "an active user stays active across a reconnect");
-    assert_eq!(oks(&book.marker(&name("b"))), vec!["b2"], "the waiter now waits for the new marker");
-}
-
-/// Leaving while disconnected sends no unsubscribe, and the channel is not resubscribed.
-#[test]
-fn a_channel_left_while_disconnected_is_not_resubscribed() {
-    let mut book = connected();
-    book.join(1, name("room"), "u1");
-    book.marker(&name("room"));
-    book.lost();
-    assert!(book.leave(1, &name("room")).calls.is_empty());
-    assert!(book.connected().calls.is_empty());
-    assert!(!book.contains(&name("room")));
-}
-
-// ── the internal channel ─────────────────────────────────────────────────
-
-/// The internal channel is subscribed on every connection with no users, is never dropped, and settles on its marker.
-#[test]
-fn the_internal_channel_is_kept_and_settles_on_its_marker() {
-    let mut book = Book::new(Some(name("proxy.auth")));
-    assert!(!book.settled(&name("proxy.auth")), "not before a connection");
-    assert_eq!(book.connected().calls, vec![sub("proxy.auth")]);
-    assert!(!book.settled(&name("proxy.auth")), "not before its marker");
-    book.marker(&name("proxy.auth"));
-    assert!(book.settled(&name("proxy.auth")));
-    book.lost();
-    assert!(!book.settled(&name("proxy.auth")));
-    assert!(book.contains(&name("proxy.auth")));
-    assert_eq!(book.connected().calls, vec![sub("proxy.auth")]);
-}
-
-/// A user may join the internal channel; leaving it never unsubscribes.
-#[test]
-fn leaving_the_internal_channel_never_unsubscribes() {
-    let mut book = Book::new(Some(name("proxy.auth")));
-    book.connected();
-    book.marker(&name("proxy.auth"));
-    book.join(1, name("proxy.auth"), "u1");
-    book.marker(&name("proxy.auth"));
-    assert!(book.leave(1, &name("proxy.auth")).calls.is_empty());
-    assert!(book.settled(&name("proxy.auth")));
+fn a_user_on_a_channel_and_its_prefix_is_in_the_audience_once() {
+    let mut book = Book::new();
+    joined(&mut book, 1, channel("room.1"), "s0", "exact");
+    joined(&mut book, 1, prefix("room"), "s0", "prefix");
+    joined(&mut book, 2, prefix("room"), "s0", "other");
+    assert_eq!(audience(&book, "room.1", "s0"), vec![1, 2]);
 }

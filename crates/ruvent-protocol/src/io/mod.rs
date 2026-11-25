@@ -42,7 +42,7 @@ pub struct RawRecord {
 /// | --- | --- |
 /// | scope | one direction of one connection |
 /// | lifetime | the connection |
-/// | bound | one read ([`READ`]) past the longest head (`u16`); bodies are not kept in it |
+/// | bound | one read (`READ`) past the longest head (`u16`); bodies are not kept in it |
 /// | cleared by | consumption, record by record |
 pub struct RecordReader<R> {
     inner: R,

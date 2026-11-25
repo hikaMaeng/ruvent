@@ -8,13 +8,15 @@ fn publish(channel: &str, reply: Option<&str>) -> Publish {
     serde_json::from_str(&format!(r#"{{"kind":"dispatch","channel":"{channel}","type":"t","payload":1{reply}}}"#)).unwrap()
 }
 
-/// Subscribing inside the scope is allowed; outside, forbidden with a fixed message.
+/// Subscribing inside the scope is allowed, a channel or a prefix; outside, forbidden with a fixed message.
 #[test]
 fn the_subscribe_rule_is_the_users_scope() {
     let user = User::new("u", ["room*"]);
-    assert_eq!(within_scope(&user, "room.1"), Ok(()));
-    let refused = within_scope(&user, "admin").unwrap_err();
+    assert_eq!(within_scope(&user, &Target::Channel("room.1".into())), Ok(()));
+    assert_eq!(within_scope(&user, &Target::Prefix("room".into())), Ok(()));
+    let refused = within_scope(&user, &Target::Channel("admin".into())).unwrap_err();
     assert_eq!((refused.cause, refused.message.as_str()), (Cause::Forbidden, "forbidden channel"));
+    assert_eq!(within_scope(&User::new("v", ["room"]), &Target::Prefix("room".into())).unwrap_err().cause, Cause::Forbidden);
 }
 
 /// Publishing checks the channel first, then the reply channel.

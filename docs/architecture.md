@@ -3,7 +3,7 @@
 ## 배치
 
 ```text
-일반 클라이언트 ──► 프록시(ruvent-proxy로 빌드) ──────┐  채널별 상위 구독 하나
+일반 클라이언트 ──► 프록시(ruvent-proxy로 빌드) ──────┐  서버마다, 대상마다 상위 구독 하나
                                                      ├──► ruvent-server ──► Engine (단일 작성자)
 워커 서버(ruvent-client: App) ───────────────────────┘          │
 내장 워커: ruvent::connect — 같은 메서드, 소켓 없음 ────────────┘
@@ -14,42 +14,51 @@
 
 ## 엔진 ([crates/ruvent/src/engine](../crates/ruvent/src/engine/mod.rs))
 
+개편 계획 [library-overhaul.md](proposals/library-overhaul.md) v4.6의 장부다. 큐 구조는 계획 2.2의 (가)다:
+tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받는다.
+
 ```text
-접속 ──Op──► inbox ──recv_many──► State(상태 기계) ──Effects──┬─► 송신 버퍼(try_send, 가득 차면 연결 종료)
-                                                               ├─► 저널 기록 태스크(한 번에 한 비행)
-                                                               └─► 스냅샷 수집기(try_send, 넘치면 셈)
+연결(역할: 생산·작업·관찰) ──Call──► inbox ──recv_many──► State(단일 작성자) ──Effects──┬─► 연결별 송신 대기열
+                                                                                       ├─► 로그 작성기(한 번에 한 비행)
+                                                                                       ├─► 본문 읽기(콜드 송신, 미리 읽기)
+                                                                                       ├─► 체크포인트 작성기(훑기 조각)
+                                                                                       ├─► 잡일(이주, 세그먼트 삭제)
+                                                                                       └─► 스냅샷 수집기
+                                                   기한 휠 ──(가장 이른 기한만)──► State
 ```
 
-* `State`([state/mod.rs](../crates/ruvent/src/engine/state/mod.rs))는 순수 상태 기계다. 호출을 받아
-  `Effects`(저널 레코드, 송신, 스냅샷 사본)를 내놓는다. 태스크도 소켓도 시계도 없다. 엔진이 시각을 넣어 준다.
-* 착수용 큐는 작업 키 순서의 `BTreeMap`이다. id 색인, 채널별 대기 집합(대기분 응답용), 기한 힙
-  `(기한, 작업 키, 표지)`을 함께 둔다. 힙에서 꺼낸 항목은 아직 같은 표지로 착수 중일 때만 회수한다.
-* 엔진은 소켓도 타이머도 기다리지 않는다. 저널 쓰기는 한 비행씩 기록 태스크에 넘긴다. 비행 중에 생긴
-  레코드는 다음 비행에 실린다.
-* **Strict 보류.** 착수용 등록·완료(후속 포함)·삭제 성공의 응답과 통지는 그 배치의 레코드가 실린 비행이
-  끝난 뒤에 넘긴다. 보류 중인 송신이 있는 접속에는 그 뒤에 처리된 것도 뒤에 선다(접속별 순서). 착수·회수·
-  구독·직접 발송은 보류하지 않는다. 세대가 바뀐 배치는 내구성 설정과 무관하게 전부 보류한다.
-* **장애.** 저널 쓰기가 실패하면 엔진은 멈추고 `Engine::stopped()`가 사유와 함께 끝난다. 보류 중이던 응답과
-  통지는 버려진다. 엔진은 정지를 알리기 전에 저널 기록 태스크를 끝내 파일 잠금을 놓는다.
+* `State`([state/mod.rs](../crates/ruvent/src/engine/state/mod.rs))는 순수 상태 기계다. 시각을 입력으로
+  받고 태스크·소켓·시계가 없다. 부분은 폴더로 나뉜다: 생산(`produce`, `producers`), 소비(`consume`, `lanes`,
+  `wheel`), 정체(`pause`, `roots`), 디스크(`disk`, `checkpoint`), 복구(`recover`), 관찰(`observe`), 슬롯(`slots`).
+* **식별자.** 논리 id는 회수해도 바뀌지 않는다. 시도는 착수 표지(`ClaimToken`, u64 순번)로 가른다. `WorkKey`
+  (세대, u64 도착 순번)가 대기 순서다. 세대는 기동 때만 오른다. 대기 줄은 (채널, 타입)별이다.
+* **생산.** 생산자 순번표가 재전송을 조용히 버리고, 연산별 기준(영속 레코드는 fsync, 그 밖은 적용)으로
+  누적 `Committed`를 낸다. 계기는 로그 쓰기 완료와 장부 묶음 끝이다. 타이머는 없다.
+* **소비.** 작업 연결이 `Join`하고 절댓값 창(`Window`)을 연다. 장부는 자리가 남은 참여자를 등록순으로
+  돌아가며 배정한다(`Assign`). lease는 배정한 순간부터 재고, 회수하면 그 참여의 창을 닫는다. `Extend`,
+  `Release{지연, 실패}`, `not_before`, `expires`, 격리(`isolate_after`), `serialize_group`이 있다.
+* **커밋 가시성.** Strict에서 영속 이벤트는 등록이 커밋되기 전에는 배정·통지·backlog·명시 착수 어느 경로로도
+  보이지 않는다. 같은 연결의 뒤 송신은 앞 송신의 커밋과 본문 읽기를 기다린다.
+* **자원.** 관리 메모리와 디스크를 바이트로 회계하고 뿌리 채널(계보의 첫 채널)마다 몫을 센다. 고수위에서
+  몫이 가장 큰 뿌리를 정지시킨다: 생산 연결에 `Paused`, 순증 줄의 배정 정지.
+* **시각.** 누적 가동 시각(ms)이다. 로그의 마지막 묶음에서 이어 가고 정지 시간은 세지 않는다.
+* **장애.** 로그 쓰기, 체크포인트 쓰기, 본문 읽기(CRC 불일치 포함)가 실패하면 엔진은 멈추고
+  `Engine::stopped()`가 사유와 함께 끝난다.
 
 ## 엔벨롭 ([crates/ruvent/src/envelope](../crates/ruvent/src/envelope/mod.rs))
 
 ```text
- 고정 머리 27   id 16 · channel 4 · type 4 · flags 1 · retry 2
- 작업 키 8      generation 4 · arrival 4                      (착수용, 서버가 보낼 때)
- 착수 블록 24   token 8 · claimer 4 · worker 4 · deadline 8    (착수 응답)
- 선택 필드      reply 4 · correlation 16 · principal 4 · delegate 4
+ 고정 머리 28   id 16 · channel 4 · type 4 · flags 2 · failures 2
+ 작업 키        generation 4 · arrival varint                       (착수용, 서버가 보내거나 기록할 때)
+ 선택 필드      reply 4 · correlation 16 · principal 4 · delegate 4 · not_before varint · expires varint · group 16
  payload        길이 4 + 바이트
 ```
 
-* `flags`: 비트 0 종류(1 = 발송용), 1 착수 여부, 2 reply, 3 correlation, 4 principal, 5 delegate, 6~7 예약.
-* 크기: 발송용 31, 대기 중 착수용 39, 착수 중 착수용 63바이트(각각 payload 별도, 선택 필드 없음).
-* 레코드 종류별로 실리는 필드는 `Layout`이 정한다(Request, Notice, Claimed, Delivery, Journal). 디코더는
-  레코드 종류와 `flags`만으로 길이를 안다. 발송용과 착수의 조합, 예약 비트, 남는 바이트는 거절한다.
-* 제자리 변경은 엔진의 상주 사본에만 한다. 송신·저널·수집기에 넘길 때는 머리 값을 복사하고, 이름 핸들과
-  payload는 공유한다(`Envelope::clone`).
-* 세대는 서버 전체에 하나인 단조 카운터다. 기동할 때, 그리고 도착·착수 순번이 u32를 다 쓰면 올라간다. 새
-  세대는 저널에 기록된 뒤에 쓰인다.
+* 착수 블록은 엔벨롭에서 뺐다. 표지와 lease는 `Assign`·`Claimed` 레코드의 머리에 실린다.
+* `not_before`와 `expires`는 등록 요청에서는 적용 순간부터의 길이이고, 서버가 쥐거나 보낼 때는 누적 가동
+  시각의 절대값이다.
+* 레코드 종류별로 실리는 필드는 `Layout`이 정한다(Request, Notice, Assigned, Delivery, Journal).
+* `failures`는 이벤트 탓인 실패 횟수다(lease 만료 회수, `Release{실패 = 예}`). 65,535에서 멈춘다.
 
 ## 이름표
 
@@ -123,10 +132,14 @@
 
 * 워커 프레임워크([crates/ruvent-client](../crates/ruvent-client/README.md)): 서비스마다 lane 태스크 하나가
   허가, 보관 알림, 재조회를 소유한다. 실행은 착수 → 핸들러 → 완료다. 허가는 핸들러가 끝나면 돌아온다.
-* 프록시([crates/ruvent-proxy](../crates/ruvent-proxy/README.md)): 채널별 상위 구독 하나를 두고 사용자에게
-  나눠 보낸다. 사용자가 붙을 때마다 상위 구독을 한 번 더 보내고, 그 표지 이후의 이벤트만 그 사용자에게
-  보낸다. 서버는 같은 접속의 중복 구독을 하나로 둔다. 프록시는 완성품 바이너리가 아니라 라이브러리다.
-  프로토콜은 feature로 고르고, 인증·구독·등록·전달은 훅(`Hooks`)으로 바꾼다. 훅을 쓰지 않으면 JSON 설정대로
-  돈다. 전달 훅만 허브의 단일 태스크에서 동기로 불리고(패닉은 허브가 잡고 그 사용자만 끊는다), 나머지는
-  사용자 태스크에서 돈다. 허브는 세 역할로 나뉜다: 구독 장부(`hub/channels`, 순수 상태), 허브 태스크
-  (`hub/task.rs`), 핸들(`hub/mod.rs`). 훅의 상위 핸들(`UpstreamCalls`)에는 구독·취소가 없다.
+* 프록시([crates/ruvent-proxy](../crates/ruvent-proxy/README.md)): 발송 팬아웃 계층(개편 계획 4장). 서버 목록의
+  모든 서버에 SDK로 붙고(서버마다 관찰·생산·작업 연결 하나씩, keepalive와 재접속은 SDK), 대상(채널 또는 접두사)마다
+  서버마다 상향 구독 하나를 두고 사용자에게 나눠 보낸다. 사용자가 붙을 때마다 관찰자에 구독을 한 번 더 내고,
+  관찰자가 붙인 ticket 이상인 그 서버의 확인(`Observed::Subscribed`) 이후의 발송만 그 사용자에게 보낸다. 엔벨롭은
+  허브가 `Arc`로 나누고, 텍스트 프로토콜용 JSON은 이벤트마다 한 번 만든다. 등록은 SDK 생산자로, 요청–응답
+  (`Proxy::exchange`, 인증 워커)은 SDK 요청자로 인스턴스 응답 채널에서 받는다. `/health`는 서버별 관찰 연결과
+  응답 채널 참여로 판정한다. 프록시는 완성품 바이너리가 아니라 라이브러리다. 프로토콜은 feature로 고르고,
+  인증·구독·등록·전달은 훅(`Hooks`)으로 바꾼다. 훅을 쓰지 않으면 JSON 설정대로 돈다. 전달 훅만 허브의 단일
+  태스크에서 동기로 불리고(패닉은 허브가 잡고 그 사용자만 끊는다), 나머지는 사용자 태스크에서 돈다. 허브는
+  구독 장부(`hub/channels`, 순수 상태), 허브 태스크(`hub/task.rs`), 핸들(`hub/mod.rs`, `hub/user.rs`), 상향 호출
+  (`hub/calls.rs`)로 나뉜다. 훅의 상향 핸들(`UpstreamCalls`)에는 구독·취소가 없다.

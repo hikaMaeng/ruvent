@@ -25,6 +25,19 @@ fn a_users_scope_is_exact_names_and_star_prefixes() {
     assert!(!User::new("nobody", Vec::<String>::new()).may_use("room"), "an empty scope allows nothing");
 }
 
+/// A prefix target is covered only by a star pattern that takes every channel below it; an exact target as `may_use` says.
+#[test]
+fn a_users_scope_covers_a_prefix_only_through_a_star_pattern() {
+    let user = User::new("u", ["room", "chat.*", "ten*"]);
+    let prefix = |name: &str| Target::Prefix(name.into());
+    assert!(user.covers(&Target::Channel("room".into())) && !user.covers(&Target::Channel("rooms".into())));
+    assert!(user.covers(&prefix("chat")), "chat.* takes every chat.<x>");
+    assert!(user.covers(&prefix("chat.eu")) && user.covers(&prefix("tenant")) && user.covers(&prefix("ten")));
+    assert!(!user.covers(&prefix("room")), "an exact name covers no prefix");
+    assert!(!user.covers(&prefix("te")), "te.x is not under ten*");
+    assert!(User::new("all", ["*"]).covers(&prefix("anything")));
+}
+
 /// A domain value rides on the user and comes back only as its own type.
 #[test]
 fn domain_data_comes_back_only_as_its_type() {
@@ -89,7 +102,7 @@ fn mode_static_tells_missing_from_rejected() {
 #[test]
 fn mode_worker_leaves_tokens_to_the_worker() {
     let mut config = config(AuthMode::Worker);
-    config.auth.worker = Some(WorkerAuth { channel: "auth".into(), event_type: "authenticate".into(), reply_channel: "r".into(), timeout_ms: 10 });
+    config.auth.worker = Some(WorkerAuth { channel: "auth".into(), event_type: "authenticate".into(), timeout_ms: 10 });
     assert_eq!(local(&config, None).unwrap().unwrap_err(), Denied::Missing);
     assert!(local(&config, Some("t")).is_none());
 }

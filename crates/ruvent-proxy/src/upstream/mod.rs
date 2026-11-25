@@ -1,45 +1,48 @@
-//! Where the proxy's one upstream connection comes from. The proxy only sees
-//! [`ruvent::Methods`] and an [`ruvent::Inbox`], so the same hub runs against
-//! a remote event server or an engine in the same process.
+//! Where the proxy's upstream connections come from (4장, 2.8).
+//!
+//! The proxy connects to **every** server of a server list, with one
+//! connection per role on each: observation (the channels its users want,
+//! one subscription per channel or prefix per server), production (what
+//! users publish) and work (its reply channel, for request–response). All of
+//! them are the client SDK's: reconnection with back-off, TCP keepalive on
+//! every socket (S13), the `Bye` table, the unacknowledged buffer.
+//!
+//! [`Upstream`] names the three things that decide it: how a connection is
+//! opened ([`Connector`]: [`Tcp`] to real servers, [`Local`] to engines in
+//! this process), which servers ([`ServerList`]: [`Servers`] is a list set in
+//! code; a router keeps its own), and the credential an in-process
+//! connection runs under (over TCP the token decides).
 
-use ruvent::{async_trait, Engine, Inbox, Methods};
-use std::io;
+pub use ruvent_client::link::{Conn, Connector, Local, Tcp};
+pub use ruvent_client::servers::{Server, ServerList, Servers};
+
+use crate::config::ProxyConfig;
 use std::sync::Arc;
 
-/// Opens the upstream connection; called again after it drops.
-#[async_trait]
-pub trait Connector: Send + Sync + 'static {
-    async fn connect(&self) -> io::Result<(Arc<dyn Methods>, Inbox)>;
-}
-
-/// Messages the upstream inbox holds before the server's send buffer for
-/// this proxy starts filling.
-pub const INBOX: usize = 65_536;
-
-/// An engine in this process, under a credential.
-pub struct InProcess {
-    pub engine: Engine,
+/// Where the proxy connects.
+#[derive(Clone)]
+pub struct Upstream {
+    pub connector: Arc<dyn Connector>,
+    pub servers: Arc<dyn ServerList>,
+    /// The credential an in-process connection runs under. Over TCP the
+    /// server maps the connector's token to a credential and this is unused.
     pub credential: String,
 }
 
-#[async_trait]
-impl Connector for InProcess {
-    async fn connect(&self) -> io::Result<(Arc<dyn Methods>, Inbox)> {
-        let (client, inbox) = ruvent::connect(&self.engine, &self.credential, INBOX).await.map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))?;
-        Ok((Arc::new(client), inbox))
+impl Upstream {
+    /// `servers`, reached through `connector`, under credential `proxy`.
+    pub fn new(connector: Arc<dyn Connector>, servers: impl ServerList) -> Upstream {
+        Upstream { connector, servers: Arc::new(servers), credential: "proxy".into() }
     }
-}
 
-/// An event server over the binary protocol.
-pub struct Remote {
-    pub address: String,
-    pub token: String,
-}
+    /// The servers of the configuration over TCP, with its token.
+    pub fn from_config(config: &ProxyConfig) -> Upstream {
+        Upstream::new(Arc::new(Tcp::new(config.upstream.token.clone())), Servers::new(&config.upstream.servers))
+    }
 
-#[async_trait]
-impl Connector for Remote {
-    async fn connect(&self) -> io::Result<(Arc<dyn Methods>, Inbox)> {
-        let (client, inbox) = ruvent_client::remote::connect(&self.address, &self.token, ruvent_client::remote::Options::default()).await?;
-        Ok((Arc::new(client), inbox))
+    /// The same, under another in-process credential.
+    pub fn credential(mut self, credential: impl Into<String>) -> Upstream {
+        self.credential = credential.into();
+        self
     }
 }
