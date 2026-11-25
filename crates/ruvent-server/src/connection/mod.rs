@@ -1,23 +1,44 @@
-//! One TCP connection to the event server.
+//! One TCP connection to the event server (2.2).
 //!
 //! ```text
-//! socket ─► reader: frames → calls → Session::call (waits only while the engine inbox is full)
-//! engine ─► send buffer (engine try_sends; full = disconnect) ─► writer: Outbound → frames → socket
+//! socket ─► read task: record head → body (memory, or the spool for a work
+//!           connection under pressure) → Call → Session::call
+//! engine ─► owner task: Outbound → unsent queue (Committed folded, faults
+//!           once, byte bound, stale assignments dropped) → records → vectored write ─► socket
 //! ```
 //!
-//! The engine never waits on this socket: it hands the writer's buffer what
-//! it has and moves on. When the engine disconnects the session (buffer full,
-//! shutdown) the writer ends and the socket is closed, which is the client's
-//! signal that it may have missed something.
+//! * [`handshake`]: the first record, version 1 recognised and refused.
+//! * [`read`]: the read task. A production connection stops reading only
+//!   while the engine says so (`Session::reading`, a connection that kept
+//!   writing to a paused root); a work connection never stops.
+//! * [`write`]: the owner. It holds the connection's unsent messages and is
+//!   the only one that encodes and writes.
+//! * [`close`]: every `Bye` is followed by a staged close under one deadline.
+//! * [`socket`]: TCP keepalive (S13).
+//!
+//! The engine never waits on this socket: it hands the owner what it has and
+//! moves on. The owner takes everything the engine hands it at once, so the
+//! engine's count-bounded buffer never fills; the owner bounds what it holds
+//! in bytes instead (S7).
+
+mod close;
+mod handshake;
+mod read;
+pub mod socket;
+mod unsent;
+mod write;
 
 use ruvent::Engine;
-use ruvent_protocol::{read_frame, write_frames, Decoder, Encoder, Message, Side, DICTIONARY, MAX_FRAME, VERSION};
+use ruvent_protocol::{features, DICTIONARY, DIRECT, INLINE, MAX_BODY};
+use socket::Keepalive;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 /// Service credentials by token.
 ///
@@ -43,112 +64,143 @@ impl Credentials {
     }
 }
 
+/// What every connection of one server is held to. Each value is a field
+/// with its default (plan chapter 8 is configuration, not constants).
 #[derive(Clone, Copy, Debug)]
 pub struct ServerOptions {
-    /// Bound on each direction's name dictionary.
+    /// S18: bound on each direction's name dictionary.
     pub dictionary: usize,
-    /// Bound on one frame, length field excluded.
-    pub max_frame: usize,
-    /// How long a new connection has to send its hello.
+    /// B13: the largest body one record may carry.
+    pub max_body: usize,
+    /// S11: a body below this many bytes is copied next to its head when sent.
+    pub inline: usize,
+    /// S11: a body of at least this many bytes is read straight into its own buffer.
+    pub direct: usize,
+    /// How long a new connection has to send its `Hello`.
     pub handshake: Duration,
+    /// S7: the unsent bytes an observation connection may hold (the dispatch
+    /// and notice bytes, for a work connection) before it is sent `Bye{slow}`.
+    pub unsent: u64,
+    /// S20: how long a staged close waits for the peer to close after `Bye`.
+    pub close: Duration,
+    /// S13: TCP keepalive on every socket.
+    pub keepalive: Keepalive,
+    /// Bytes gathered before one blocking write while a follow-up's body is
+    /// streamed to disk (2.6).
+    pub spool_piece: usize,
+    /// Messages encoded into one vectored write, at most.
+    pub batch: usize,
+    /// The feature bits `Welcome` announces.
+    pub features: u64,
 }
 
 impl Default for ServerOptions {
     fn default() -> Self {
-        ServerOptions { dictionary: DICTIONARY, max_frame: MAX_FRAME, handshake: Duration::from_secs(10) }
+        ServerOptions {
+            dictionary: DICTIONARY,
+            max_body: MAX_BODY,
+            inline: INLINE,
+            direct: DIRECT,
+            handshake: Duration::from_secs(10),
+            unsent: 256 << 20,
+            close: Duration::from_secs(5),
+            keepalive: Keepalive::default(),
+            spool_piece: 256 << 10,
+            batch: 1024,
+            features: features::ALL,
+        }
     }
 }
 
-/// Most messages packed in one pass of a writer.
-const PASS: usize = 1024;
-
-/// Accepts connections until the listener fails.
-pub async fn serve(listener: TcpListener, engine: Engine, credentials: Arc<Credentials>, options: ServerOptions) -> io::Result<()> {
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            // One client's failed connection attempt is not the listener's.
-            Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset) => continue,
-            Err(error) => return Err(error),
-        };
-        tokio::spawn(connection(stream, engine.clone(), credentials.clone(), options));
-    }
+/// What a connection hears about the server going down, and how it says it
+/// has handed its close to the engine.
+///
+/// | state | key | lifetime | bound | cleared by |
+/// | --- | --- | --- | --- | --- |
+/// | `stopping` | the server | serve ~ its end | 1 | `serve` (sets it once) |
+/// | `session` (a sender clone) | one connection | accepted ~ its engine session closed | open connections | the connection, right after `Session::close` |
+#[derive(Clone)]
+pub(crate) struct Lifeline {
+    pub(crate) stopping: watch::Receiver<bool>,
+    pub(crate) session: mpsc::Sender<()>,
 }
 
-async fn bye(write: &mut OwnedWriteHalf, encoder: &mut Encoder, reason: &str) {
-    if encoder.push(&Message::Bye { reason: reason.to_owned() }).is_ok() {
-        let _ = write_frames(write, &encoder.take()).await;
-    }
-}
-
-/// Serves one connection from hello to close.
-pub async fn connection(stream: TcpStream, engine: Engine, credentials: Arc<Credentials>, options: ServerOptions) {
-    let _ = stream.set_nodelay(true);
-    let (mut read, mut write) = stream.into_split();
-    let mut decoder = Decoder::new(Side::Server, options.dictionary, options.max_frame);
-    let mut encoder = Encoder::new(options.dictionary, options.max_frame);
-
-    // The hello's deadline: the one place a connection waits on the clock.
-    let hello = match tokio::time::timeout(options.handshake, read_frame(&mut read, options.max_frame)).await {
-        Ok(Ok(Some(frame))) => decoder.decode(frame).ok(),
-        _ => None,
-    };
-    let (version, token) = match hello.as_deref() {
-        Some([Message::Hello { version, token }]) => (*version, token.clone()),
-        _ => return bye(&mut write, &mut encoder, "expected a hello").await,
-    };
-    if version != VERSION {
-        return bye(&mut write, &mut encoder, &format!("unsupported protocol version {version}; this server speaks {VERSION}")).await;
-    }
-    let Some(credential) = credentials.credential(&token).map(str::to_owned) else {
-        return bye(&mut write, &mut encoder, "unknown token").await;
-    };
-    let Ok((session, mut outbound)) = engine.open(&credential).await else {
-        return bye(&mut write, &mut encoder, "the server is stopping").await;
-    };
-    if encoder.push(&Message::Welcome { version: VERSION, credential }).is_err() || write_frames(&mut write, &encoder.take()).await.is_err() {
-        return;
-    }
-
-    let mut writer = tokio::spawn(async move {
-        let mut batch = Vec::with_capacity(PASS);
-        loop {
-            if outbound.recv_many(&mut batch, PASS).await == 0 {
-                // The engine let go of this connection.
-                return;
-            }
-            for message in batch.drain(..) {
-                if encoder.push(&Message::Outbound(message)).is_err() {
-                    return;
+/// Accepts connections until `shutdown` resolves or the listener fails, then
+/// takes the server down in the order of 2.8 (B22) and shuts the engine down:
+///
+/// 1. stop accepting;
+/// 2. drain the engine: every production connection gets its final
+///    `Committed`, then `Bye{draining}` and a staged close; new production
+///    connections would be sent away;
+/// 3. every other connection is sent `Bye{draining}` after what it was
+///    already given; assignments it had not started writing go back to
+///    waiting, their failure count unchanged;
+/// 4. once every connection has handed its close to the engine,
+///    `Engine::shutdown`: the stopped ledger's checkpoint. Written
+///    assignments stay claimed across the restart (M8-6): a peer slow to
+///    close cannot make them run out meanwhile;
+/// 5. wait until every staged close finished (each bounded by the close deadline).
+///
+/// `Err`: the listener failed, or the engine had stopped on its own.
+pub async fn serve(listener: TcpListener, engine: Engine, credentials: Arc<Credentials>, options: ServerOptions, shutdown: impl Future<Output = ()>) -> io::Result<()> {
+    let (stop, stopping) = watch::channel(false);
+    let (held, mut released) = mpsc::channel::<()>(1);
+    let lifeline = Lifeline { stopping, session: held };
+    let mut connections = JoinSet::new();
+    let shutdown = std::pin::pin!(shutdown);
+    let mut shutdown = shutdown;
+    let outcome = loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(connection(stream, engine.clone(), credentials.clone(), options, lifeline.clone()));
                 }
-            }
-            if write_frames(&mut write, &encoder.take()).await.is_err() {
-                return;
-            }
+                // One client's failed connection attempt is not the listener's.
+                Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset) => {}
+                Err(error) => break Err(error),
+            },
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            () = &mut shutdown => break Ok(()),
         }
-    });
+    };
+    drop(listener);
+    drop(lifeline);
+    let _ = engine.drain().await;
+    let _ = stop.send(true);
+    // Every connection's sender goes once its session is closed.
+    let _ = released.recv().await;
+    let stopped = engine.shutdown().await;
+    while connections.join_next().await.is_some() {}
+    outcome?;
+    stopped.map_err(io::Error::other)
+}
 
-    let mut writer_done = false;
-    'reading: loop {
-        let frame = tokio::select! {
-            frame = read_frame(&mut read, decoder.max_frame()) => frame,
-            _ = &mut writer => {
-                writer_done = true;
-                break;
-            }
-        };
-        let Ok(Some(frame)) = frame else { break };
-        let Ok(messages) = decoder.decode(frame) else { break };
-        for message in messages {
-            let Message::Call { req, call } = message else { break 'reading };
-            if session.call(req, call).await.is_err() {
-                break 'reading;
-            }
+/// Serves one connection from `Hello` to close.
+async fn connection(stream: TcpStream, engine: Engine, credentials: Arc<Credentials>, options: ServerOptions, lifeline: Lifeline) {
+    // A socket the kernel cannot watch still serves; it only loses the early
+    // notice of a silent disconnection.
+    let _ = socket::tune(&stream, &options.keepalive);
+    let (read, write) = stream.into_split();
+    let mut reader = ruvent_protocol::RecordReader::with_limits(read, options.direct, options.max_body);
+    let mut decoder = ruvent_protocol::Decoder::new(ruvent_protocol::Side::Server, options.dictionary);
+    let encoder = ruvent_protocol::Encoder::new(options.dictionary).with_features(options.features).with_inline(options.inline).with_max_body(options.max_body);
+    let hello = match handshake::hello(&mut reader, &mut decoder, &credentials, options.handshake).await {
+        Ok(hello) => hello,
+        Err(refusal) => {
+            drop(lifeline);
+            return close::refuse(write, reader, encoder, refusal, options.close).await;
         }
-    }
-    drop(session);
-    if !writer_done {
-        writer.abort();
-        let _ = writer.await;
-    }
+    };
+    let role = hello.role;
+    let Ok((session, outbound)) = engine.open(hello).await else {
+        drop(lifeline);
+        return close::refuse(write, reader, encoder, handshake::Refusal::Bye(ruvent::ByeReason::Draining), options.close).await;
+    };
+    let session = Arc::new(session);
+    let (closing, closing_rx) = watch::channel(false);
+    let (ended, read_end) = tokio::sync::oneshot::channel();
+    let reading = read::Reading::new(reader, decoder, session.clone(), engine.clone(), role, closing_rx, options.spool_piece);
+    let read_task = tokio::spawn(read::run(reading, ended));
+    let owner = write::Owner::new(write, encoder, engine, role, session, closing, read_end, read_task, options, lifeline.session);
+    owner.run(outbound, lifeline.stopping).await;
 }

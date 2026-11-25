@@ -31,20 +31,46 @@ tokio::select! {
 cargo run --release -p ruvent-server -- crates/ruvent-server/server.example.json
 ```
 
-설정 필드는 [crates/ruvent-server/README.md](../crates/ruvent-server/README.md)에 있다. 자격마다 토큰,
-메서드, 채널 패턴, 위임 허용을 둔다. Ctrl-C로 정상 종료하고, 엔진이 멈추면 실패 코드로 끝난다.
+설정은 JSON 하나다. `listen`과 `credentials`만 필수이고, 나머지는 계획 8장의 값이 기본값으로 들어 있다.
+고칠 값만 적는다.
 
-## 원격 워커 서버
-
-```rust
-# async fn demo() -> std::io::Result<()> {
-let (client, inbox) = ruvent_client::remote::connect("127.0.0.1:7400", "workers-secret-change-me", Default::default()).await?;
-let running = ruvent_client::worker::App::new(client, inbox) /* .service(...) */ .start().await.expect("subscribed");
-running.wait().await.ok();
-# Ok(()) }
+```json
+{
+  "listen": "127.0.0.1:7400",
+  "journal": "data/journal",
+  "durability": "strict",
+  "credentials": [
+    { "name": "workers", "token": "…", "methods": ["register_claimable", "register_dispatch", "claim", "complete"], "channels": ["orders.*", "reply.*"] },
+    { "name": "ops", "token": "…", "methods": ["operate"] }
+  ],
+  "memory": { "limit": 8589934592 },
+  "storage": { "disk_capacity": 107374182400 },
+  "channels": { "rules": [ { "pattern": "jobs.*", "isolate_after": 3 } ] },
+  "connection": { "unsent": 268435456, "close_ms": 5000, "keepalive": { "idle_ms": 15000 } }
+}
 ```
 
-같은 `Service`를 인프로세스와 원격에 그대로 붙인다.
+| 절 | 담는 것 |
+| --- | --- |
+| `journal` | 세그먼트 로그 디렉터리. 없으면 휘발 서버 |
+| `credentials` | 자격마다 토큰, 메서드(`operate`는 `Stats`·`Drain`), 채널 패턴, 위임 허용 |
+| `engine`, `producers` | 누적 확인 N(S2), 재접속 유예(S20), 후속 상한(S10), 정지 뒤 허용량(S14), 생산자 순번표(B4, S15) |
+| `memory`, `storage` | 관리 메모리 상한과 수위(S5, S19, S22), 세그먼트·체크포인트·디스크 예산(S3, S4, S6) |
+| `channels` | 채널 패턴별 격리 문턱(B6), 만료 격리(B9), `max_backlog`(B17), `serialize_group`(B26), 휘발 |
+| `connection` | 사전 상한(S18), 본문 상한(B13), 작은 본문 문턱(S11), 관찰 연결 미송신 상한(S7), 닫기 기한(S20), keepalive(S13) |
+
+모든 키와 기본값은 [crates/ruvent-server/README.md](../crates/ruvent-server/README.md)에 있다.
+Ctrl-C로 정상 종료한다: drain(생산 연결에 최종 확인과 `Bye{draining}`) → 나머지 연결에 `Bye{draining}` →
+엔진 종료와 체크포인트. 엔진이 스스로 멈추면 실패 코드로 끝난다.
+
+## 원격 연결
+
+```rust,ignore
+let (client, inbox) = ruvent_client::remote::connect("127.0.0.1:7400", "workers-secret-change-me", ruvent::Hello::worker("ignored"), Default::default()).await?;
+```
+
+`Hello`가 역할(생산·작업·관찰)과 생산자 id, 인스턴스 nonce를 정한다. 돌려받는 `Client`는 인프로세스 연결과 같다.
+재접속·미확인 버퍼·서버 선택·워커 규칙은 SDK 계층(계획 2.9)의 몫이다.
 
 ## 프록시
 

@@ -100,7 +100,6 @@ cargo run --release -p ruvent --example bench   # 측정
 | 디스크 회계와 디스크 고수위(S6): 디스크 몫이 가장 큰 뿌리 정지 | `the_disk_watermark_pauses_the_root_with_the_biggest_disk_share` |
 | M8-4: 이주·삭제·콜드 읽기·체크포인트 훑기가 겹치고 훑는 도중에 죽어도 잃는 것이 없다 | `relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothing` |
 | 장부 정합성(속성): 한 이벤트는 한 자리, 줄·참여·회계·group 계수의 합이 맞다 | `random_operations_keep_the_ledgers_bookkeeping_consistent` |
-| 옛 클라이언트 경로(다른 크레이트. 그 크레이트의 에이전트가 새 계약으로 옮긴다) | `a_resent_completion_after_a_lost_reply_has_no_effect_and_no_follow_ups`, `after_a_server_restart_a_surviving_workers_old_completion_is_void` |
 
 ## 코어 단위 (`crates/ruvent/src/**/tests.rs`, `src/engine/state/tests/`)
 
@@ -138,24 +137,46 @@ cargo run --release -p ruvent --example bench   # 측정
 
 ## 프로토콜 (`crates/ruvent-protocol/src/tests.rs`)
 
+wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프레임 없음.
+
 | 영역 | 테스트 |
 | --- | --- |
-| 고정 바이트 | `a_hello_frame_has_these_exact_bytes`, `a_claim_call_has_these_exact_bytes`, `a_delivery_defines_its_names_first` |
-| 왕복 | `every_method_and_every_reply_round_trips`, `calls_round_trip_through_small_dictionaries` |
-| 거절 | `a_record_from_the_wrong_direction_refuses_the_frame`, `unknown_tags_leftover_bytes_and_forbidden_bodies_refuse_the_frame`, `arbitrary_bytes_never_panic_the_decoder` |
-| 프레임 상한 | `a_frame_over_the_bound_is_refused_on_both_ends`, `messages_are_split_across_frames_under_the_bound` |
-| 접속별 사전 | `after_a_reset_an_old_number_is_never_read_as_a_new_name`, `the_receiver_holds_the_same_bound` |
+| 고정 바이트 | `a_hello_record_has_these_exact_bytes`, `a_register_carries_its_payload_as_the_body_after_the_names_it_uses` |
+| 왕복(2.11의 모든 레코드, 속성 시험) | `every_call_and_every_server_message_round_trips`, `calls_round_trip_through_small_dictionaries`, `an_engine_welcome_is_sent_with_this_version_and_the_encoders_features` |
+| `Complete` 뒤 `FollowUp` 잇기 | `a_completion_is_handed_over_only_when_its_last_follow_up_arrived` |
+| `Assign`의 남은 lease(쓰기 시작 순간) | `an_assignment_carries_the_lease_left_at_the_moment_it_is_written` |
+| 거절 | `a_record_from_the_wrong_direction_or_out_of_place_is_refused`, `unknown_tags_leftover_bytes_bodies_on_bodiless_records_and_forbidden_heads_are_refused`, `arbitrary_bytes_never_panic_the_decoder` |
+| 거절된 메시지는 사전 정의도 남기지 않음 | `a_refused_message_leaves_no_name_definition_behind` |
+| 접속별 사전(S18) | `after_a_reset_an_old_number_is_never_read_as_a_new_name`, `the_receiver_holds_the_same_bound` |
+| 머리 먼저 읽기·본문 직접 수신·본문 상한(B13, S11) | `records_are_read_head_first_and_each_body_into_its_own_buffer`, `a_body_over_the_bound_is_refused_from_its_header` |
+| 벡터 쓰기: 큰 본문은 공유 항목, 작은 본문은 머리 버퍼(S11), 부분 쓰기 잇기 | `a_large_body_is_its_own_shared_vector_entry_and_a_small_one_is_inlined`, `a_partial_write_continues_where_it_stopped` |
+| v1 거절(B12) | `version_1_is_refused` |
 
 ## 서버 (`crates/ruvent-server/`)
 
+`tests/remote.rs`는 실제 TCP다. 클라이언트가 보내지 않을 것(재전송, 빈자리, 읽지 않는 소켓, v1)은 원시 wire v2 연결로 보낸다.
+
 | 영역 | 테스트 |
 | --- | --- |
-| 설정 | `the_example_configuration_parses_into_grants`, `bad_configurations_are_refused_with_a_reason` |
-| TCP 위의 메서드 | `all_seven_methods_work_over_tcp`, `local_and_remote_connections_see_the_same_results_in_the_same_order` |
-| 자격 | `a_wrong_token_is_refused_with_its_reason`, `a_credential_may_use_only_its_granted_methods_and_channels` |
+| 설정(8장 값 전부, 기본값) | `the_example_configuration_parses_into_grants_and_every_section`, `a_minimal_configuration_takes_every_default`, `bad_configurations_are_refused_with_a_reason` |
+| 미송신 대기열: 누적 확인 접기, `Fault` 첫 1회, 바이트 상한(S7), 미송신 `Assign` 반환 | `a_newer_committed_replaces_the_queued_one`, `a_fault_is_told_once_per_kind_on_one_connection`, `an_observer_past_its_byte_bound_is_slow_and_bytes_count_until_written`, `dropping_assignments_returns_their_tokens_and_keeps_the_rest_in_order` |
+| 역할별 흐름(2.2) | `each_role_does_its_own_work_over_tcp` |
+| 자격·권한(2.7) | `a_wrong_token_and_a_forbidden_channel_are_refused_with_their_reason` |
+| 재전송 무시, 누적 확인(2.3) | `a_retransmission_is_dropped_quietly`, `acknowledgements_are_cumulative_not_one_per_registration` |
+| 순번 빈자리 → `Fault` + `Bye{protocol}` | `a_sequence_gap_is_told_once_and_closes_the_connection` |
+| nonce 같음·다름(`superseded`, M8-7) | `the_same_nonce_reconnects_quietly_and_another_nonce_supersedes` |
+| 창 배정과 완료(2.4) | `a_window_takes_work_up_to_its_size_and_a_completion_frees_a_slot` |
+| 큰 본문 직접 수신 | `a_large_body_arrives_whole` |
+| 작업 연결 흘려 읽기(2.6 4·5번, B15) | `a_work_connection_streams_follow_up_bodies_to_disk_under_pressure` |
+| 관찰 연결 바이트 상한 → `Bye{slow}`(S7) | `an_observer_that_does_not_read_is_sent_bye_slow` |
+| drain 중 송신: 최종 확인을 놓친 연결 0(M8-5, B22) | `draining_while_producers_send_misses_no_final_acknowledgement` |
+| 착수 중 정상 재시작 뒤 같은 표지의 완료(M8-6, 원시 연결, 닫지 않는 피어 포함) | `a_claim_survives_a_graceful_restart_and_completes_under_its_token` |
+| 쓰지 못한 `Assign`은 즉시 대기로(M8-2) | `assignments_never_written_go_back_at_once_when_the_worker_goes` |
+| 단계로 닫기와 닫기 기한(2.2, S20) | `a_bye_is_read_whole_even_when_the_peer_had_sent_more_than_the_server_read`, `a_peer_that_never_closes_after_bye_is_closed_at_the_deadline` |
+| v1·다른 버전 거절(B12) | `version_1_and_other_versions_are_refused` |
+| keepalive(S13) | `a_tuned_socket_has_keepalive_and_no_delay` |
 | 대기분 이어받기 | `a_backlog_larger_than_one_page_is_read_to_the_end_by_subscribing_again` |
-| 원격 워커 단절·회수 | `a_claim_held_by_a_disconnected_remote_worker_is_reclaimed_by_the_next_registration` |
-| 서버 종료 | `when_the_server_goes_away_the_inbox_closes_and_calls_fail_closed` |
+| 서버가 연결을 놓을 때 | `when_the_server_goes_away_the_inbox_closes_and_calls_fail_closed` |
 
 ## 워커 프레임워크 (`crates/ruvent-client/tests/worker.rs`)
 

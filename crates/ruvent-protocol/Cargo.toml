@@ -1,6 +1,6 @@
 [package]
 name = "ruvent-protocol"
-description = "The event server's binary wire protocol: frames, per-connection name dictionaries, the seven methods as records."
+description = "The event server's binary wire protocol, version 2: records read head first, per-connection name dictionaries, vectored writes."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

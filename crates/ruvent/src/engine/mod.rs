@@ -73,6 +73,7 @@ pub(crate) enum Op {
     Open { session: SessionId, hello: Hello, out: mpsc::Sender<Outbound>, reading: watch::Sender<bool> },
     Close { session: SessionId, unwritten: Vec<ClaimToken> },
     Call { session: SessionId, call: Call },
+    Drain,
     Shutdown { done: oneshot::Sender<()> },
 }
 
@@ -288,6 +289,14 @@ impl Engine {
         let (reading, watching) = watch::channel(true);
         self.ops.send(Op::Open { session, hello, out, reading }).await.map_err(|_| Closed)?;
         Ok((Session { id: session, ops: self.ops.clone(), reading: watching, closed: false }, rx))
+    }
+
+    /// Starts draining without an operator connection: what `Call::Drain`
+    /// does, asked by the process that owns the engine (a server shutting
+    /// down, 2.8). New production connections are sent away; every open one
+    /// gets its final `Committed`, then `Bye{draining}`.
+    pub async fn drain(&self) -> Result<(), Closed> {
+        self.ops.send(Op::Drain).await.map_err(|_| Closed)
     }
 
     /// Stops accepting calls, writes what is pending and a checkpoint of the
@@ -624,6 +633,7 @@ impl Core {
                     self.state.close(session, &unwritten);
                 }
                 Op::Call { session, call } => self.state.call(session, call),
+                Op::Drain => self.state.start_drain(),
                 Op::Shutdown { done } => self.shutdown.push(done),
             }
         }

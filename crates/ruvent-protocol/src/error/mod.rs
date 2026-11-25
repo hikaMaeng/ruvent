@@ -1,26 +1,29 @@
-//! Why a frame was refused.
+//! Why a record was refused.
 
 use ruvent::envelope::codec::Malformed;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
-    /// The envelope body or a field was malformed (see the codec).
+    /// The event head or a field was malformed (see the codec).
     Malformed(Malformed),
     /// A record tag this version does not know.
     UnknownTag(u8),
-    /// A known record that may not travel in this direction.
+    /// A known record that may not travel in this direction, or not here
+    /// (a `FollowUp` outside a completion, a `Hello` after the first record).
     WrongDirection(u8),
     /// The peer speaks another protocol version.
-    Version(u16),
-    /// A frame longer than the agreed bound.
-    FrameTooLarge(usize),
+    Version(u32),
+    /// A body longer than the agreed bound, or a head longer than `u16`.
+    TooLarge(usize),
+    /// A body on a record that carries none.
+    UnexpectedBody(u8),
     /// A dictionary rule was broken: over its bound, or a number redefined without a reset.
     Dictionary(&'static str),
     /// A text field was not UTF-8.
     Utf8,
-    /// A refusal code this version does not know.
-    UnknownRefusal(u8),
+    /// A code byte this version does not know.
+    UnknownCode(u8),
     /// The handshake did not go as the protocol says.
     Handshake(String),
 }
@@ -30,12 +33,13 @@ impl fmt::Display for ProtocolError {
         match self {
             ProtocolError::Malformed(error) => write!(f, "malformed record: {error}"),
             ProtocolError::UnknownTag(tag) => write!(f, "unknown record tag {tag:#04x}"),
-            ProtocolError::WrongDirection(tag) => write!(f, "record tag {tag:#04x} may not travel in this direction"),
+            ProtocolError::WrongDirection(tag) => write!(f, "record tag {tag:#04x} may not travel here"),
             ProtocolError::Version(version) => write!(f, "unsupported protocol version {version}"),
-            ProtocolError::FrameTooLarge(length) => write!(f, "frame of {length} bytes exceeds the bound"),
+            ProtocolError::TooLarge(length) => write!(f, "{length} bytes exceed the bound"),
+            ProtocolError::UnexpectedBody(tag) => write!(f, "record tag {tag:#04x} carries no body"),
             ProtocolError::Dictionary(rule) => write!(f, "name dictionary: {rule}"),
             ProtocolError::Utf8 => f.write_str("text field is not UTF-8"),
-            ProtocolError::UnknownRefusal(code) => write!(f, "unknown refusal code {code}"),
+            ProtocolError::UnknownCode(code) => write!(f, "unknown code {code}"),
             ProtocolError::Handshake(reason) => write!(f, "handshake: {reason}"),
         }
     }

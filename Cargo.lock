@@ -766,6 +766,7 @@ dependencies = [
  "parking_lot",
  "ruvent",
  "ruvent-protocol",
+ "socket2",
  "tokio",
 ]
 
@@ -801,11 +802,13 @@ dependencies = [
 name = "ruvent-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "ruvent",
  "ruvent-client",
  "ruvent-protocol",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
 ]
 

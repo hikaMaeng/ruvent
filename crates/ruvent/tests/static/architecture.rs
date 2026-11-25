@@ -191,20 +191,31 @@ fn workspace_library() -> Vec<Source> {
 /// | `ruvent/snapshot/mod.rs` `time::timeout(` | a snapshot unit's age limit |
 /// | `ruvent/engine/mod.rs` `time::sleep(` | the timing wheel: one one-shot sleep to the earliest lease end or visibility time, none when the wheel is empty (2.4) |
 /// | `ruvent-client/worker/lane.rs` `time::timeout(` | a handler's run limit: past it the run is abandoned (2.9; the lease is no longer the run limit) |
-/// | `ruvent-server/connection/mod.rs` `time::timeout(` | how long a new connection has to say hello |
+/// | `ruvent-server/connection/handshake.rs` `time::timeout(` | how long a new connection has to say hello |
+/// | `ruvent-server/connection/close.rs` `time::timeout(` | the deadline of a staged close after `Bye` (2.2, S20) |
 /// | `ruvent-proxy/hub/mod.rs` `time::timeout(` | how long an authentication worker has to answer |
 /// | `ruvent-proxy/hub/task.rs` `time::sleep(` | back-off before reconnecting to the upstream server |
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
     ("ruvent/engine/mod.rs", "time::sleep(", 1),
     ("ruvent-client/worker/lane.rs", "time::timeout(", 1),
-    ("ruvent-server/connection/mod.rs", "time::timeout(", 1),
+    ("ruvent-server/connection/handshake.rs", "time::timeout(", 1),
+    ("ruvent-server/connection/close.rs", "time::timeout(", 1),
     ("ruvent-proxy/hub/mod.rs", "time::timeout(", 1),
     ("ruvent-proxy/hub/task.rs", "time::sleep(", 1),
 ];
 
-/// Ways of finding out by asking again. None may appear in a library.
+/// Ways of finding out by asking again. None may appear in a library, except
+/// where [`NOT_POLLING`] declares it.
 const POLLING: &[&str] = &["interval(", "interval_at(", "thread::sleep", "yield_now", "spin_loop", "try_recv(", "sleep_until(", "timeout_at(", "MissedTickBehavior"];
+
+/// Places a polling word appears without polling, by (file, word, count).
+///
+/// | where | what it is |
+/// | --- | --- |
+/// | `ruvent-server/connection/socket.rs` `interval(` | `socket2`'s `with_interval(`: the kernel's keepalive probe interval (2.2, S13), not an application timer |
+/// | `ruvent-client/remote/socket.rs` `interval(` | the same on the client's sockets |
+const NOT_POLLING: &[(&str, &str, usize)] = &[("ruvent-server/connection/socket.rs", "interval(", 1), ("ruvent-client/remote/socket.rs", "interval(", 1)];
 
 #[test]
 fn nothing_polls_and_every_timer_is_declared() {
@@ -212,8 +223,10 @@ fn nothing_polls_and_every_timer_is_declared() {
     let mut found: BTreeMap<(String, &str), usize> = BTreeMap::new();
     for source in workspace_library() {
         for needle in POLLING {
-            if source.count(needle) > 0 {
-                violations.push(format!("{} uses `{needle}`", source.path));
+            let count = source.count(needle);
+            let allowed = NOT_POLLING.iter().find(|(path, word, _)| *path == source.path && word == needle).map_or(0, |(_, _, count)| *count);
+            if count != allowed {
+                violations.push(format!("{} uses `{needle}` {count} times; declared {allowed}", source.path));
             }
         }
         for needle in ["time::sleep(", "time::timeout("] {
@@ -226,6 +239,12 @@ fn nothing_polls_and_every_timer_is_declared() {
             if source.code().contains(&format!("use tokio::{import}")) {
                 violations.push(format!("{} imports from tokio::time by name; write `tokio::time::…` at the call so it is counted", source.path));
             }
+        }
+    }
+    let sources = workspace_library();
+    for (path, word, _) in NOT_POLLING {
+        if !sources.iter().any(|source| source.path == *path) {
+            violations.push(format!("{path} is declared to use `{word}` but is gone; update the table"));
         }
     }
     let declared: BTreeMap<(String, &str), usize> = TIMERS.iter().map(|(path, needle, count)| (((*path).to_owned(), *needle), *count)).collect();

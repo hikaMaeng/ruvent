@@ -1,8 +1,8 @@
 # ruvent-server
 
-이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 이진 프로토콜(`ruvent-protocol`) TCP 수신부를 둔다.
-서버는 워커·프록시·클라이언트를 구분하지 않는다. 모든 접속은 첫 프레임에서 서비스 자격 토큰으로
-인증하고, 그 뒤로는 그 자격으로 일곱 메서드를 부른다. 자격이 할 수 있는 일은 엔진의 권한표(`grants`)가 정한다.
+이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v2(`ruvent-protocol`) TCP 수신부를 둔다.
+모든 접속은 `Hello`에서 서비스 자격 토큰과 역할(생산·작업·관찰, 계획 2.2)을 밝히고, 그 뒤로는 그 역할의
+호출만 그 자격으로 보낸다. 자격이 할 수 있는 일은 엔진의 권한표(`grants`)가 정한다.
 
 ## 실행
 
@@ -10,56 +10,88 @@
 cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 ```
 
-* Ctrl-C → 엔진 정상 종료(남은 저널 기록) → 종료 코드 0.
+* Ctrl-C → 정상 종료(아래 "내리는 순서") → 종료 코드 0.
 * 설정 오류 → 종료 코드 2.
 * 엔진이 스스로 멈춤(저널 쓰기 실패) 또는 수신부 실패 → 원인을 stderr에 쓰고 종료 코드 1.
 
 ## 설정 (JSON)
 
-[server.example.json](server.example.json):
-
-```json
-{
-  "listen": "127.0.0.1:7400",
-  "journal": "data/ruvent.journal",
-  "durability": "strict",
-  "credentials": [
-    { "name": "workers", "token": "…", "methods": ["register_claimable", "claim", "complete", "subscribe"], "channels": ["orders.*"] },
-    { "name": "proxy", "token": "…", "channels": ["chat.*"], "delegate": true }
-  ]
-}
-```
+[server.example.json](server.example.json). `listen`과 `credentials`만 필수이고, 나머지는 모두 엔진·서버의
+기본값(계획 8장)을 쓴다. 모르는 키는 거절한다.
 
 | 키 | 기본값 | 뜻 |
 | --- | --- | --- |
 | `listen` | (필수) | `host:port` |
-| `journal` | 없음 = 휘발 | 저널 파일. 상위 디렉터리는 만든다 |
-| `durability` | `"scheduled"` | `"strict"`: 착수용 등록·완료·삭제의 응답과 통지를 디스크 기록 뒤에 낸다 |
-| `credentials` | (필수, 1개 이상) | `name`, `token`, `methods`(생략 = 일곱 개 전부), `channels`(패턴, 생략 = `["*"]`), `delegate`(위임 신원 허용) |
-| `batch_max`, `inbox`, `outbound`, `backlog_page` | 엔진 기본값 | `outbound`는 접속별 송신 버퍼(메시지 수). 가득 차면 그 접속을 끊는다 |
-| `compaction` | `{50000, 4}` | `{ "min_records", "ratio" }` |
+| `journal` | 없음 = 휘발 | 세그먼트 로그 디렉터리. 단일 파일 저널(형식 2 이하)은 거부하고 그대로 둔다(B12) |
+| `durability` | `"scheduled"` | `"strict"`: 영속 채널 이벤트는 등록이 디스크에 닿기 전에 다른 연결에 보이지 않는다(2.7) |
+| `server_id` | 기동마다 새로 | `Welcome`의 서버 id(UUID 문자열) |
+| `credentials` | (필수, 1개 이상) | `name`, `token`, `methods`(생략 = 여덟 개 전부), `channels`(패턴, 생략 = `["*"]`), `delegate` |
+| `engine` | 엔진 기본값 | `batch_max`, `inbox`, `outbound`, `backlog_page`, `ack_every`(S2, 256), `reconnect_grace_ms`(S20, 3000), `max_follow_ups`(S10, 1024), `pause_allowance`(S14, 1 MiB), `stats_top`(B24, 16) |
+| `producers` | B4·S15 | `linger_ms`(1시간), `linger_max_ms`(7일), `max_entries`(100만), `entry_bytes`(64) |
+| `memory` | S5·S19·S22 | `limit`(바이트, 생략 = 물리 메모리의 절반), `reserve`(0.10), `high_watermark`(0.80), `release`(0.875), `early_pause`(0.125), `net_growth_window`(256), `slot_bytes`(180), `depth_target`(1억) |
+| `storage` | S3·S4·S6 | `segment_bytes`(64 MiB), `relocate_at`(0.10), `checkpoint_slice`(4096), `checkpoint_tail_multiple`(8), `checkpoint_tail_cap`(8 GiB), `disk_reserve_segments`(4), `disk_reserve`(0.10), `disk_capacity`(없음), `read_ahead`(16), `max_reads`(64), `checkpoint_queue`(2) |
+| `channels` | B6·B9·B17·B26 | `isolation_prefix`(`isolated.`), `default`(모든 채널의 기본), `rules`(`pattern` + 같은 키들. 먼저 맞는 규칙이 정한다) |
+| `connection` | 서버 기본값 | `dictionary`(S18, 4096), `max_body`(B13, 16 MiB), `inline`(S11, 256), `direct`(S11, 4096), `handshake_ms`(10000), `unsent`(S7, 256 MiB), `close_ms`(S20, 5000), `spool_piece`(256 KiB), `batch`(1024), `keepalive` |
+| `connection.keepalive` | S13 | `idle_ms`(15000), `interval_ms`(5000), `retries`(3), `user_timeout_ms`(30000, 리눅스만) |
 | `snapshot` | 없음 | `{ "directory", "channels", "types", "max_events", "max_age_ms", "buffer" }` 운영 스냅샷 |
-| `dictionary` | 4096 | 접속·방향별 이름 사전 상한 |
-| `max_frame` | 16 MiB | 프레임 상한(길이 필드 제외) |
-| `handshake_ms` | 10000 | 새 접속이 hello를 보내야 하는 기한 |
 
-메서드 이름: `register_claimable`, `register_dispatch`, `claim`, `complete`, `delete`, `subscribe`, `unsubscribe`.
-채널 패턴: 정확한 이름, `*`로 끝나는 접두사, 또는 `*`.
+채널 설정 키: `isolate_after`(격리 문턱, `0` = 격리 안 함, 기본 5), `isolated_keep_ms`(격리 보존, 7일),
+`isolate_expired`(만료를 지우지 않고 격리), `max_backlog`(`{ "count", "bytes" }`, 넘으면 그 뿌리 정지),
+`serialize_group`(같은 `group`을 한 번에 하나만 배정), `volatile`(저널에 쓰지 않음). 사용자 규칙 뒤에
+기본 규칙 둘이 붙는다: `reply.*`는 휘발이고 격리하지 않으며, `isolated.*`는 다시 격리하지 않는다.
+
+메서드 이름: `register_claimable`, `register_dispatch`, `claim`, `complete`, `delete`, `subscribe`, `unsubscribe`,
+`operate`(`Stats`, `Drain`). 채널 패턴: 정확한 이름, `*`로 끝나는 접두사, 또는 `*`.
 
 토큰은 설정 파일에 평문으로 있다. 파일 권한으로 보호하고 저장소에 커밋하지 않는다.
+
+## 연결
+
+| 역할 | 읽기 | 쓰기 |
+| --- | --- | --- |
+| 생산 | 엔진이 `Session::reading()`으로 멈추라 할 때만 레코드 경계에서 멈춘다(정지 통보 뒤 허용량 S14를 넘긴 연결) | 누적 `Committed`는 대기열에 하나만 둔다(새 것이 아직 쓰지 않은 것을 덮는다) |
+| 작업 | 멈추지 않는다. 메모리가 고수위면 후속 본문을 스풀로 디스크에 흘려 읽는다(2.6 4·5번) | `Assign`은 쓰기를 시작할 때 남은 lease를 싣는다. 그때 이미 lease가 지났으면 보내지 않는다(명시 착수의 답은 `Refused{missing}`). 발송·통지 바이트는 `unsent`(S7)로 묶는다 |
+| 관찰 | 들어오는 것은 작다 | 미송신 바이트가 `unsent`(S7)를 넘으면 `Bye{slow}` |
+
+* 수신: 레코드 머리를 먼저 읽고, 본문은 그 이벤트의 버퍼로 바로 받는다(`direct` 이상은 소켓에서 직접).
+  프레임 전체를 먼저 할당하지 않는다.
+* 송신: 연결별 머리와 공유 본문을 벡터 쓰기로 보낸다. `inline` 미만 본문만 머리 버퍼에 복사한다.
+* `Fault`는 (연결, 종류)마다 처음 한 번만 보낸다. 읽을 수 없는 레코드는 `Fault{malformed}` + `Bye{protocol}`.
+* 모든 `Bye` 뒤에는 단계로 닫는다: 남은 것을 쓰고 → 쓰기 쪽만 닫고 → 상대가 닫을 때까지 읽어 버리고 → 닫는다.
+  상대가 닫지 않으면 `close_ms`에 닫는다. 연결이 닫힐 때 쓰기를 끝내지 못한 `Assign`의 표지를 엔진에 넘겨
+  곧바로 대기로 되돌린다(실패 횟수 그대로).
+* 모든 소켓에 TCP keepalive를 건다. 리눅스는 `TCP_USER_TIMEOUT`도 건다. 앱 타이머는 없다.
+* v1 클라이언트의 hello는 첫 바이트로 알아보고 v1 형식의 `Bye`로 거절한다. 다른 v2 버전은 `Bye{version}`.
+
+## 내리는 순서 (`serve`, 계획 2.8, B22)
+
+1. 수신을 멈춘다.
+2. `Engine::drain`: 생산 연결마다 최종 `Committed` → `Bye{draining}` → 단계로 닫기. 새 생산 연결은 거절된다.
+3. 작업·관찰 연결에 `Bye{draining}`. 쓰기를 시작하지 않은 `Assign`은 대기로 돌아간다.
+4. 모든 연결이 엔진에 닫힘을 넘기면 곧바로 `Engine::shutdown`(멈춘 장부의 체크포인트). 다 쓴 `Assign`은
+   착수 상태로 재기동을 넘는다. 늦게 닫는 피어가 그사이 재접속 유예를 넘겨 착수를 회수시키지 못한다.
+5. 남은 단계로 닫기가 끝날 때까지(각각 `close_ms` 이내) 기다린다.
+
+운영자가 미리 비우려면 `operate` 권한의 관찰 연결로 `Drain`을 보낸다. `Stats`의 대기·착수가 0이면 잃는 것 없이
+내릴 수 있다.
 
 ## 구조
 
 | 경로 | 내용 |
 | --- | --- |
-| `src/config/` | JSON 설정 → `EngineConfig`·권한표·자격 목록 |
-| `src/connection/` | 접속 하나: 핸드셰이크, 읽기 태스크(프레임 → `Session::call`), 쓰기 태스크(`Outbound` → 프레임) |
-| `src/lib.rs` | `run`: 저널 복구, 엔진 시작, 수신, 종료·장애 전파 |
+| `src/config/` | JSON 설정 → `EngineConfig`·권한표·자격 목록·`ServerOptions` |
+| `src/connection/mod.rs` | `serve`(수신과 내리는 순서), 접속 하나의 조립, `ServerOptions` |
+| `src/connection/handshake.rs` | 첫 레코드 `Hello`, v1 알아보기, 토큰 → 자격 |
+| `src/connection/read.rs` | 읽기 태스크: 머리 → 본문(메모리 또는 스풀) → `Session::call` |
+| `src/connection/write.rs` | 소유자: 엔진의 `Outbound` → 미송신 대기열 → 벡터 쓰기, 연결 끝의 처리 |
+| `src/connection/unsent/` | 미송신 대기열(순수 상태): 누적 확인 접기, `Fault` 첫 1회, 바이트 상한 |
+| `src/connection/close.rs` | 단계로 닫기와 닫기 기한, 핸드셰이크에서의 거절 |
+| `src/connection/socket.rs` | keepalive(`socket2`) |
+| `src/lib.rs` | `run`: 세그먼트 로그 복구, 엔진 시작, 수신, 종료·장애 전파 |
 | `src/main.rs` | 바이너리 |
-| `tests/remote.rs` | 실제 TCP 위의 서버와 `ruvent_client::remote` 클라이언트 |
+| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v2 연결 |
 
-엔진은 소켓을 기다리지 않는다. 쓰기 태스크의 송신 버퍼에 `try_send`로 넘기고 지나간다. 엔진이 접속을
-끊으면(버퍼 포화, 종료) 쓰기 태스크가 끝나고 소켓이 닫힌다. 클라이언트에게는 연결 종료가 손실 신호다.
+타이머는 둘이다: hello 기한(`handshake.rs`)과 닫기 기한(`close.rs`). 정적 시험의 `TIMERS`에 선언돼 있다.
 
 ## 테스트
 
@@ -67,15 +99,4 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 cargo test -p ruvent-server
 ```
 
-| 테스트 | 판정 |
-| --- | --- |
-| `all_seven_methods_work_over_tcp` | 일곱 메서드가 TCP로 동작하고 효과가 맞는 접속에 닿는다 |
-| `a_wrong_token_is_refused_with_its_reason` | 모르는 토큰은 서버 사유와 함께 거절 |
-| `a_credential_may_use_only_its_granted_methods_and_channels` | 자격별 메서드·채널 권한, 위임 |
-| `a_backlog_larger_than_one_page_is_read_to_the_end_by_subscribing_again` | 한 응답보다 큰 대기분을 구독 재호출로 끝까지 |
-| `local_and_remote_connections_see_the_same_results_in_the_same_order` | 같은 입력에 로컬·원격의 응답·전달·순서가 같다 |
-| `a_claim_held_by_a_disconnected_remote_worker_is_reclaimed_by_the_next_registration` | 끊긴 원격 워커의 착수가 다음 등록으로 회수되어 다른 워커가 새 id로 처리 |
-| `a_resent_completion_after_a_lost_reply_has_no_effect_and_no_follow_ups` | 응답 유실 뒤 재전송은 무효, 후속 0건 |
-| `after_a_server_restart_a_surviving_workers_old_completion_is_void` | 서버 재기동 뒤 살아 있던 워커의 옛 완료는 무효 |
-| `when_the_server_goes_away_the_inbox_closes_and_calls_fail_closed` | 서버가 접속을 놓으면 받은 편지함이 닫히고 이후 호출은 매달리지 않고 `Closed` |
-| `the_example_configuration_parses_into_grants`, `bad_configurations_are_refused_with_a_reason` | 설정 해석과 거절 사유 |
+시험 지도는 [docs/testing.md](../../docs/testing.md)의 "서버" 절이다.

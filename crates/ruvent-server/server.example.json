@@ -1,25 +1,43 @@
 {
   "listen": "127.0.0.1:7400",
-  "journal": "data/ruvent.journal",
+  "journal": "data/journal",
   "durability": "strict",
   "credentials": [
     {
       "name": "workers",
       "token": "workers-secret-change-me",
       "methods": ["register_claimable", "register_dispatch", "claim", "complete", "subscribe", "unsubscribe"],
-      "channels": ["orders.*", "jobs.*"]
+      "channels": ["orders.*", "jobs.*", "reply.*"]
     },
     {
       "name": "proxy",
       "token": "proxy-secret-change-me",
-      "methods": ["register_claimable", "register_dispatch", "delete", "subscribe", "unsubscribe"],
-      "channels": ["chat.*", "orders.*", "proxy.*"],
+      "methods": ["register_claimable", "register_dispatch", "delete", "claim", "complete", "subscribe", "unsubscribe"],
+      "channels": ["chat.*", "orders.*", "proxy.*", "reply.*"],
       "delegate": true
+    },
+    {
+      "name": "ops",
+      "token": "ops-secret-change-me",
+      "methods": ["operate"]
     }
   ],
-  "backlog_page": 1024,
-  "outbound": 65536,
-  "compaction": { "min_records": 50000, "ratio": 4 },
+  "engine": { "backlog_page": 1024, "ack_every": 256, "reconnect_grace_ms": 3000 },
+  "producers": { "linger_ms": 3600000, "max_entries": 1000000 },
+  "memory": { "limit": 8589934592, "high_watermark": 0.8 },
+  "storage": { "segment_bytes": 67108864, "disk_capacity": 107374182400 },
+  "channels": {
+    "default": { "isolate_after": 5 },
+    "rules": [
+      { "pattern": "jobs.*", "isolate_after": 3, "serialize_group": true },
+      { "pattern": "proxy.*", "volatile": true }
+    ]
+  },
+  "connection": {
+    "unsent": 268435456,
+    "close_ms": 5000,
+    "keepalive": { "idle_ms": 15000, "interval_ms": 5000, "retries": 3, "user_timeout_ms": 30000 }
+  },
   "snapshot": {
     "directory": "data/snapshots",
     "channels": ["orders.*"],

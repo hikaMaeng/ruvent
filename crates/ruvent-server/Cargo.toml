@@ -14,6 +14,8 @@ ruvent-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+socket2.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 ruvent-client.workspace = true

@@ -153,8 +153,15 @@ impl State {
         if !self.operator(credential) {
             return self.send(session, Outbound::Refused { req, reason: Refusal::Forbidden }, None);
         }
-        self.draining = true;
         self.send(session, Outbound::Draining { req }, None);
+        self.start_drain();
+    }
+
+    /// Draining asked for by the process that owns the engine (a server
+    /// shutting down without a `Drain`, 2.8 step 5 "drain 없이 종료 신호를
+    /// 받아도 2번과 5번은 한다"): the same as `Drain`, with nobody to answer.
+    pub fn start_drain(&mut self) {
+        self.draining = true;
         let producing: Vec<(SessionId, Option<crate::envelope::ProducerId>, bool)> =
             self.sessions.iter().filter(|(_, open)| open.role == Role::Produce).map(|(id, open)| (*id, open.producer, open.acks)).collect();
         for (target, producer, acks) in producing {

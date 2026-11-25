@@ -2,8 +2,10 @@
 
 이벤트 서버에 붙는 쪽이다. 두 부분으로 나뉜다.
 
-* `remote` — 소켓 연결. `remote::connect(주소, 토큰, Options)`가 인프로세스 연결과 같은 `ruvent::Client`와
-  `Inbox`를 돌려준다. 메서드 구현은 코어의 `Client` 하나뿐이고, 여기는 링크(쓰기·읽기 태스크)만 붙인다.
+* `remote` — 소켓 연결(wire v2). `remote::connect(주소, 토큰, Hello, Options)`가 인프로세스 연결과 같은
+  `ruvent::Client`와 `Inbox`를 돌려준다. `remote::open`은 `Welcome`과 서버 기능 비트도 준다. `Hello`를 `Bye`로
+  거절당하면 오류 안의 `remote::Refused(ByeReason)`로 사유를 알 수 있다. 모든 소켓에 keepalive(S13)를 건다.
+  메서드 구현은 코어의 `Client` 하나뿐이고, 여기는 링크(쓰기·읽기 태스크)만 붙인다.
 * `worker` — 워커 프레임워크. `ruvent::Methods`만 보므로 같은 서비스를 내장 엔진에도, 원격 서버에도 붙인다.
 
 ## 워커 프레임워크

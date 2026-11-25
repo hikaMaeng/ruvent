@@ -192,6 +192,44 @@ pub fn size(envelope: &Envelope, layout: Layout) -> usize {
 /// Appends `envelope` in `layout`. `number` gives the dictionary number of a
 /// name; the caller has defined every name of [`Envelope::names`] beforehand.
 pub fn encode(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Name) -> u32, out: &mut impl BufMut) -> Result<(), Malformed> {
+    encode_parts(envelope, layout, number, out, true)
+}
+
+/// [`encode`] without the payload block: what a record that carries the
+/// payload apart writes as its head (wire v2: the payload is the record's
+/// body, so it is never copied into the head). Same checks as [`encode`].
+pub fn encode_head(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Name) -> u32, out: &mut impl BufMut) -> Result<(), Malformed> {
+    encode_parts(envelope, layout, number, out, false)
+}
+
+/// The encoded size of [`encode_head`]'s output.
+pub fn head_size(envelope: &Envelope, layout: Layout) -> usize {
+    let whole = size(envelope, layout);
+    if layout.has_payload() {
+        whole - 4 - envelope.payload.len()
+    } else {
+        whole
+    }
+}
+
+/// Whether [`encode`] (and [`encode_head`]) would accept `envelope` in
+/// `layout`, without writing anything. An encoder that writes name
+/// definitions before the record checks first, so a refused record leaves
+/// nothing half-written behind.
+pub fn validate(envelope: &Envelope, layout: Layout) -> Result<(), Malformed> {
+    let flags = envelope.flags() & layout.written();
+    let failures = if layout.has_failures() { envelope.failures } else { 0 };
+    layout.check(flags, failures)?;
+    if layout.has_payload() && envelope.payload.len() > u32::MAX as usize {
+        return Err(Malformed::Forbidden("payload over 4 GiB"));
+    }
+    if layout.has_key() && envelope.key.is_none() {
+        return Err(Malformed::Missing("work key"));
+    }
+    Ok(())
+}
+
+fn encode_parts(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Name) -> u32, out: &mut impl BufMut, payload: bool) -> Result<(), Malformed> {
     let flags = envelope.flags() & layout.written();
     let failures = if layout.has_failures() { envelope.failures } else { 0 };
     layout.check(flags, failures)?;
@@ -229,7 +267,7 @@ pub fn encode(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Name)
     if flags & GROUP != 0 {
         out.put_slice(&envelope.group.unwrap_or_default());
     }
-    if layout.has_payload() {
+    if payload && layout.has_payload() {
         out.put_u32_le(envelope.payload.len() as u32);
         out.put_slice(&envelope.payload);
     }
@@ -322,6 +360,16 @@ impl<'a> Reader<'a> {
 
 /// Reads one envelope in `layout`. `name` resolves a dictionary number.
 pub fn decode(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Option<Name>) -> Result<Envelope, Malformed> {
+    decode_parts(reader, layout, name, true)
+}
+
+/// Reads what [`encode_head`] wrote. The payload is empty; the caller puts
+/// the record's body there.
+pub fn decode_head(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Option<Name>) -> Result<Envelope, Malformed> {
+    decode_parts(reader, layout, name, false)
+}
+
+fn decode_parts(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Option<Name>, with_payload: bool) -> Result<Envelope, Malformed> {
     let lookup = |number: u32| name(number).ok_or(Malformed::UnknownName(number));
     let id = reader.id()?;
     let channel = lookup(reader.u32()?)?;
@@ -337,7 +385,7 @@ pub fn decode(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Opt
     let not_before = if flags & NOT_BEFORE != 0 { Some(reader.varint()?) } else { None };
     let expires = if flags & EXPIRES != 0 { Some(reader.varint()?) } else { None };
     let group = if flags & GROUP != 0 { Some(reader.bytes16()?) } else { None };
-    let payload = if layout.has_payload() {
+    let payload = if with_payload && layout.has_payload() {
         let length = reader.u32()? as usize;
         reader.take_shared(length)?
     } else {
