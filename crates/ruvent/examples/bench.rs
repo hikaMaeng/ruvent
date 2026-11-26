@@ -39,7 +39,7 @@ async fn lifecycles(engine: &Engine, total: usize) -> (usize, Duration) {
             for _ in 0..share {
                 let (_, id) = producer.register_committed(Envelope::claimable(channel, 1, Bytes::from_static(&[0; 16]))).await.expect("register");
                 let claimed = worker.claim(id, Duration::from_secs(60)).await.expect("claim");
-                let seq = worker.complete(id, claimed.token, Vec::new()).await.expect("complete");
+                let seq = worker.complete(id, claimed.token(), Vec::new()).await.expect("complete");
                 if worker.committed(seq).await.is_ok() {
                     done += 1;
                 }
@@ -60,7 +60,7 @@ fn encode_cost(event: &Envelope, layout: Layout) -> (usize, f64) {
     let started = Instant::now();
     for _ in 0..rounds {
         out.clear();
-        codec::encode(event, layout, &mut |_| 1, &mut out).expect("encodes");
+        codec::encode(event, layout, &mut out).expect("encodes");
     }
     (out.len(), started.elapsed().as_nanos() as f64 / f64::from(rounds))
 }
@@ -89,7 +89,8 @@ async fn main() {
     let payload = Bytes::from_static(&[0; 16]);
     let dispatch = Envelope::dispatch(Channel::new(), 30, payload.clone()).with_id(EventId::new_v7());
     let waiting = Envelope { key: Some(key), ..Envelope::claimable(Channel::new(), 1, payload.clone()).with_id(EventId::new_v7()) };
-    let claimed = Envelope { failures: 1, ..waiting.clone() };
+    let mark = ruvent::ClaimMark { worker: [7; 16], token: ruvent::ClaimToken { generation: 1, seq: 1 }, lease_ms: 30_000 };
+    let claimed = Envelope { failures: 1, claim: Some(mark), ..waiting.clone() };
     for (label, event, layout) in
         [("dispatch/delivery", &dispatch, Layout::Delivery), ("waiting/journal", &waiting, Layout::Journal), ("assigned", &claimed, Layout::Assigned), ("notice", &waiting, Layout::Notice)]
     {

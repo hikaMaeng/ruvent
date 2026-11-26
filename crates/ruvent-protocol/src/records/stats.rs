@@ -6,7 +6,6 @@
 //! counters (15 varints, declaration order),
 //! type count, (type u16, waiting, oldest_ms)…,
 //! idle lane count, (channel 16, type u16, waiting)…,
-//! root count, (root type u16, events, bytes, disk, paused u8)…
 //! ```
 //!
 //! Each list is cut at [`LIST`] entries so the head stays within `u16`.
@@ -15,25 +14,20 @@ use super::fields::{boolean, put_bool, put_varint};
 use crate::error::ProtocolError;
 use bytes::BufMut;
 use ruvent::envelope::codec::Reader;
-use ruvent::{Channel, Counters, IdleLane, RootStat, Stats, TypeStat};
+use ruvent::{Channel, Counters, IdleLane, Stats, TypeStat};
 
 /// Most entries of each top-K list on the wire.
 pub(crate) const LIST: usize = 256;
 
-fn counters(counters: &Counters) -> [u64; 15] {
+fn counters(counters: &Counters) -> [u64; 10] {
     [
         counters.retransmits,
         counters.duplicates,
         counters.stale,
-        counters.expired,
-        counters.isolated,
         counters.reclaimed,
         counters.faults,
-        counters.over_limit,
-        counters.pauses,
         counters.released,
         counters.read_ahead,
-        counters.spilled_bytes,
         counters.relocated,
         counters.segments_removed,
         counters.checkpoints,
@@ -76,15 +70,6 @@ pub(crate) fn encode(stats: &Stats, out: &mut impl BufMut) {
         out.put_u16_le(lane.event_type);
         put_varint(out, lane.waiting);
     }
-    let roots = &stats.roots[..stats.roots.len().min(LIST)];
-    put_varint(out, roots.len() as u64);
-    for entry in roots {
-        out.put_u16_le(entry.root);
-        put_varint(out, entry.events);
-        put_varint(out, entry.bytes);
-        put_varint(out, entry.disk);
-        put_bool(out, entry.paused);
-    }
 }
 
 fn count(reader: &mut Reader<'_>) -> Result<usize, ProtocolError> {
@@ -101,27 +86,12 @@ pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Stats, ProtocolError> {
         *value = reader.varint()?;
     }
     let draining = boolean(reader)?;
-    let mut c = [0u64; 15];
+    let mut c = [0u64; 10];
     for value in &mut c {
         *value = reader.varint()?;
     }
-    let counters = Counters {
-        retransmits: c[0],
-        duplicates: c[1],
-        stale: c[2],
-        expired: c[3],
-        isolated: c[4],
-        reclaimed: c[5],
-        faults: c[6],
-        over_limit: c[7],
-        pauses: c[8],
-        released: c[9],
-        read_ahead: c[10],
-        spilled_bytes: c[11],
-        relocated: c[12],
-        segments_removed: c[13],
-        checkpoints: c[14],
-    };
+    let counters =
+        Counters { retransmits: c[0], duplicates: c[1], stale: c[2], reclaimed: c[3], faults: c[4], released: c[5], read_ahead: c[6], relocated: c[7], segments_removed: c[8], checkpoints: c[9] };
     let mut types = Vec::new();
     for _ in 0..count(reader)? {
         types.push(TypeStat { event_type: reader.u16()?, waiting: reader.varint()?, oldest_ms: reader.varint()? });
@@ -129,10 +99,6 @@ pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Stats, ProtocolError> {
     let mut idle_lanes = Vec::new();
     for _ in 0..count(reader)? {
         idle_lanes.push(IdleLane { channel: Channel(reader.bytes16()?), event_type: reader.u16()?, waiting: reader.varint()? });
-    }
-    let mut roots = Vec::new();
-    for _ in 0..count(reader)? {
-        roots.push(RootStat { root: reader.u16()?, events: reader.varint()?, bytes: reader.varint()?, disk: reader.varint()?, paused: boolean(reader)? });
     }
     let [waiting, delayed, claimed, oldest_ms, memory_used, memory_budget, memory_limit, depth_capacity, depth_target, disk_used, disk_budget, disk_limit, segments] = totals;
     Ok(Stats {
@@ -153,6 +119,5 @@ pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Stats, ProtocolError> {
         counters,
         types,
         idle_lanes,
-        roots,
     })
 }

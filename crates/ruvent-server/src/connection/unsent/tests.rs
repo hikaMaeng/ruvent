@@ -1,10 +1,11 @@
 use super::*;
-use ruvent::{Assignment, ByeReason, Bytes, ClaimToken, Envelope, WorkKey};
+use ruvent::{Assignment, ByeReason, Bytes, ClaimMark, ClaimToken, Envelope, WorkKey};
 
 fn assign(seq: u64) -> Outbound {
     let mut event = Envelope::claimable(ruvent::Channel::new(), 10, Bytes::from_static(b"p"));
     event.key = Some(WorkKey::default());
-    Outbound::Assign(Assignment { event, token: ClaimToken { generation: 1, seq }, lease_ms: 1000, until: 1000, more: false })
+    event.claim = Some(ClaimMark { worker: [9; 16], token: ClaimToken { generation: 1, seq }, lease_ms: 1000 });
+    Outbound::Assign(Assignment { event, until: 1000, more: false })
 }
 
 fn drain(unsent: &mut Unsent) -> Vec<Outbound> {
@@ -24,9 +25,9 @@ fn a_newer_committed_replaces_the_queued_one() {
     for seq in [3, 7, 5, 9] {
         assert!(!unsent.accept(Outbound::Committed { seq }), "a production connection is never slow");
     }
-    unsent.accept(Outbound::Paused { event_type: 7 });
+    unsent.accept(Outbound::Fault { kind: FaultKind::Malformed, detail: "x" });
     unsent.accept(Outbound::Committed { seq: 12 });
-    assert_eq!(drain(&mut unsent), [Outbound::Committed { seq: 12 }, Outbound::Paused { event_type: 7 }]);
+    assert_eq!(drain(&mut unsent), [Outbound::Committed { seq: 12 }, Outbound::Fault { kind: FaultKind::Malformed, detail: "x" }]);
     // Once written, the next one is queued anew.
     unsent.accept(Outbound::Committed { seq: 13 });
     assert_eq!(drain(&mut unsent), [Outbound::Committed { seq: 13 }]);

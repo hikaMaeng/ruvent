@@ -1,17 +1,16 @@
 //! Random operation sequences keep the ledger's bookkeeping consistent.
 //!
 //! The invariants are what every other rule relies on: an event is in exactly
-//! one place; a lane holds exactly the waiting events of its (channel, type,
-//! isolated);
-//! a join's counts are the attempts that name it; the managed bytes and the
-//! root shares are the sum over the events; a group's count is its attempts.
+//! one place; a lane holds exactly the waiting events of its (channel, type);
+//! a join's counts are the attempts that name it; an attempt's worker is the
+//! worker that took it; the managed bytes are the sum over the events.
 
 use super::*;
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]
 enum Step {
-    Register(u8, bool),
+    Register(u8),
     Window(u8, u32),
     Complete(u8, bool),
     Release(u8, bool, u64),
@@ -24,7 +23,7 @@ enum Step {
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
-        (0..3u8, any::<bool>()).prop_map(|(channel, grouped)| Step::Register(channel, grouped)),
+        (0..3u8).prop_map(Step::Register),
         (0..2u8, 0..4u32).prop_map(|(worker, count)| Step::Window(worker, count)),
         (0..16u8, any::<bool>()).prop_map(|(at, follow)| Step::Complete(at, follow)),
         (0..16u8, any::<bool>(), 0..30u64).prop_map(|(at, failed, delay)| Step::Release(at, failed, delay)),
@@ -36,19 +35,18 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
-const CHANNELS: [&str; 3] = ["a", "b", "scratch.c"];
-/// The type registered on each of [`CHANNELS`]: type 2 serializes groups
-/// and isolates at two failures, [`VOLATILE`] is never journaled.
-const TYPES: [u16; 3] = [1, 2, VOLATILE];
-/// The `req` of every worker's isolated join (types 1 and 2, every channel).
-const ISOLATED: u32 = 10;
+const CHANNELS: [&str; 3] = ["a", "b", "c"];
+/// The type registered on each of [`CHANNELS`]; type 3 is taken by a type join only.
+const TYPES: [u16; 3] = [1, 2, 3];
+/// The `req` of every worker's type join (type 3, every channel).
+const TYPED: u32 = 10;
 
-/// Joins every channel (req 1, 2, 3) and the isolated events of types 1 and 2.
+/// Joins channels `a` and `b` (req 1, 2) and type 3 on every channel.
 fn join_all(h: &mut H, session: SessionId) {
-    for (at, channel) in CHANNELS.iter().enumerate() {
-        h.call(session, Call::Join { req: at as u32 + 1, channel: Some(ch(channel)), types: Vec::new(), isolated: false, lease_ms: 50, dispatch: false });
+    for (at, channel) in CHANNELS[..2].iter().enumerate() {
+        h.call(session, Call::Join { req: at as u32 + 1, channel: Some(ch(channel)), types: Vec::new(), lease_ms: 50, dispatch: false });
     }
-    h.call(session, Call::Join { req: ISOLATED, channel: None, types: vec![1, 2], isolated: true, lease_ms: 50, dispatch: false });
+    h.call(session, Call::Join { req: TYPED, channel: None, types: vec![3], lease_ms: 50, dispatch: false });
 }
 
 fn check(state: &State) -> Result<(), TestCaseError> {
@@ -63,67 +61,41 @@ fn check(state: &State) -> Result<(), TestCaseError> {
         }
         prop_assert!(!lane.is_idle(), "an idle lane is dropped");
     }
-    let mut in_holds = 0usize;
-    for held in state.holds.values() {
-        for index in held.values() {
-            prop_assert!(matches!(state.slots.get(*index).expect("held slot").place, Place::Held));
-            in_holds += 1;
-        }
-    }
     let mut waiting = 0usize;
-    let mut held = 0usize;
     let mut bytes = 0u64;
-    let mut roots: HashMap<u16, (u64, u64, u64)> = HashMap::new();
     let mut joins: HashMap<JoinId, (u32, u64)> = HashMap::new();
-    let mut groups: HashMap<(Channel, GroupId), u32> = HashMap::new();
     for (index, slot) in state.slots.iter() {
-        let usage = state.usage(slot);
-        bytes += usage.memory;
-        let root = roots.entry(slot.fixed.root).or_default();
-        root.0 += 1;
-        root.1 += usage.share;
-        root.2 += usage.disk;
+        bytes += state.usage(slot).memory;
         match &slot.place {
             Place::Waiting => waiting += 1,
-            Place::Held => held += 1,
             Place::Delayed { .. } => {}
             Place::Claimed(attempt) => {
+                prop_assert!(attempt.worker == [2; 16] || attempt.worker == [3; 16], "an attempt names the worker that took it");
                 if let Some(join) = &attempt.join {
                     let entry = joins.entry(*join).or_default();
                     entry.0 += 1;
                     entry.1 += slot.len();
                     prop_assert!(state.joins.get(join).is_some_and(|found| found.attempts.contains(&index)));
+                    prop_assert_eq!(state.worker_of(join.0), Some(attempt.worker), "an attempt counts against a join of its own worker");
                 }
-                if let Some(group) = slot.fixed.group {
-                    if state.config.types.settings(slot.fixed.event_type).serialize_group {
-                        *groups.entry((slot.channel, group)).or_default() += 1;
-                    }
-                }
+                prop_assert_eq!(slot.envelope().claim.map(|claim| claim.worker), Some(attempt.worker), "the claim mark is the attempt's");
             }
         }
         prop_assert_eq!(state.slots.by_id(&slot.fixed.id), Some(index));
     }
     prop_assert_eq!(waiting, in_lanes, "every waiting event is in its lane");
-    prop_assert_eq!(held, in_holds);
     prop_assert_eq!(bytes, state.slot_bytes, "managed bytes are the sum over the events");
-    for (name, root) in &state.roots {
-        let (events, root_bytes, disk) = roots.get(name).copied().unwrap_or_default();
-        prop_assert_eq!((root.events, root.bytes, root.disk), (events, root_bytes, disk), "root {}", name);
-    }
-    prop_assert_eq!(roots.len(), state.roots.values().filter(|root| root.events > 0).count());
     for (id, join) in &state.joins {
         prop_assert_eq!((join.claimed, join.claimed_bytes), joins.get(id).copied().unwrap_or_default(), "join {:?}", id);
         prop_assert_eq!(join.claimed as usize, join.attempts.len());
     }
-    prop_assert_eq!(&groups, &state.groups);
     Ok(())
 }
 
 proptest! {
     #[test]
     fn random_operations_keep_the_ledgers_bookkeeping_consistent(steps in proptest::collection::vec(step(), 1..120), strict in any::<bool>()) {
-        let mut config = if strict { super::strict() } else { super::config() };
-        config.types.rules.insert(0, rule([2], TypeSettings { serialize_group: true, isolate_after: Some(2), ..TypeSettings::default() }));
+        let config = if strict { super::strict() } else { super::config() };
         let mut h = H::with(config, true).cast();
         let workers = [W1, W2];
         for worker in workers {
@@ -133,16 +105,13 @@ proptest! {
         for step in steps {
             let attempt = |h: &H, at: u8| ids.get(at as usize).and_then(|id| h.slot(*id).and_then(|slot| slot.attempt().map(|attempt| (*id, attempt.token, attempt.join))));
             match step {
-                Step::Register(channel, grouped) => {
-                    let mut event = Envelope::claimable(ch(CHANNELS[channel as usize]), TYPES[channel as usize], Bytes::from_static(b"p")).with_id(EventId::new_v7());
-                    if grouped {
-                        event = event.with_group([channel; 16]);
-                    }
+                Step::Register(channel) => {
+                    let event = Envelope::claimable(ch(CHANNELS[channel as usize]), TYPES[channel as usize], Bytes::from_static(b"p")).with_id(EventId::new_v7());
                     ids.push(event.id);
                     h.produce(P, event);
                 }
                 Step::Window(worker, count) => {
-                    for join in [1, 2, 3, ISOLATED] {
+                    for join in [1, 2, TYPED] {
                         h.call(workers[worker as usize], Call::Window { join, count, bytes: 0 });
                     }
                 }

@@ -4,21 +4,19 @@ use super::lanes::LaneKey;
 use super::slots::Index;
 use super::State;
 use crate::engine::config::Method;
-use crate::engine::ops::{ByeReason, IdleLane, Outbound, Refusal, Role, RootStat, SessionId, Stats, TypeStat};
+use crate::engine::ops::{ByeReason, IdleLane, Outbound, Refusal, Role, SessionId, Stats, TypeStat};
 use crate::envelope::{Channel, Envelope, WorkKey};
 use crate::names::Name;
 use std::collections::HashMap;
 
 impl State {
-    /// `Subscribe`: from now on, the channel's notices and dispatch events
-    /// of the credential's types; and one page of what waits there, in
-    /// work-key order, after `after`. The grant asked is the method; the
-    /// types decide what is handed over (plan 9.15).
+    /// `Subscribe`: from now on, the channel's notices and dispatch events;
+    /// and one page of what waits there, in work-key order, after `after`.
     pub(super) fn subscribe(&mut self, session: SessionId, credential: &Name, req: u32, channel: Channel, after: Option<WorkKey>) {
         if !channel.is_valid() {
             return self.send(session, Outbound::Refused { req, reason: Refusal::Malformed }, None);
         }
-        if !self.has_method(credential, Method::Subscribe) {
+        if !self.allowed(credential, Method::Subscribe) {
             return self.send(session, Outbound::Refused { req, reason: Refusal::Forbidden }, None);
         }
         if let Some(open) = self.sessions.get_mut(&session) {
@@ -26,25 +24,20 @@ impl State {
                 self.subscribers.add(channel, session);
             }
         }
-        let (backlog, more) = self.backlog(session, &channel, after);
+        let (backlog, more) = self.backlog(&channel, after);
         self.send(session, Outbound::Subscribed { req, channel, backlog, more }, None);
     }
 
-    /// Waiting events (in a lane or held) of the channel after `after`, of
-    /// the types the connection reads, one page. Under Strict, nothing whose
-    /// registration is not on disk (2.7).
-    fn backlog(&self, session: SessionId, channel: &Channel, after: Option<WorkKey>) -> (Vec<Envelope>, bool) {
+    /// Waiting events of the channel after `after`, one page. Under Strict,
+    /// nothing whose registration is not on disk (2.7).
+    fn backlog(&self, channel: &Channel, after: Option<WorkKey>) -> (Vec<Envelope>, bool) {
         let page = self.config.backlog_page.max(1);
         let start = match after {
             Some(after) => std::ops::Bound::Excluded(after),
             None => std::ops::Bound::Unbounded,
         };
-        let grant = self.sessions.get(&session).and_then(|open| open.grant.as_ref());
-        let wanted = |key: &LaneKey| key.0 == *channel && grant.is_none_or(|grant| grant.reads(key.1));
         let mut found: Vec<(WorkKey, Index)> = Vec::new();
-        let lanes = self.lanes.iter().filter(|(key, _)| wanted(key)).map(|(_, lane)| &lane.queue);
-        let holds = self.holds.iter().filter(|((_, key), _)| wanted(key)).map(|(_, held)| held);
-        for queue in lanes.chain(holds) {
+        for queue in self.lanes.iter().filter(|(key, _)| key.0 == *channel).map(|(_, lane)| &lane.queue) {
             let visible = queue.range((start, std::ops::Bound::Unbounded)).take(page + 1).take_while(|(_, index)| self.visible(**index));
             found.extend(visible.map(|(key, index)| (*key, *index)));
         }
@@ -59,12 +52,9 @@ impl State {
         self.slots.get(index).is_some_and(|slot| !(self.strict && slot.fixed.durable && slot.fixed.visible_from > self.durable))
     }
 
-    /// Whether the credential holds the operator grant. Types do not matter.
+    /// Whether the credential holds the operator grant.
     fn operator(&self, credential: &Name) -> bool {
-        match &self.config.grants {
-            None => true,
-            Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.methods.contains(&Method::Operate)),
-        }
+        self.allowed(credential, Method::Operate)
     }
 
     /// `Stats`: values copied when asked (2.8, B24).
@@ -93,9 +83,6 @@ impl State {
                 idle_lanes.push(IdleLane { channel: key.0, event_type: key.1, waiting: lane.queue.len() as u64 });
             }
         }
-        for ((_, key), held) in &self.holds {
-            add(key, held.len() as u64, held.values().next().map_or(0, age));
-        }
         let mut stats = Stats {
             memory_used: self.memory_used(),
             memory_budget: self.memory_budget(),
@@ -112,7 +99,7 @@ impl State {
         stats.depth_capacity = stats.memory_budget / self.config.memory.slot_bytes.max(1);
         for (_, slot) in self.slots.iter() {
             match slot.place {
-                super::slots::Place::Waiting | super::slots::Place::Held => {
+                super::slots::Place::Waiting => {
                     stats.waiting += 1;
                     stats.oldest_ms = stats.oldest_ms.max(self.now.saturating_sub(slot.fixed.registered_at));
                 }
@@ -125,13 +112,8 @@ impl State {
         types.truncate(top);
         idle_lanes.sort_by(|a, b| b.waiting.cmp(&a.waiting).then_with(|| (a.channel, a.event_type).cmp(&(b.channel, b.event_type))));
         idle_lanes.truncate(top);
-        let mut roots: Vec<RootStat> =
-            self.roots.iter().map(|(root, entry)| RootStat { root: *root, events: entry.events, bytes: entry.bytes, disk: entry.disk, paused: entry.paused.is_some() }).collect();
-        roots.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.root.cmp(&b.root)));
-        roots.truncate(top);
         stats.types = types;
         stats.idle_lanes = idle_lanes;
-        stats.roots = roots;
         stats
     }
 

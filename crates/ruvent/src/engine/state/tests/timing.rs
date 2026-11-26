@@ -15,41 +15,6 @@ fn not_before_hides_an_event_until_its_time_and_the_wheel_wakes_for_it() {
     assert_eq!(assigned(&h.advance(1), W1)[0].event.id, id(1));
 }
 
-/// Expired events are removed without any consumer, by batches that run
-/// anyway; the wheel does not wake for them (2.4, B9).
-#[test]
-fn an_expired_event_is_never_assigned_and_is_purged_without_any_consumer() {
-    let mut h = H::volatile().cast();
-    h.produce(P, work("nobody").with_id(id(1)).with_expires(Duration::from_millis(100)));
-    assert_eq!(h.s.next_due(), None, "no timer for an expiry");
-    h.now = 100;
-    h.produce(P, Envelope::dispatch(ch("elsewhere"), 10, Bytes::new()));
-    assert!(h.slot(id(1)).is_none(), "collected by an unrelated batch");
-    assert_eq!(h.s.counters.expired, 1);
-    // And one that expired before a join is not assigned to it.
-    h.produce(P, work("work").with_id(id(2)).with_expires(Duration::from_millis(10)));
-    h.now = 200;
-    let joined = h.join(W1, "work", 1);
-    assert!(assigned(&joined, W1).is_empty());
-    assert!(h.slot(id(2)).is_none());
-}
-
-#[test]
-fn an_expired_event_is_isolated_instead_where_its_type_says_so() {
-    let mut config = config();
-    config.types.rules.insert(0, rule([1], TypeSettings { isolate_expired: true, isolated_keep: Duration::from_secs(60), ..TypeSettings::default() }));
-    let mut h = H::with(config, false).cast();
-    h.produce(P, work("keep").with_id(id(1)).with_expires(Duration::from_millis(10)));
-    h.advance(10);
-    let slot = h.slot(id(1)).expect("isolated, not removed");
-    assert!(slot.isolated && slot.channel == ch("keep"));
-    assert_eq!((slot.expires, h.s.counters.expired, h.s.counters.isolated), (Some(60_010), 0, 1), "the keep time is its new expiry");
-    // Expiring again once isolated removes it.
-    h.advance(60_000);
-    assert!(h.slot(id(1)).is_none());
-    assert_eq!(h.s.counters.expired, 1);
-}
-
 /// Under Strict nothing uncommitted is assigned, noticed, backlogged or
 /// claimed by id; all of it becomes visible when the batch lands (2.7).
 #[test]

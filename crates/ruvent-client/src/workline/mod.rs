@@ -94,15 +94,14 @@ impl WorkLine {
         }
     }
 
-    /// Joins `channel` (`None`: every channel) for `types`, isolated events
-    /// or the others; the answer names `index`.
+    /// Joins `channel` (`None`: every channel) for `types`; the answer names `index`.
     pub(crate) async fn join(&mut self, index: usize, selection: crate::worker::Selection, lease: Duration, dispatch: bool) {
-        let crate::worker::Selection { channel, types, isolated } = selection;
+        let crate::worker::Selection { channel, types } = selection;
         let req = self.next_req;
         self.next_req = self.next_req.wrapping_add(1).max(1);
         let Some(live) = &mut self.live else { return };
         live.asked.insert(req, index);
-        let _ = live.link.send(Call::Join { req, channel, types, isolated, lease_ms: millis(lease), dispatch }).await;
+        let _ = live.link.send(Call::Join { req, channel, types, lease_ms: millis(lease), dispatch }).await;
     }
 
     /// The service index a `Joined` or `Refused` answers. With `joined`, the

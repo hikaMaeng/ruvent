@@ -7,14 +7,12 @@
 //!   It returns once handed over; [`Producer::send_committed`] also waits for
 //!   the cumulative `Committed`. It **waits** — never refuses — while the
 //!   chosen line's buffer is at its byte bound (S8), while every candidate
-//!   has the event's type paused (2.6), or while no server is connected.
+//!   while no server is connected. The server never pauses a producer (plan 9.15).
 //! * A registration once numbered goes only to that server again: after a
 //!   reconnection everything above `Welcome.resume` is sent again under the
 //!   same numbers, or numbered again from `resume + 1` when the server lost
 //!   the record ([`crate::buffer`]). Only `Bye{draining}` (after the final
 //!   `Committed`) and the server leaving the list move the rest elsewhere.
-//! * `Paused{type}` holds that type's registrations to that server only;
-//!   another server, or another type, goes on. Deletions are never held.
 //! * The producer id is new at every start unless [`ProducerConfig::id`]
 //!   keeps one (a durable outbox). `Bye{superseded}`, a reconnection that
 //!   finds the id superseded, and a refused token, version or grant end the
@@ -28,7 +26,6 @@
 //! | unacknowledged buffer | (server, seq) | production line | sent ~ `Committed` | [`ProducerConfig::unacked_bytes`] per line (`send` waits) | SDK (acknowledgement) |
 //! | server list and lines | server address | process | while the list names it | servers | SDK (list changes) |
 //! | selection state | server → connected, unacked bytes, draining | process | the line's | servers | SDK |
-//! | pause marks | (server, root type) | production line | `Paused` ~ `Resumed` or disconnection | paused types (≤ 65,536) | SDK |
 //! | reconnection back-off | server | line | disconnection ~ welcome | servers | SDK ([`crate::line`]) |
 //! | retry budget | the producer | process | the producer's | one counter | SDK ([`RetryBudget`]) |
 
@@ -44,7 +41,7 @@ pub use budget::RetryBudget;
 use parking_lot::Mutex;
 use ruvent::{ByeReason, Call, Channel, Envelope, EventId, Hello, Link, Outbound, ProducerId, WorkKey};
 pub use selector::{Candidate, Choice, LeastUnacked, Selector};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -188,7 +185,6 @@ struct LineState {
     /// The epoch of the live connection.
     connected: Option<u64>,
     draining: bool,
-    paused: HashSet<u16>,
     buffer: Unacked<Pending>,
     io: Arc<tokio::sync::Mutex<Io>>,
 }
@@ -232,7 +228,7 @@ impl Drop for Task {
 
 enum Pick {
     Send(Server, Arc<tokio::sync::Mutex<Io>>),
-    Wait { paused: bool },
+    Wait,
 }
 
 impl Producer {
@@ -333,8 +329,9 @@ impl Producer {
         &self.shared.budget
     }
 
-    /// A send from inside a handler: `blocked` is set while it waits for a
-    /// paused channel (B23: a run held up by flow control is not the event's failure).
+    /// A send from inside a handler: `blocked` is set while it waits — a full
+    /// unacknowledged buffer, no server (B23: a run held up by flow control is
+    /// not the event's failure).
     pub(crate) async fn send_marked(&self, event: Envelope, blocked: &AtomicBool) -> Result<Sent, ProducerError> {
         self.shared.budget.earn();
         self.place(Op::Register(prepare(event)), None, Some(blocked), false).await.map(|(sent, _)| sent)
@@ -382,9 +379,9 @@ async fn place(shared: &Arc<Shared>, pending: Pending, blocked: Option<&AtomicBo
         let pick = pick(shared, &pending, gate.as_mut())?;
         let (server, io) = match pick {
             Pick::Send(server, io) => (server, io),
-            Pick::Wait { paused } => {
+            Pick::Wait => {
                 if let Some(blocked) = blocked {
-                    blocked.store(paused, Ordering::Relaxed);
+                    blocked.store(true, Ordering::Relaxed);
                 }
                 let changed = match gate.as_mut() {
                     Some(gate) => tokio::select! {
@@ -412,9 +409,8 @@ async fn place(shared: &Arc<Shared>, pending: Pending, blocked: Option<&AtomicBo
             let acks = shared.config.acks;
             let Some(line) = state.lines.get_mut(&server) else { continue };
             let open = line.connected == Some(io.epoch) && !line.draining;
-            let paused = pending.op.event_type().is_some_and(|kind| line.paused.contains(&kind));
             let full = !line.buffer.is_empty() && line.buffer.bytes().saturating_add(pending.op.bytes()) > limit;
-            if !open || paused || full {
+            if !open || full {
                 continue;
             }
             let op = pending.op.clone();
@@ -450,29 +446,22 @@ fn pick(shared: &Shared, pending: &Pending, gate: Option<&mut Gate>) -> Result<P
         .filter(|(server, line)| line.connected.is_some() && !line.draining && allowed.as_ref().is_none_or(|allowed| allowed.contains(*server)))
         .map(|(server, line)| {
             let full = !line.buffer.is_empty() && line.buffer.bytes().saturating_add(pending.op.bytes()) > shared.config.unacked_bytes;
-            (Candidate { server: server.clone(), unacked_bytes: line.buffer.bytes(), paused: event_type.is_some_and(|kind| line.paused.contains(&kind)) }, line.io.clone(), full)
+            (Candidate { server: server.clone(), unacked_bytes: line.buffer.bytes() }, line.io.clone(), full)
         })
         .collect();
     candidates.sort_by(|a, b| a.0.server.cmp(&b.0.server));
     if candidates.is_empty() {
-        return Ok(Pick::Wait { paused: false });
+        return Ok(Pick::Wait);
     }
     let listed: Vec<Candidate> = candidates.iter().map(|(candidate, _, _)| candidate.clone()).collect();
-    let group = match &pending.op {
-        Op::Register(event) => event.group,
-        Op::Delete { .. } => None,
-    };
-    let Some(index) = shared.config.selector.select(&Choice { channel, event_type, group, candidates: &listed }) else {
-        return Ok(Pick::Wait { paused: listed.iter().all(|candidate| candidate.paused) });
+    let Some(index) = shared.config.selector.select(&Choice { channel, event_type, candidates: &listed }) else {
+        return Ok(Pick::Wait);
     };
     let Some((candidate, io, full)) = candidates.into_iter().nth(index) else {
-        return Ok(Pick::Wait { paused: false });
+        return Ok(Pick::Wait);
     };
-    if candidate.paused {
-        return Ok(Pick::Wait { paused: true });
-    }
     if full {
-        return Ok(Pick::Wait { paused: false });
+        return Ok(Pick::Wait);
     }
     Ok(Pick::Send(candidate.server, io))
 }
@@ -520,7 +509,7 @@ fn follow_list(shared: &Arc<Shared>, connector: &Arc<dyn Connector>, hello: &Hel
         }
         let spec = Spec { server: server.clone(), hello: hello.clone(), connector: connector.clone(), reconnect: shared.config.reconnect };
         let line = Line::spawn(spec, events.clone());
-        state.lines.insert(server.clone(), LineState { _line: line, connected: None, draining: false, paused: HashSet::new(), buffer: Unacked::new(), io: Arc::default() });
+        state.lines.insert(server.clone(), LineState { _line: line, connected: None, draining: false, buffer: Unacked::new(), io: Arc::default() });
     }
     drop(state);
     shared.bump();
@@ -567,7 +556,6 @@ async fn handle(shared: &Arc<Shared>, event: Event) {
                 told(dropped);
                 line.connected = Some(epoch);
                 line.draining = false;
-                line.paused.clear();
                 line.buffer.iter().map(|entry| entry.item.op.call(entry.seq)).collect()
             };
             io.link = Some(link.clone());
@@ -588,12 +576,6 @@ async fn handle(shared: &Arc<Shared>, event: Event) {
             }
             match *message {
                 Outbound::Committed { seq } => told(line.buffer.ack(seq)),
-                Outbound::Paused { event_type } => {
-                    line.paused.insert(event_type);
-                }
-                Outbound::Resumed { event_type } => {
-                    line.paused.remove(&event_type);
-                }
                 _ => return,
             }
             drop(state);
@@ -607,7 +589,6 @@ async fn handle(shared: &Arc<Shared>, event: Event) {
                     return;
                 }
                 line.connected = None;
-                line.paused.clear();
                 if let Ok(mut io) = line.io.try_lock() {
                     io.link = None;
                 }

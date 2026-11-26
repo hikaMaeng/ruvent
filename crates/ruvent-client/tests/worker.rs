@@ -245,20 +245,20 @@ async fn a_graceful_restart_keeps_the_run_claimed_and_counts_nothing() {
     worker.shutdown().await;
 }
 
-/// M8-12, B6, B23: "later, not this event's fault" more often than
-/// `isolate_after` isolates nothing; "this event failed" isolates at the
-/// n-th failure. The SDK counts neither. The isolated event stays on its
-/// channel and type (plan 9.15) and only a service that asks for isolated
-/// events takes it: `Service::typed().on(T).isolated()` gets it, its
-/// isolated bit set and its failures counted, and completes it.
+/// M8-12, B23, requirement 6: the server counts failures and never acts on
+/// the count — it hands the event back again and again. "Later, not this
+/// event's fault" does not count; "this event failed" does. The retry limit
+/// is the worker's: this handler reads `cx.failures()` and, at three,
+/// completes the event (with a failure follow-up, as a worker would) instead
+/// of retrying again.
 #[tokio::test]
-async fn releasing_later_more_often_than_isolate_after_isolates_nothing_but_failures_do() {
-    let mut config = EngineConfig::default();
-    config.types.default.isolate_after = Some(3);
-    let (local, list, engines) = locals(1, config).await;
+async fn the_retry_limit_is_the_workers_the_server_only_counts_failures() {
+    let (local, list, engines) = locals(1, EngineConfig::default()).await;
     let outage = Arc::new(AtomicU64::new(0));
-    let broken = Arc::new(AtomicU64::new(0));
-    let (handler_outage, handler_broken) = (outage.clone(), broken.clone());
+    let attempts: Arc<Mutex<Vec<u16>>> = Arc::default();
+    let (handler_outage, handler_attempts) = (outage.clone(), attempts.clone());
+    let (observer, mut seen) = ruvent::connect(&engines[0], ruvent::Hello::observer("o"), 64).await.unwrap();
+    observer.subscribe(ch("dead"), None).await.unwrap();
     let worker = Worker::builder(local, &list)
         .service(
             Service::new(ch("jobs"))
@@ -272,10 +272,14 @@ async fn releasing_later_more_often_than_isolate_after_isolates_nothing_but_fail
                         Ok(())
                     }
                 })
-                .on(27, move |_cx| {
-                    let broken = handler_broken.clone();
+                .on(27, move |cx| {
+                    let attempts = handler_attempts.clone();
                     async move {
-                        broken.fetch_add(1, Ordering::SeqCst);
+                        attempts.lock().push(cx.failures());
+                        if cx.failures() >= 3 {
+                            cx.emit_dispatch(ch("dead"), 28, cx.payload().clone());
+                            return Ok(());
+                        }
                         Err(Retry::failed(Duration::ZERO))
                     }
                 }),
@@ -287,51 +291,21 @@ async fn releasing_later_more_often_than_isolate_after_isolates_nothing_but_fail
         let engine = engines[0].clone();
         async move {
             let stats = stats(&engine).await;
-            stats.counters.isolated == 1 && stats.claimed == 0 && stats.waiting == 1
+            stats.claimed == 0 && stats.waiting == 0 && stats.delayed == 0
         }
     })
     .await;
-    assert_eq!(outage.load(Ordering::SeqCst), 9, "eight times later, then done: never isolated");
-    assert_eq!(broken.load(Ordering::SeqCst), 3, "isolated at the third failure");
-    let before = stats(&engines[0]).await;
-    let waiting: Vec<u16> = before.types.iter().filter(|entry| entry.waiting > 0).map(|entry| entry.event_type).collect();
-    assert_eq!(waiting, [27], "isolated in place: same type");
-    let idle: Vec<(Channel, u16)> = before.idle_lanes.iter().map(|lane| (lane.channel, lane.event_type)).collect();
-    assert_eq!(idle, [(ch("jobs"), 27)], "same channel; the plain join does not take it");
+    assert_eq!(outage.load(Ordering::SeqCst), 9, "eight times later, then done: later never counts");
+    assert_eq!(*attempts.lock(), [0, 1, 2, 3], "handed back at every failure; the worker stopped at three");
+    let dead = loop {
+        match tokio::time::timeout(Duration::from_secs(10), seen.recv()).await.expect("the dead letter arrives") {
+            Some(Incoming::Delivery(event)) => break event,
+            Some(_) => continue,
+            None => panic!("the observer closed"),
+        }
+    };
+    assert_eq!(dead.event_type, 28, "the worker's own dead letter");
     worker.shutdown().await;
-
-    let seen: Arc<Mutex<Vec<(Channel, bool, u16)>>> = Arc::default();
-    let handler_seen = seen.clone();
-    let reprocess = Worker::builder(local_of(&engines[0]), &list)
-        .service(
-            Service::typed()
-                .on(27, move |cx| {
-                    let seen = handler_seen.clone();
-                    async move {
-                        seen.lock().push((cx.channel(), cx.event().isolated, cx.failures()));
-                        Ok(())
-                    }
-                })
-                .isolated(),
-        )
-        .start();
-    eventually("the isolated service took it", || seen.lock().len() == 1).await;
-    assert_eq!(*seen.lock(), [(ch("jobs"), true, 3)]);
-    eventually_async("it completed", || {
-        let engine = engines[0].clone();
-        async move {
-            let stats = stats(&engine).await;
-            stats.waiting == 0 && stats.claimed == 0
-        }
-    })
-    .await;
-    reprocess.shutdown().await;
-}
-
-fn local_of(engine: &Engine) -> Arc<ruvent_client::link::Local> {
-    let local = Arc::new(ruvent_client::link::Local::new());
-    local.insert("s0", engine.clone());
-    local
 }
 
 /// > 여러클라이언트-프록시-여러채널+같은타입으로 요청이벤트 전송-이벤트서버:타입으로 등록된 워커서버에게 이벤트전달-워커서버:요청타입의 이벤트를 전부 접수하고 채널별로 분리하여 인퍼런스 프로세스 진행-인퍼런스프로세스는 셋팅시 주어진 채널을 바탕으로 스트리밍이 올때마다 이벤트서버에게 해당 채널로 스트리밍조각을 페이로드로 이벤트 전송-이벤트서버는 해당 채널로 들어온 발송이벤트를 프록시에게 전달

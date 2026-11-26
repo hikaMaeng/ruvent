@@ -1,23 +1,18 @@
 //! What the engine is told at start.
 //!
-//! Nothing here is policy about events — retry counts, back-off and follow-ups
-//! belong to the workers — with one exception: the isolation threshold
-//! (`isolate_after`, B6), the single place a failure count is compared.
+//! Nothing here is policy about events. Retry limits, dead letters, expiry,
+//! ordering and back-pressure belong to the workers and proxies (requirement
+//! 6, plan 9.15); the server counts failures and never acts on the count.
 //!
-//! Every value of the plan's chapter 8 is a field here with its default, not
-//! a constant (v4.6). Type-level values are [`TypeSettings`], which a type
-//! set can override ([`TypeConfig`]); grants are by type too. A channel is an
-//! id the server reads nothing from (plan 9.15).
+//! Every value of the plan's chapter 8 that is left is a field here with its
+//! default, not a constant (v4.6).
 
 mod limits;
-mod types;
 
 pub use crate::snapshot::SnapshotConfig;
-pub use crate::types::TypeSet;
 pub use limits::{MemoryConfig, ProducerConfig, StorageConfig};
 use std::collections::HashMap;
 use std::time::Duration;
-pub use types::{MaxBacklog, TypeConfig, TypeRule, TypeSettings};
 
 /// When other connections may see a change relative to the disk.
 ///
@@ -30,7 +25,7 @@ pub enum Durability {
     /// write; producers still hold it, unacknowledged, and send it again.
     #[default]
     Scheduled,
-    /// A durable event (of a type that is not volatile) is visible to no other connection —
+    /// A claimable event is visible to no other connection —
     /// assignment, notice, backlog, explicit claim — before its registration
     /// is on disk (2.7). A completion's dispatch follow-ups and a deletion's
     /// result wait for the completion or deletion to be on disk.
@@ -59,32 +54,23 @@ impl Method {
     pub const ALL: [Method; 8] = [Method::RegisterClaimable, Method::RegisterDispatch, Method::Claim, Method::Complete, Method::Delete, Method::Subscribe, Method::Unsubscribe, Method::Operate];
 }
 
-/// What one service credential may do: its methods, on the events of its
-/// types. Channels do not matter — a channel is an id, and knowing it is what
-/// lets a connection name it. Subscriptions and dispatch joins hand a
-/// connection only the events of its types (and the server's own, type 0).
+/// What one service credential may do: its methods, nothing narrower.
+/// Channels and types do not matter — a channel is an id, and knowing it is
+/// what lets a connection name it. A deployment that needs separate scopes
+/// runs separate servers (plan 9.15).
 #[derive(Clone, Debug)]
 pub struct Grant {
     pub methods: Vec<Method>,
-    pub types: TypeSet,
-    /// Whether this credential may register on behalf of an end user (`delegate`).
-    pub delegate: bool,
 }
 
 impl Grant {
-    /// Every method on every type, delegation included.
+    /// Every method.
     pub fn all() -> Self {
-        Grant { methods: Method::ALL.to_vec(), types: TypeSet::all(), delegate: true }
+        Grant { methods: Method::ALL.to_vec() }
     }
 
-    pub fn allows(&self, method: Method, event_type: u16) -> bool {
-        self.methods.contains(&method) && self.types.contains(event_type)
-    }
-
-    /// Whether events of `event_type` may be handed to this credential's
-    /// subscriptions and dispatch joins.
-    pub fn reads(&self, event_type: u16) -> bool {
-        event_type == crate::envelope::SERVER_TYPE || self.types.contains(event_type)
+    pub fn allows(&self, method: Method) -> bool {
+        self.methods.contains(&method)
     }
 }
 
@@ -119,16 +105,10 @@ pub struct EngineConfig {
     pub reconnect_grace: Duration,
     /// S10: most follow-ups one completion may register.
     pub max_follow_ups: usize,
-    /// S5, S19, S22: managed memory, watermarks and channel pause.
+    /// S5, S22: managed memory and its watermark (paging).
     pub memory: MemoryConfig,
-    /// S14: what a production connection may still send to a paused root
-    /// type after `Paused` before its reading stops (the record being read
-    /// at the notice is allowed on top).
-    pub pause_allowance: u64,
     /// B24: entries in each top-K list of `Stats`.
     pub stats_top: usize,
-    /// B6, B9, B17, B26 and volatile events, by type.
-    pub types: TypeConfig,
     /// S3, S4, S6, S17: segments, checkpoints, disk budget, the read path.
     /// The segment size must match the one the log was opened with.
     pub storage: StorageConfig,
@@ -150,9 +130,7 @@ impl Default for EngineConfig {
             reconnect_grace: Duration::from_secs(3),
             max_follow_ups: 1024,
             memory: MemoryConfig::default(),
-            pause_allowance: 1 << 20,
             stats_top: 16,
-            types: TypeConfig::default(),
             storage: StorageConfig::default(),
         }
     }

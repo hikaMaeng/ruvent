@@ -6,11 +6,10 @@
 //!   "journal": "data/journal",
 //!   "durability": "strict",
 //!   "credentials": [
-//!     { "name": "workers", "token": "…", "methods": ["claim", "complete", "register_dispatch"], "types": ["10-19", 101] },
+//!     { "name": "workers", "token": "…", "methods": ["claim", "complete", "register_dispatch"] },
 //!     { "name": "ops", "token": "…", "methods": ["operate"] }
 //!   ],
 //!   "memory": { "limit": 8589934592 },
-//!   "types": { "rules": [ { "types": ["30-39"], "isolate_after": 3 } ] },
 //!   "connection": { "keepalive": { "idle_ms": 15000 } }
 //! }
 //! ```
@@ -18,14 +17,13 @@
 //! Everything but `listen` and `credentials` has a default, and every
 //! default is the engine's or the server's own (plan chapter 8). `journal`
 //! absent means nothing is written to disk. A credential without `methods`
-//! may use all eight; without `types` it may use every type. A type set is
-//! a list of items: a number, `"A-B"`, or `"*"`. Channels appear nowhere: a
-//! channel is a UUIDv7 the server reads nothing from (plan 9.15). The
+//! may use all eight. A grant is methods and nothing narrower; channels and
+//! types appear nowhere but in the snapshot's choice (plan 9.15). The
 //! sections and their keys are in the crate's README.
 
 use crate::connection::socket::Keepalive;
 use crate::connection::{Credentials, ServerOptions};
-use ruvent::{Durability, EngineConfig, EventId, Grant, Grants, MaxBacklog, MemoryConfig, Method, ProducerConfig, SnapshotConfig, StorageConfig, TypeConfig, TypeRule, TypeSet, TypeSettings};
+use ruvent::{Durability, EngineConfig, EventId, Grant, Grants, MemoryConfig, Method, ProducerConfig, SnapshotConfig, StorageConfig};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -55,8 +53,6 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageJson,
     #[serde(default)]
-    pub types: TypesJson,
-    #[serde(default)]
     pub connection: ConnectionJson,
     #[serde(default)]
     pub snapshot: Option<SnapshotJson>,
@@ -71,12 +67,6 @@ pub struct CredentialConfig {
     /// `complete`, `delete`, `subscribe`, `unsubscribe`, `operate`. Absent: all.
     #[serde(default)]
     pub methods: Option<Vec<String>>,
-    /// The types it may use (a type set). Absent: every type.
-    #[serde(default)]
-    pub types: Option<Vec<TypeItem>>,
-    /// May register on behalf of an end user.
-    #[serde(default)]
-    pub delegate: bool,
 }
 
 /// `EngineConfig`'s scalar fields.
@@ -95,8 +85,6 @@ pub struct EngineJson {
     pub reconnect_grace_ms: Option<u64>,
     /// S10.
     pub max_follow_ups: Option<usize>,
-    /// S14.
-    pub pause_allowance: Option<u64>,
     /// B24.
     pub stats_top: Option<usize>,
 }
@@ -111,7 +99,7 @@ pub struct ProducersJson {
     pub entry_bytes: Option<u64>,
 }
 
-/// S5, S19, S22.
+/// S5, S22.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryJson {
@@ -119,8 +107,6 @@ pub struct MemoryJson {
     pub reserve: Option<f64>,
     pub high_watermark: Option<f64>,
     pub release: Option<f64>,
-    pub early_pause: Option<f64>,
-    pub net_growth_window: Option<u32>,
     pub slot_bytes: Option<u64>,
     pub depth_target: Option<u64>,
 }
@@ -142,72 +128,10 @@ pub struct StorageJson {
     pub checkpoint_queue: Option<usize>,
 }
 
-/// One item of a type set: a number, `"A-B"`, `"N"` or `"*"`.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-pub enum TypeItem {
-    Number(u16),
-    Text(String),
-}
-
-/// A type set from its items.
-fn type_set(what: &str, items: &[TypeItem]) -> Result<TypeSet, String> {
-    let texts: Vec<String> = items
-        .iter()
-        .map(|item| match item {
-            TypeItem::Number(number) => number.to_string(),
-            TypeItem::Text(text) => text.clone(),
-        })
-        .collect();
-    TypeSet::parse(&texts).map_err(|error| format!("{what}: {error}"))
-}
-
-/// B6, B9, B17, B26, volatile types.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TypesJson {
-    /// Overrides of the defaults every type starts from.
-    #[serde(default)]
-    pub default: TypeJson,
-    /// Rules by type set; the first that holds a type decides.
-    #[serde(default)]
-    pub rules: Vec<TypeRuleJson>,
-}
-
-/// One type's settings; an absent key keeps the default.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TypeJson {
-    /// B6: the failure count that isolates. `0`: never.
-    pub isolate_after: Option<u16>,
-    pub isolated_keep_ms: Option<u64>,
-    pub isolate_expired: Option<bool>,
-    pub max_backlog: Option<MaxBacklogJson>,
-    pub serialize_group: Option<bool>,
-    pub volatile: Option<bool>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaxBacklogJson {
-    pub count: u64,
-    pub bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TypeRuleJson {
-    pub types: Vec<TypeItem>,
-    #[serde(flatten)]
-    pub settings: TypeJson,
-}
-
 /// `ServerOptions`.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionJson {
-    /// S18.
-    pub dictionary: Option<usize>,
     /// B13.
     pub max_body: Option<usize>,
     /// S11.
@@ -239,8 +163,9 @@ pub struct KeepaliveJson {
 #[serde(deny_unknown_fields)]
 pub struct SnapshotJson {
     pub directory: PathBuf,
-    /// The types to collect, on every channel (a type set). Empty: none.
-    pub types: Vec<TypeItem>,
+    /// The types to collect, on every channel. Empty or absent: every type.
+    #[serde(default)]
+    pub types: Vec<u16>,
     #[serde(default)]
     pub max_events: Option<usize>,
     #[serde(default)]
@@ -273,19 +198,6 @@ fn fraction(name: &str, value: Option<f64>, default: f64) -> Result<f64, String>
         return Err(format!("{name} {value}: expected a fraction between 0 and 1"));
     }
     Ok(value)
-}
-
-impl TypeJson {
-    fn apply(&self, base: &TypeSettings) -> TypeSettings {
-        TypeSettings {
-            isolate_after: self.isolate_after.map_or(base.isolate_after, |count| (count > 0).then_some(count)),
-            isolated_keep: ms(self.isolated_keep_ms, base.isolated_keep),
-            isolate_expired: self.isolate_expired.unwrap_or(base.isolate_expired),
-            max_backlog: self.max_backlog.map_or(base.max_backlog, |bound| Some(MaxBacklog { count: bound.count, bytes: bound.bytes })),
-            serialize_group: self.serialize_group.unwrap_or(base.serialize_group),
-            volatile: self.volatile.unwrap_or(base.volatile),
-        }
-    }
 }
 
 impl Config {
@@ -322,33 +234,16 @@ impl Config {
                 Some(methods) => methods.iter().map(|name| method(name)).collect::<Result<Vec<_>, _>>()?,
                 None => Method::ALL.to_vec(),
             };
-            let types = match &credential.types {
-                Some(items) => type_set(&format!("credential {:?} types", credential.name), items)?,
-                None => TypeSet::all(),
-            };
-            grants.insert(credential.name.clone(), Grant { methods, types, delegate: credential.delegate });
+            grants.insert(credential.name.clone(), Grant { methods });
         }
         Ok(grants)
-    }
-
-    fn types(&self) -> Result<TypeConfig, String> {
-        let default = self.types.default.apply(&TypeConfig::default().default);
-        let mut rules = Vec::with_capacity(self.types.rules.len());
-        for (at, rule) in self.types.rules.iter().enumerate() {
-            rules.push(TypeRule { types: type_set(&format!("types.rules[{at}]"), &rule.types)?, settings: rule.settings.apply(&default) });
-        }
-        Ok(TypeConfig { default, rules })
     }
 
     /// The engine configuration this file describes.
     pub fn engine_config(&self) -> Result<EngineConfig, String> {
         let defaults = EngineConfig::default();
-        let snapshot = match self.snapshot.as_ref() {
-            Some(snapshot) => Some((snapshot, type_set("snapshot.types", &snapshot.types)?)),
-            None => None,
-        };
-        let snapshot = snapshot.map(|(snapshot, types)| {
-            let mut config = SnapshotConfig::new(snapshot.directory.clone(), types);
+        let snapshot = self.snapshot.as_ref().map(|snapshot| {
+            let mut config = SnapshotConfig::new(snapshot.directory.clone(), snapshot.types.clone());
             if let Some(max_events) = snapshot.max_events {
                 config.max_events = max_events;
             }
@@ -379,8 +274,6 @@ impl Config {
             reserve: fraction("memory.reserve", m.reserve, d.reserve)?,
             high_watermark: fraction("memory.high_watermark", m.high_watermark, d.high_watermark)?,
             release: fraction("memory.release", m.release, d.release)?,
-            early_pause: fraction("memory.early_pause", m.early_pause, d.early_pause)?,
-            net_growth_window: m.net_growth_window.unwrap_or(d.net_growth_window),
             slot_bytes: m.slot_bytes.unwrap_or(d.slot_bytes),
             depth_target: m.depth_target.unwrap_or(d.depth_target),
         };
@@ -414,9 +307,7 @@ impl Config {
             reconnect_grace: ms(engine.reconnect_grace_ms, defaults.reconnect_grace),
             max_follow_ups: engine.max_follow_ups.unwrap_or(defaults.max_follow_ups),
             memory,
-            pause_allowance: engine.pause_allowance.unwrap_or(defaults.pause_allowance),
             stats_top: engine.stats_top.unwrap_or(defaults.stats_top),
-            types: self.types()?,
             storage,
         })
     }
@@ -431,7 +322,6 @@ impl Config {
         let c = &self.connection;
         let k = &c.keepalive;
         ServerOptions {
-            dictionary: c.dictionary.unwrap_or(defaults.dictionary),
             max_body: c.max_body.unwrap_or(defaults.max_body),
             inline: c.inline.unwrap_or(defaults.inline),
             direct: c.direct.unwrap_or(defaults.direct),

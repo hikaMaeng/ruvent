@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c49097e75150c19c50214372b4e458a92274dbacb945ec41291c00e672af09f0 # shrinks to event = Envelope { id: 00000000-0000-0000-0000-000000000000, channel: 00000000-0000-0000-0000-000000000000, event_type: 0, kind: Dispatch, failures: 0, key: Some(WorkKey { generation: 0, arrival: 0 }), not_before: Some(0), claim: None, payload: b"" }

@@ -1,4 +1,5 @@
-//! The one event envelope.
+//! The one event envelope: what the server needs for its own work, and
+//! nothing else (plan 9.15).
 //!
 //! Claimable and dispatch events share one layout and differ only in the kind
 //! bit of `flags`. The ledger holds the metadata of a claimable event; the
@@ -9,27 +10,34 @@
 //!  ┌──── id 16 ────┬── channel 16 ──┬type 2┬flags 2┬failures 2┐
 //!  work key (claimable, when the server sends or journals it)
 //!  ┌── generation 4 · arrival varint ──┐
-//!  optional fields (only those whose flag bit is set)
-//!  principal 4 · delegate 4 · not_before varint · expires varint · group 16
+//!  not_before varint                                  (flag bit, claimable)
+//!  claim mark: worker 16 · token generation 4 · token seq varint · lease ms varint
+//!                                                     (flag bit, an assignment)
 //!  payload: length 4 + bytes
 //! ```
 //!
 //! The byte layout is [`codec`]. Which of these blocks a record carries is
 //! fixed by the record kind, [`codec::Layout`].
 //!
-//! ## Why the type is here
+//! ## What is here, and why
 //!
-//! The envelope holds only what the server acts on. The type is a 16-bit
-//! number the server routes claimable work by: a worker joins a channel, a
-//! set of types, or both (`Call::Join`), so one worker can take one kind of
-//! request from many channels — a channel per request — without knowing the
-//! channels in advance. The server never reads what a type means; projects
-//! number their own (plan 9.14). Dispatch is routed by channel alone.
+//! Every field is one the server's own work reads; what a project means by an
+//! event is the payload's, which the server never reads.
 //!
-//! The type is also what the server's settings and grants are keyed by:
-//! which credential may register, claim or read an event, whether it is
-//! journaled, when it is isolated, how much of it may wait (plan 9.15).
-//! Type 0 is the server's own: delete outcomes ([`crate::delete_outcome`]).
+//! | field | the server's work that needs it |
+//! | --- | --- |
+//! | id | idempotent registration and completion; claim and delete by id |
+//! | channel | dispatch goes to the channel's subscribers; the waiting lane |
+//! | type | claimable work goes to the worker that joined its type (`Call::Join`) |
+//! | kind | claimable waits for a completion, dispatch is handed over and gone |
+//! | failures | the retry count: lease expiries and failed releases. The worker reads it and decides |
+//! | work key | the waiting order, and the registration's name in the journal |
+//! | not_before | a delayed registration or release becomes visible then |
+//! | claim mark | which worker holds the event (its uuid), the attempt's fencing token and lease |
+//!
+//! Policies are not here: no isolation, expiry, grouping, delegation or
+//! credential. Retry limits, dead letters and deadlines are the workers'
+//! business (requirement 6, plan 9.15).
 //!
 //! ## The channel is an id, not a name
 //!
@@ -39,18 +47,19 @@
 //! per request costs no dictionary entry and no configuration, and leaves
 //! nothing behind once its events are gone. Anything else is refused.
 //!
+//! The type is a 16-bit number projects number themselves (plan 9.14). Type 0
+//! is the server's own: delete outcomes ([`crate::delete_outcome`]).
+//!
 //! ## Times
 //!
-//! `not_before` and `expires` are milliseconds. In a registration request
-//! (and a follow-up) they are **durations from the moment the server applies
-//! it**. Everywhere the server holds or sends them — the ledger, the journal,
-//! an assignment — they are **absolute values on the server's accumulated
-//! uptime clock**, which survives restarts and does not count the time the
-//! server was down.
+//! `not_before` is milliseconds. In a registration request (and a follow-up)
+//! it is **a duration from the moment the server applies it**. Everywhere the
+//! server holds or sends it — the ledger, the journal, an assignment — it is
+//! **an absolute value on the server's accumulated uptime clock**, which
+//! survives restarts and does not count the time the server was down.
 
 pub mod codec;
 
-use crate::names::Name;
 use bytes::Bytes;
 use std::fmt;
 use std::str::FromStr;
@@ -148,10 +157,6 @@ pub const SERVER_TYPE: u16 = 0;
 /// The name of one retransmission buffer: a producer (2.3). 16 bytes.
 pub type ProducerId = [u8; 16];
 
-/// A `group` (B26): events of one group on a channel with `serialize_group`
-/// are assigned one at a time. The server compares it and never reads it.
-pub type GroupId = [u8; 16];
-
 /// What the server assigns to each registration: `(generation, arrival)`.
 ///
 /// It survives reclaims and restarts, a new registration under a reused id
@@ -196,33 +201,36 @@ impl Digest {
     }
 }
 
-/// One event. Cloning copies the head and shares the names and the payload.
+/// One event. Cloning copies the head and shares the payload.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Envelope {
     pub id: EventId,
     pub channel: Channel,
-    /// The event's type: a number its project defines, routed by (see the module's "Why the type is here").
+    /// The event's type: a number its project defines, routed by.
     pub event_type: u16,
     pub kind: Kind,
     /// Failures counted against this event: lease expiries and releases that
-    /// said "this event failed". Saturates at 65,535.
+    /// said "this event failed". Saturates at 65,535. The retry count the
+    /// worker decides by.
     pub failures: u16,
     /// Set by the server on claimable events.
     pub key: Option<WorkKey>,
-    /// Set by the server: the event reached its type's failure threshold and
-    /// waits only for joins that ask for isolated events (B6).
-    pub isolated: bool,
-    /// The registering connection's service credential. Set by the server only.
-    pub principal: Option<Name>,
-    /// The end user a proxy registered this on behalf of.
-    pub delegate: Option<Name>,
     /// Visible from this time on (see the module's "Times").
     pub not_before: Option<u64>,
-    /// Removed, never assigned, from this time on (see the module's "Times").
-    pub expires: Option<u64>,
-    /// Serialization group (B26).
-    pub group: Option<GroupId>,
+    /// Set by the server on an assignment: who holds the event and under which attempt.
+    pub claim: Option<ClaimMark>,
     pub payload: Bytes,
+}
+
+/// The claim mark of an assigned event: the worker that holds it, the
+/// attempt, and the lease the attempt runs under.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ClaimMark {
+    /// The worker's uuid: its work connection's producer id. A completion,
+    /// extension or release must come from this worker with this token.
+    pub worker: ProducerId,
+    pub token: ClaimToken,
+    pub lease_ms: u64,
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -231,21 +239,7 @@ fn millis(duration: Duration) -> u64 {
 
 impl Envelope {
     fn draft(kind: Kind, channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> Self {
-        Envelope {
-            id: EventId::NIL,
-            channel,
-            event_type,
-            kind,
-            failures: 0,
-            key: None,
-            isolated: false,
-            principal: None,
-            delegate: None,
-            not_before: None,
-            expires: None,
-            group: None,
-            payload: payload.into(),
-        }
+        Envelope { id: EventId::NIL, channel, event_type, kind, failures: 0, key: None, not_before: None, claim: None, payload: payload.into() }
     }
 
     /// A claimable event to register; the server assigns the id unless [`Envelope::with_id`] sets one.
@@ -263,40 +257,16 @@ impl Envelope {
         self
     }
 
-    pub fn with_delegate(mut self, user: impl Into<Name>) -> Self {
-        self.delegate = Some(user.into());
-        self
-    }
-
     /// Visible only `delay` after the server applies the registration.
     pub fn with_not_before(mut self, delay: Duration) -> Self {
         self.not_before = Some(millis(delay));
         self
     }
 
-    /// Removed if not completed within `life` of the server applying the registration.
-    pub fn with_expires(mut self, life: Duration) -> Self {
-        self.expires = Some(millis(life));
-        self
-    }
-
-    pub fn with_group(mut self, group: GroupId) -> Self {
-        self.group = Some(group);
-        self
-    }
-
     /// The `flags` word this envelope encodes with, before a layout masks it.
     pub fn flags(&self) -> u16 {
         let mut flags = 0;
-        for (present, bit) in [
-            (self.kind == Kind::Dispatch, codec::KIND),
-            (self.isolated, codec::ISOLATED),
-            (self.principal.is_some(), codec::PRINCIPAL),
-            (self.delegate.is_some(), codec::DELEGATE),
-            (self.not_before.is_some(), codec::NOT_BEFORE),
-            (self.expires.is_some(), codec::EXPIRES),
-            (self.group.is_some(), codec::GROUP),
-        ] {
+        for (present, bit) in [(self.kind == Kind::Dispatch, codec::KIND), (self.not_before.is_some(), codec::NOT_BEFORE), (self.claim.is_some(), codec::CLAIMED)] {
             if present {
                 flags |= bit;
             }
@@ -304,16 +274,9 @@ impl Envelope {
         flags
     }
 
-    /// Every name this envelope carries in `layout`, in encoding order: the
-    /// credential and the end user, the only names left (the channel is an id).
-    pub fn names(&self, layout: codec::Layout) -> impl Iterator<Item = &Name> {
-        let optional = layout.has_optional();
-        [self.principal.as_ref(), self.delegate.as_ref()].into_iter().filter(move |_| optional).flatten()
-    }
-
     /// The same event as a notice: the head and the work key, nothing else.
     pub fn notice(&self) -> Envelope {
-        Envelope { principal: None, delegate: None, not_before: None, expires: None, group: None, payload: Bytes::new(), ..self.clone() }
+        Envelope { not_before: None, claim: None, payload: Bytes::new(), ..self.clone() }
     }
 }
 

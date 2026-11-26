@@ -48,18 +48,8 @@ impl Reading {
     /// Applies calls until the peer stops, a record is refused, or the owner
     /// says `closing`.
     async fn calls(&mut self) -> ReadEnd {
-        let mut reading = self.session.reading();
         let mut closing = self.closing.clone();
         loop {
-            if self.role == Role::Produce && !self.decoder.gathering() {
-                // Stopped by the engine: wait at a record boundary.
-                while !*reading.borrow_and_update() {
-                    tokio::select! {
-                        changed = reading.changed() => if changed.is_err() { return ReadEnd::Released },
-                        _ = closing.changed() => return ReadEnd::Released,
-                    }
-                }
-            }
             let step = tokio::select! {
                 biased;
                 _ = closing.changed() => return ReadEnd::Released,
@@ -94,10 +84,10 @@ impl Reading {
     }
 
     /// Whether this follow-up's body goes to disk (2.6): the engine decides
-    /// from the channel and the memory in use.
+    /// from the memory in use. The head is checked first.
     fn to_disk(&self, raw: &RawRecord) -> Result<bool, ReadEnd> {
-        let event = self.decoder.follow_up(raw).map_err(ReadEnd::Protocol)?;
-        Ok(self.engine.body_to_disk(event.event_type, u64::from(raw.body_len)))
+        self.decoder.follow_up(raw).map_err(ReadEnd::Protocol)?;
+        Ok(self.engine.body_to_disk(u64::from(raw.body_len)))
     }
 
     /// Streams the next `len` body bytes from the socket into the spool, a

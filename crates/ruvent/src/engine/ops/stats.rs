@@ -12,25 +12,14 @@ pub struct Counters {
     pub duplicates: u64,
     /// Completions, extensions and releases whose token was not the current attempt's.
     pub stale: u64,
-    /// Events removed because they expired.
-    pub expired: u64,
-    /// Events isolated (B6, B9).
-    pub isolated: u64,
     /// Leases that ran out.
     pub reclaimed: u64,
     /// Faults of any kind, told or not.
     pub faults: u64,
-    /// Batches that ended with managed memory at or past the limit (net-growth lanes were not assigned).
-    pub over_limit: u64,
-    /// Root types paused, by any rule.
-    pub pauses: u64,
     /// Cached durable payloads released at the high watermark (2.5).
     pub released: u64,
     /// Cold payloads read ahead into the cache.
     pub read_ahead: u64,
-    /// Bytes of volatile follow-up payloads received to disk past the memory
-    /// reserve (2.6 item 5, B15). Zero in normal operation (M3).
-    pub spilled_bytes: u64,
     /// Payloads moved to the long-lived lane.
     pub relocated: u64,
     /// Segments removed.
@@ -74,19 +63,6 @@ pub struct IdleLane {
     pub waiting: u64,
 }
 
-/// One root type in the top-K by share: the type that started the lineages.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RootStat {
-    pub root: u16,
-    /// Events held for the root, in any state.
-    pub events: u64,
-    /// The root's memory share: metadata and volatile payloads.
-    pub bytes: u64,
-    /// The root's disk share: payloads in segments.
-    pub disk: u64,
-    pub paused: bool,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Events waiting in a lane or held back by a pause.
@@ -115,5 +91,4 @@ pub struct Stats {
     pub counters: Counters,
     pub types: Vec<TypeStat>,
     pub idle_lanes: Vec<IdleLane>,
-    pub roots: Vec<RootStat>,
 }

@@ -12,13 +12,12 @@
 //!
 //! | record | means |
 //! | --- | --- |
-//! | `Register` | this registration exists, with this envelope (failures, times and group included) and this root type; its payload inline, or at a location written earlier (a streamed body) |
+//! | `Register` | this registration exists, with this envelope (failures, times and group included) ; its payload inline, or at a location written earlier (a streamed body) |
 //! | `Body` | a payload written inline with no registration; skipped unless something points at it |
-//! | `Claim` | this registration is claimed under this token, lease length and credential |
+//! | `Claim` | this registration is claimed by this worker (its uuid) under this token and lease length |
 //! | `Remove` | this registration is gone: completed, deleted or expired |
 //! | `Reclaim` | its lease ran out: waiting again with this failure count |
 //! | `Release` | the worker gave it back: this failure count, visible again at this uptime (or now) |
-//! | `Isolate` | it is isolated in place (B6) with this failure count and this expiry |
 //! | `Relocate` | its payload now lives at this location (the long-lived lane) |
 //! | `ProducerDef` | producer number ↔ producer id |
 //! | `Producer` | this producer's last applied sequence number |
@@ -53,7 +52,6 @@ mod segment;
 mod spool;
 
 use crate::envelope::{ClaimToken, Digest, Envelope, ProducerId, WorkKey};
-use crate::names::Name;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::io;
@@ -130,11 +128,10 @@ pub struct Written {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     /// A registration. `event` has its work key, the absolute `not_before` and
-    /// `expires`, and its failure count; `root` is its root type. With `at`
+    /// `expires`, and its failure count; With `at`
     /// the payload was written earlier (streamed) and `event.payload` is empty.
     Register {
         event: Envelope,
-        root: u16,
         at: Option<Location>,
     },
     /// A payload with no registration around it.
@@ -145,7 +142,8 @@ pub enum Record {
         key: WorkKey,
         token: ClaimToken,
         lease_ms: u64,
-        credential: Name,
+        /// The worker's uuid: its work connection's producer id.
+        worker: ProducerId,
     },
     Remove(WorkKey),
     Reclaim {
@@ -157,11 +155,6 @@ pub enum Record {
         key: WorkKey,
         failures: u16,
         visible_at: Option<u64>,
-    },
-    Isolate {
-        key: WorkKey,
-        failures: u16,
-        expires: Option<u64>,
     },
     Relocate {
         key: WorkKey,
@@ -201,7 +194,7 @@ pub enum Standing {
     Claimed {
         token: ClaimToken,
         lease_ms: u64,
-        credential: Name,
+        worker: ProducerId,
     },
 }
 
@@ -209,9 +202,8 @@ pub enum Standing {
 /// the serial of its last change (2.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    /// Head, work key, channel, failures, times, the isolated bit; the payload empty.
+    /// Head, work key, channel, failures, `not_before`; the payload empty.
     pub event: Envelope,
-    pub root: u16,
     /// `None` while its registration was not yet on disk when the checkpoint
     /// started: the registration is then in the replayed tail, which supplies it.
     pub at: Option<Location>,

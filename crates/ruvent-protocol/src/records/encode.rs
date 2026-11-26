@@ -2,15 +2,14 @@
 
 use super::fields::{close, cut, open, put_bool, put_channel, put_key, put_text, put_token, put_varint, DETAIL};
 use super::*;
-use crate::dictionary::Outgoing;
 use crate::error::ProtocolError;
 use crate::io::Parts;
-use crate::{features, DICTIONARY, INLINE, MAX_BODY, VERSION};
+use crate::{features, INLINE, MAX_BODY, VERSION};
 use bytes::{BufMut, Bytes, BytesMut};
 use ruvent::envelope::codec::{self, Layout};
 use ruvent::{Assignment, Envelope, Role};
 
-/// The longest text one head carries (a name, a token, a credential).
+/// The longest text one head carries (a token, a credential).
 const TEXT: usize = 32 << 10;
 /// The longest head a record may have.
 const HEAD: usize = u16::MAX as usize;
@@ -31,9 +30,8 @@ pub(crate) fn role_code(role: Role) -> u8 {
 /// hands the gathered entries to one vectored write.
 ///
 /// A message is checked whole before anything is written, so a refused
-/// message leaves neither a record nor a name definition behind.
+/// message leaves no record behind.
 pub struct Encoder {
-    dictionary: Outgoing,
     features: u64,
     inline: usize,
     max_body: usize,
@@ -47,13 +45,13 @@ pub struct Encoder {
 
 impl Default for Encoder {
     fn default() -> Self {
-        Encoder::new(DICTIONARY)
+        Encoder::new()
     }
 }
 
 impl Encoder {
-    pub fn new(dictionary: usize) -> Self {
-        Encoder { dictionary: Outgoing::new(dictionary), features: features::ALL, inline: INLINE, max_body: MAX_BODY, now: 0, buf: BytesMut::with_capacity(4096), parts: Vec::new(), parted: 0 }
+    pub fn new() -> Self {
+        Encoder { features: features::ALL, inline: INLINE, max_body: MAX_BODY, now: 0, buf: BytesMut::with_capacity(4096), parts: Vec::new(), parted: 0 }
     }
 
     /// The feature bits written into `Welcome` (from `Outbound::Welcome`).
@@ -104,10 +102,9 @@ impl Encoder {
         self.parts.iter().any(|part| part.as_ptr() == payload.as_ptr() && part.len() == payload.len())
     }
 
-    /// Adds a message: its name definitions, then its records.
+    /// Adds a message: its records.
     pub fn push(&mut self, message: &Message) -> Result<(), ProtocolError> {
         self.check(message)?;
-        self.dictionary.define(names_of(message), &mut self.buf)?;
         self.write(message);
         Ok(())
     }
@@ -136,11 +133,11 @@ impl Encoder {
     }
 
     /// A record that carries an event: `prefix` writes the fields before the event's head.
-    fn event(&mut self, tag: u8, prefix: impl FnOnce(&mut BytesMut, &Outgoing), event: &Envelope, layout: Layout) {
-        let Encoder { dictionary, buf, .. } = &mut *self;
+    fn event(&mut self, tag: u8, prefix: impl FnOnce(&mut BytesMut), event: &Envelope, layout: Layout) {
+        let buf = &mut self.buf;
         let at = open(buf, tag);
-        prefix(buf, dictionary);
-        let _ = codec::encode_head(event, layout, &mut |name| dictionary.number(name), buf);
+        prefix(buf);
+        let _ = codec::encode_head(event, layout, buf);
         let body = if layout.has_payload() { event.payload.len() as u32 } else { 0 };
         close(buf, at, body);
         if layout.has_payload() {
@@ -149,21 +146,19 @@ impl Encoder {
     }
 
     /// A record without a body.
-    fn plain(&mut self, tag: u8, fields: impl FnOnce(&mut BytesMut, &Outgoing)) {
-        let Encoder { dictionary, buf, .. } = &mut *self;
+    fn plain(&mut self, tag: u8, fields: impl FnOnce(&mut BytesMut)) {
+        let buf = &mut self.buf;
         let at = open(buf, tag);
-        fields(buf, dictionary);
+        fields(buf);
         close(buf, at, 0);
     }
 
     fn assignment(&mut self, tag: u8, req: Option<u32>, assignment: &Assignment) {
         let remaining = assignment.until.saturating_sub(self.now);
-        let prefix = |out: &mut BytesMut, _: &Outgoing| {
+        let prefix = |out: &mut BytesMut| {
             if let Some(req) = req {
                 put_varint(out, u64::from(req));
             }
-            put_token(out, assignment.token);
-            put_varint(out, assignment.lease_ms);
             put_varint(out, remaining);
             put_bool(out, assignment.more);
         };
@@ -172,7 +167,7 @@ impl Encoder {
 
     fn write(&mut self, message: &Message) {
         match message {
-            Message::Hello { version, features, token, hello } => self.plain(HELLO, |out, _| {
+            Message::Hello { version, features, token, hello } => self.plain(HELLO, |out| {
                 put_varint(out, u64::from(*version));
                 put_varint(out, *features);
                 out.put_u8(role_code(hello.role));
@@ -186,10 +181,6 @@ impl Encoder {
                 if let Some(linger) = hello.linger_ms {
                     put_varint(out, linger);
                 }
-                put_varint(out, hello.types.len() as u64);
-                for kind in &hello.types {
-                    out.put_u16_le(*kind);
-                }
             }),
             Message::Welcome { version, features, welcome } => self.welcome(*version, *features, welcome),
             Message::Outbound(Outbound::Welcome(welcome)) => self.welcome(VERSION, self.features, welcome),
@@ -199,7 +190,7 @@ impl Encoder {
     }
 
     fn welcome(&mut self, version: u32, features: u64, welcome: &Welcome) {
-        self.plain(WELCOME, |out, _| {
+        self.plain(WELCOME, |out| {
             put_varint(out, u64::from(version));
             put_varint(out, features);
             out.put_slice(&welcome.server_id);
@@ -212,14 +203,14 @@ impl Encoder {
 
     fn call(&mut self, call: &Call) {
         match call {
-            Call::Register { seq, event } => self.event(REGISTER, |out, _| put_varint(out, seq.unwrap_or(0)), event, Layout::Request),
-            Call::Delete { seq, id, result, key } => self.plain(DELETE, |out, _| {
+            Call::Register { seq, event } => self.event(REGISTER, |out| put_varint(out, seq.unwrap_or(0)), event, Layout::Request),
+            Call::Delete { seq, id, result, key } => self.plain(DELETE, |out| {
                 put_varint(out, *seq);
                 out.put_slice(&id.0);
                 put_channel(out, result);
                 put_key(out, *key);
             }),
-            Call::Join { req, channel, types, isolated, lease_ms, dispatch } => self.plain(JOIN, |out, _| {
+            Call::Join { req, channel, types, lease_ms, dispatch } => self.plain(JOIN, |out| {
                 put_varint(out, u64::from(*req));
                 put_bool(out, channel.is_some());
                 if let Some(channel) = channel {
@@ -229,93 +220,90 @@ impl Encoder {
                 for kind in types {
                     out.put_u16_le(*kind);
                 }
-                put_bool(out, *isolated);
                 put_varint(out, *lease_ms);
                 put_bool(out, *dispatch);
             }),
-            Call::Window { join, count, bytes } => self.plain(WINDOW, |out, _| {
+            Call::Window { join, count, bytes } => self.plain(WINDOW, |out| {
                 put_varint(out, u64::from(*join));
                 put_varint(out, u64::from(*count));
                 put_varint(out, *bytes);
             }),
             Call::Complete { seq, id, token, follow_ups, .. } => {
-                self.plain(COMPLETE, |out, _| {
+                self.plain(COMPLETE, |out| {
                     put_varint(out, *seq);
                     out.put_slice(&id.0);
                     put_token(out, *token);
                     put_varint(out, follow_ups.len() as u64);
                 });
                 for event in follow_ups {
-                    self.event(FOLLOW_UP, |_, _| {}, event, Layout::Request);
+                    self.event(FOLLOW_UP, |_| {}, event, Layout::Request);
                 }
             }
-            Call::Extend { id, token } => self.plain(EXTEND, |out, _| {
+            Call::Extend { id, token } => self.plain(EXTEND, |out| {
                 out.put_slice(&id.0);
                 put_token(out, *token);
             }),
-            Call::Release { id, token, delay_ms, failed } => self.plain(RELEASE, |out, _| {
+            Call::Release { id, token, delay_ms, failed } => self.plain(RELEASE, |out| {
                 out.put_slice(&id.0);
                 put_token(out, *token);
                 put_varint(out, *delay_ms);
                 put_bool(out, *failed);
             }),
-            Call::Claim { req, id, lease_ms } => self.plain(CLAIM, |out, _| {
+            Call::Claim { req, id, lease_ms } => self.plain(CLAIM, |out| {
                 put_varint(out, u64::from(*req));
                 out.put_slice(&id.0);
                 put_varint(out, *lease_ms);
             }),
-            Call::Subscribe { req, channel, after } => self.plain(SUBSCRIBE, |out, _| {
+            Call::Subscribe { req, channel, after } => self.plain(SUBSCRIBE, |out| {
                 put_varint(out, u64::from(*req));
                 put_channel(out, channel);
                 put_key(out, *after);
             }),
-            Call::Unsubscribe { req, channel } => self.plain(UNSUBSCRIBE, |out, _| {
+            Call::Unsubscribe { req, channel } => self.plain(UNSUBSCRIBE, |out| {
                 put_varint(out, u64::from(*req));
                 put_channel(out, channel);
             }),
-            Call::Stats { req } => self.plain(STATS, |out, _| put_varint(out, u64::from(*req))),
-            Call::Drain { req } => self.plain(DRAIN, |out, _| put_varint(out, u64::from(*req))),
+            Call::Stats { req } => self.plain(STATS, |out| put_varint(out, u64::from(*req))),
+            Call::Drain { req } => self.plain(DRAIN, |out| put_varint(out, u64::from(*req))),
         }
     }
 
     fn outbound(&mut self, outbound: &Outbound) {
         match outbound {
             Outbound::Welcome(welcome) => self.welcome(VERSION, self.features, welcome),
-            Outbound::Bye(reason) => self.plain(BYE, |out, _| out.put_u8(reason.code())),
-            Outbound::Fault { kind, detail } => self.plain(FAULT, |out, _| {
+            Outbound::Bye(reason) => self.plain(BYE, |out| out.put_u8(reason.code())),
+            Outbound::Fault { kind, detail } => self.plain(FAULT, |out| {
                 out.put_u8(kind.code());
                 put_text(out, cut(detail, DETAIL));
             }),
-            Outbound::Committed { seq } => self.plain(COMMITTED, |out, _| put_varint(out, *seq)),
-            Outbound::Paused { event_type } => self.plain(PAUSED, |out, _| out.put_u16_le(*event_type)),
-            Outbound::Resumed { event_type } => self.plain(RESUMED, |out, _| out.put_u16_le(*event_type)),
-            Outbound::Joined { req } => self.plain(JOINED, |out, _| put_varint(out, u64::from(*req))),
-            Outbound::Refused { req, reason } => self.plain(REFUSED, |out, _| {
+            Outbound::Committed { seq } => self.plain(COMMITTED, |out| put_varint(out, *seq)),
+            Outbound::Joined { req } => self.plain(JOINED, |out| put_varint(out, u64::from(*req))),
+            Outbound::Refused { req, reason } => self.plain(REFUSED, |out| {
                 put_varint(out, u64::from(*req));
                 out.put_u8(reason.code());
             }),
-            Outbound::Pending { join } => self.plain(PENDING, |out, _| put_varint(out, u64::from(*join))),
+            Outbound::Pending { join } => self.plain(PENDING, |out| put_varint(out, u64::from(*join))),
             Outbound::Assign(assignment) => self.assignment(ASSIGN, None, assignment),
             Outbound::Claimed { req, assignment } => self.assignment(CLAIMED, Some(*req), assignment),
             Outbound::Subscribed { req, channel, backlog, more } => {
-                self.plain(SUBSCRIBED, |out, _| {
+                self.plain(SUBSCRIBED, |out| {
                     put_varint(out, u64::from(*req));
                     put_channel(out, channel);
                     put_bool(out, *more);
                     put_varint(out, backlog.len() as u64);
                 });
                 for event in backlog {
-                    self.event(NOTICE, |_, _| {}, event, Layout::Notice);
+                    self.event(NOTICE, |_| {}, event, Layout::Notice);
                 }
             }
-            Outbound::Unsubscribed { req } => self.plain(UNSUBSCRIBED, |out, _| put_varint(out, u64::from(*req))),
-            Outbound::Notice(event) => self.event(NOTICE, |_, _| {}, event, Layout::Notice),
-            Outbound::Delivery(event) => self.event(DELIVERY, |_, _| {}, event, Layout::Delivery),
-            Outbound::StatsReply { req, stats } => self.plain(STATS_REPLY, |out, _| {
+            Outbound::Unsubscribed { req } => self.plain(UNSUBSCRIBED, |out| put_varint(out, u64::from(*req))),
+            Outbound::Notice(event) => self.event(NOTICE, |_| {}, event, Layout::Notice),
+            Outbound::Delivery(event) => self.event(DELIVERY, |_| {}, event, Layout::Delivery),
+            Outbound::StatsReply { req, stats } => self.plain(STATS_REPLY, |out| {
                 put_varint(out, u64::from(*req));
                 stats::encode(stats, out);
             }),
-            Outbound::Draining { req } => self.plain(DRAINING, |out, _| put_varint(out, u64::from(*req))),
+            Outbound::Draining { req } => self.plain(DRAINING, |out| put_varint(out, u64::from(*req))),
         }
     }
 }
@@ -333,14 +321,9 @@ fn check_event(event: &Envelope, layout: Layout, max_body: usize) -> Result<(), 
 /// bounds. A sender that numbers calls checks before it takes a number, so a
 /// refused call never leaves a gap in the sequence.
 pub fn validate(message: &Message, max_body: usize) -> Result<(), ProtocolError> {
-    for name in names_of(message) {
-        if name.as_str().len() > TEXT {
-            return Err(ProtocolError::TooLarge(name.as_str().len()));
-        }
-    }
     match message {
-        Message::Hello { token, hello, .. } => {
-            let head = 64 + token.len() + hello.types.len() * 2;
+        Message::Hello { token, .. } => {
+            let head = 64 + token.len();
             if token.len() > TEXT || head > HEAD {
                 return Err(ProtocolError::TooLarge(head));
             }

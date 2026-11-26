@@ -45,10 +45,10 @@ impl State {
     /// generation.
     ///
     /// The clock carries on from where the log ended. A claimed event stays
-    /// claimed (2.4): its token, lease length and credential come back, the
+    /// claimed (2.4): its token, lease length and worker come back, the
     /// lease is re-armed at its full length from now, and its failure count
     /// does not change — a restart is not a closed connection. `not_before`
-    /// and `expires` are absolute and keep their remaining time.
+    /// is absolute and keeps its remaining time.
     ///
     /// Returns the records that must be durable before the first answer (the
     /// new generation) and where the log ended.
@@ -73,23 +73,10 @@ impl State {
     }
 
     /// A slot from a registration or a checkpoint entry.
-    fn rebuild(&mut self, event: Envelope, root: u16, at: Option<Location>, serial: u64, place: Place) -> Option<Index> {
+    fn rebuild(&mut self, event: Envelope, at: Option<Location>, serial: u64, place: Place) -> Option<Index> {
         let key = event.key?;
-        let fixed = Fixed {
-            id: event.id,
-            key,
-            event_type: event.event_type,
-            root,
-            principal: event.principal.map(|name| self.names.adopt(&name)),
-            delegate: event.delegate.map(|name| self.names.adopt(&name)),
-            group: event.group,
-            not_before: event.not_before,
-            durable: self.journaled,
-            registered_at: 0,
-            visible_from: 0,
-            digest: None,
-        };
-        let slot = Slot { fixed, channel: event.channel, isolated: event.isolated, failures: event.failures, expires: event.expires, place, commit: 0, serial, payload: event.payload, at };
+        let fixed = Fixed { id: event.id, key, event_type: event.event_type, not_before: event.not_before, durable: self.journaled, registered_at: 0, visible_from: 0, digest: None };
+        let slot = Slot { fixed, channel: event.channel, failures: event.failures, place, commit: 0, serial, payload: event.payload, at };
         Some(self.slots.insert(slot))
     }
 
@@ -109,14 +96,14 @@ impl State {
                 }
             }
             Replay::ProducerName { number, id } => self.producer_number(replayer, number, id),
-            Replay::Entry(Entry { event, root, at, serial, standing }) => {
+            Replay::Entry(Entry { event, at, serial, standing }) => {
                 let place = match standing {
                     Standing::Waiting => Place::Waiting,
                     Standing::Delayed { until } => Place::Delayed { until },
-                    Standing::Claimed { token, lease_ms, credential } => Place::Claimed(Attempt { token, lease_ms, until: 0, credential: self.names.adopt(&credential), join: None }),
+                    Standing::Claimed { token, lease_ms, worker } => Place::Claimed(Attempt { token, lease_ms, until: 0, worker, join: None }),
                 };
                 let key = event.key;
-                if let (Some(key), Some(index)) = (key, self.rebuild(event, root, at, serial, place)) {
+                if let (Some(key), Some(index)) = (key, self.rebuild(event, at, serial, place)) {
                     replayer.keys.insert(key, index);
                 }
             }
@@ -129,7 +116,7 @@ impl State {
         // The slot this record is about, if the record is newer than what it holds.
         let newer = |state: &State, key: &WorkKey| replayer.keys.get(key).copied().filter(|index| state.slots.get(*index).is_some_and(|slot| slot.serial < serial));
         match record {
-            Record::Register { event, root, at } => {
+            Record::Register { event, at } => {
                 let Some(key) = event.key else { return };
                 if let Some(index) = replayer.keys.get(&key).copied() {
                     // The checkpoint has it: only the payload's place can be news.
@@ -147,15 +134,14 @@ impl State {
                     Some(until) => Place::Delayed { until },
                     None => Place::Waiting,
                 };
-                if let Some(index) = self.rebuild(event, root, at, serial, place) {
+                if let Some(index) = self.rebuild(event, at, serial, place) {
                     replayer.keys.insert(key, index);
                 }
             }
             Record::Body { .. } => {}
-            Record::Claim { key, token, lease_ms, credential } => {
-                let credential = self.names.adopt(&credential);
+            Record::Claim { key, token, lease_ms, worker } => {
                 if let Some(slot) = newer(self, &key).and_then(|index| self.slots.get_mut(index)) {
-                    slot.place = Place::Claimed(Attempt { token, lease_ms, until: 0, credential, join: None });
+                    slot.place = Place::Claimed(Attempt { token, lease_ms, until: 0, worker, join: None });
                     slot.serial = serial;
                 }
             }
@@ -179,15 +165,6 @@ impl State {
                         Some(until) => Place::Delayed { until },
                         None => Place::Waiting,
                     };
-                    slot.serial = serial;
-                }
-            }
-            Record::Isolate { key, failures, expires } => {
-                if let Some(slot) = newer(self, &key).and_then(|index| self.slots.get_mut(index)) {
-                    slot.isolated = true;
-                    slot.failures = failures;
-                    slot.expires = expires;
-                    slot.place = Place::Waiting;
                     slot.serial = serial;
                 }
             }
@@ -226,14 +203,14 @@ impl State {
             if matches!(slot.place, Place::Delayed { until } if until <= uptime) {
                 slot.place = Place::Waiting;
             }
-            let (lane, key, expires, at) = (slot.lane(), slot.fixed.key, slot.expires, slot.at);
+            let (lane, key, at) = (slot.lane(), slot.fixed.key, slot.at);
             let due = match &mut slot.place {
                 Place::Claimed(attempt) => {
                     attempt.until = uptime.saturating_add(attempt.lease_ms);
                     Some((attempt.until, Due::Lease(attempt.token)))
                 }
                 Place::Delayed { until } => Some((*until, Due::Visible)),
-                Place::Waiting | Place::Held => None,
+                Place::Waiting => None,
             };
             match due {
                 Some((at, due)) => self.wheel.wake_at(at, index, generation, due),
@@ -241,24 +218,14 @@ impl State {
                     self.lane_mut(&lane).queue.insert(key, index);
                 }
             }
-            if let Some(at) = expires {
-                self.wheel.expire_at(at, index, generation);
-            }
             if let Some(at) = at {
                 self.book.live_add(&at);
             }
             if let Some(slot) = self.slots.get(index) {
                 let usage = self.usage(slot);
-                let root = slot.fixed.root;
-                self.account_add(root, usage);
+                self.account_add(usage);
             }
         }
-        // History before the restart is unknown: no recovered root counts as
-        // one that never drained.
-        for root in self.roots.values_mut() {
-            root.ended = root.ended.max(1);
-        }
-        self.grown.clear();
         let ids: Vec<ProducerId> = self.producers.entries.keys().copied().collect();
         for id in ids {
             if let Some(entry) = self.producers.entries.get_mut(&id) {

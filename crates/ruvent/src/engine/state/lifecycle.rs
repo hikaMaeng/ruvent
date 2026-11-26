@@ -1,13 +1,13 @@
-//! An event's way out and back: completion, release, lease expiry,
-//! isolation, expiry, and the moves between lane, hold lane and wheel (2.4).
+//! An event's way out and back: completion, release, lease expiry, and the
+//! moves between lane and wheel (2.4). The server counts failures and never
+//! acts on the count: what to do after so many is the worker's (requirement 6).
 
-use super::lanes::LaneKey;
 use super::slots::{Attempt, Index, Place, Slot};
 use super::wheel::Due;
 use super::State;
 use crate::engine::config::Method;
 use crate::engine::ops::{FaultKind, Outbound, SessionId};
-use crate::envelope::{ClaimToken, Digest, Envelope, EventId, Kind, WorkKey};
+use crate::envelope::{ClaimToken, Digest, Envelope, EventId, Kind};
 use crate::journal::{Location, Record, Spooled};
 use crate::names::Name;
 use std::collections::HashMap;
@@ -18,10 +18,9 @@ impl State {
     /// nothing happens. `spooled` gives the follow-ups whose payload the
     /// connection received to disk (2.6), by position.
     pub(super) fn complete(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)>) {
-        let Some(index) = self.attempt_for(session, credential, id, token) else { return };
-        let Some(event_type) = self.slots.get(index).map(|slot| slot.fixed.event_type) else { return };
-        if !self.allowed(credential, Method::Complete, event_type) {
-            return self.fault(session, FaultKind::Forbidden, "the credential may not complete here");
+        let Some(index) = self.attempt_for(session, id, token) else { return };
+        if !self.allowed(credential, Method::Complete) {
+            return self.fault(session, FaultKind::Forbidden, "the credential may not complete");
         }
         if follow_ups.len() > self.config.max_follow_ups {
             return self.fault(session, FaultKind::Malformed, "more follow-ups than one completion may register");
@@ -62,21 +61,15 @@ impl State {
         }
 
         let before = self.effects.records.len();
-        let Some(parent) = self.remove_event(index, kept.is_empty()) else { return };
+        let Some(parent) = self.remove_event(index) else { return };
         if parent.fixed.durable {
             self.record(Record::Remove(parent.fixed.key));
-        }
-        let children = kept.len() as u64;
-        let child_bytes: u64 = kept.iter().map(|(event, body)| body.map_or(event.payload.len() as u64, |at| u64::from(at.len))).sum();
-        let window = self.config.memory.net_growth_window;
-        if let Some(lane) = self.lanes.get_mut(&parent.lane()) {
-            lane.growth.record(parent.len(), children, child_bytes, window);
         }
         let mut dispatches = Vec::new();
         for (follow_up, body) in kept {
             match follow_up.kind {
                 Kind::Claimable => {
-                    self.enqueue(follow_up, parent.fixed.root, body);
+                    self.enqueue(follow_up, body);
                 }
                 Kind::Dispatch => dispatches.push(follow_up),
             }
@@ -91,7 +84,10 @@ impl State {
     /// `Release`: the worker gives the event back, visible again after
     /// `delay_ms`. Only `failed` counts against the event (2.4).
     pub(super) fn give_back(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, delay_ms: u64, failed: bool) {
-        let Some(index) = self.attempt_for(session, credential, id, token) else { return };
+        let Some(index) = self.attempt_for(session, id, token) else { return };
+        if !self.allowed(credential, Method::Complete) {
+            return self.fault(session, FaultKind::Forbidden, "the credential may not release");
+        }
         if self.end_attempt(index).is_none() {
             return;
         }
@@ -99,10 +95,6 @@ impl State {
         if failed {
             slot.failures = slot.failures.saturating_add(1);
         }
-        if failed && self.should_isolate(index) {
-            return self.isolate(index);
-        }
-        let Some(slot) = self.slots.get_mut(index) else { return };
         let (key, failures, durable) = (slot.fixed.key, slot.failures, slot.fixed.durable);
         let visible_at = (delay_ms > 0).then(|| self.now.saturating_add(delay_ms));
         if let Some(until) = visible_at {
@@ -145,10 +137,6 @@ impl State {
         self.counters.reclaimed += 1;
         let Some(slot) = self.slots.get_mut(index) else { return };
         slot.failures = slot.failures.saturating_add(1);
-        if self.should_isolate(index) {
-            return self.isolate(index);
-        }
-        let Some(slot) = self.slots.get(index) else { return };
         let (key, failures, durable) = (slot.fixed.key, slot.failures, slot.fixed.durable);
         if durable {
             self.record_for(index, Record::Reclaim { key, failures });
@@ -156,8 +144,7 @@ impl State {
         self.wait(index);
     }
 
-    /// Ends the attempt at `index`: the join gets its room back, the group is
-    /// free. The slot is left with no place; the caller gives it one.
+    /// Ends the attempt at `index`: the join gets its room back. The slot is left with no place; the caller gives it one.
     fn end_attempt(&mut self, index: Index) -> Option<Attempt> {
         let attempt = self.slots.get(index)?.attempt()?.clone();
         self.unclaim(index, &attempt);
@@ -167,10 +154,9 @@ impl State {
         Some(attempt)
     }
 
-    /// Takes an attempt off its join and its group.
+    /// Takes an attempt off its join.
     fn unclaim(&mut self, index: Index, attempt: &Attempt) {
-        let Some(slot) = self.slots.get(index) else { return };
-        let (len, group, channel, lane, event_type) = (slot.len(), slot.fixed.group, slot.channel, slot.lane(), slot.fixed.event_type);
+        let Some(len) = self.slots.get(index).map(Slot::len) else { return };
         if let Some(join_id) = &attempt.join {
             if let Some(join) = self.joins.get_mut(join_id) {
                 join.claimed = join.claimed.saturating_sub(1);
@@ -179,74 +165,13 @@ impl State {
                 self.to_fill.push(*join_id);
             }
         }
-        if let Some(group) = group {
-            if self.config.types.settings(event_type).serialize_group {
-                let key = (channel, group);
-                if let Some(count) = self.groups.get_mut(&key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.groups.remove(&key);
-                    }
-                }
-                self.to_offer.push(lane);
-            }
-        }
     }
 
-    fn should_isolate(&self, index: Index) -> bool {
-        self.slots.get(index).is_some_and(|slot| self.config.types.settings(slot.fixed.event_type).isolate_after.is_some_and(|limit| slot.failures >= limit))
-    }
-
-    /// Isolates the event in place (B6): it keeps its channel, type, root and
-    /// durability, gets its type's keep time as its expiry, and waits in its
-    /// isolated lane, where only joins that ask for isolated events take it.
-    /// The channel's subscribers get its notice with the isolated bit set, so
-    /// whoever waits on the channel learns the work gave up. An event that is
-    /// already isolated goes back to its isolated lane with its new failure
-    /// count and its expiry unchanged.
-    fn isolate(&mut self, index: Index) {
-        let Some(slot) = self.slots.get(index) else { return };
-        let again = slot.isolated;
-        let keep = super::millis(self.config.types.settings(slot.fixed.event_type).isolated_keep);
-        let expires = if again { slot.expires } else { Some(self.now.saturating_add(keep)) };
-        let generation = self.slots.generation(index);
-        let Some(slot) = self.slots.get_mut(index) else { return };
-        slot.isolated = true;
-        slot.expires = expires;
-        let (key, failures, durable) = (slot.fixed.key, slot.failures, slot.fixed.durable);
-        if let (false, Some(at)) = (again, expires) {
-            self.wheel.expire_at(at, index, generation);
-        }
-        if durable {
-            self.record_for(index, Record::Isolate { key, failures, expires });
-        }
-        if !again {
-            self.counters.isolated += 1;
-        }
-        self.wait(index);
-    }
-
-    /// An expired event is removed (or isolated, if its type says so and it
-    /// is not isolated yet) and counted; nobody is told (B9).
-    pub(super) fn expire(&mut self, index: Index) {
-        let Some(slot) = self.slots.get(index) else { return };
-        let settings = self.config.types.settings(slot.fixed.event_type);
-        if settings.isolate_expired && !slot.isolated {
-            self.take_out(index);
-            return self.isolate(index);
-        }
-        let Some(slot) = self.remove_event(index, true) else { return };
-        self.counters.expired += 1;
-        if slot.fixed.durable {
-            self.record(Record::Remove(slot.fixed.key));
-        }
-    }
-
-    /// Takes an event out of whatever holds it — lane, hold lane, wheel,
-    /// attempt — leaving it in the arena with no place.
+    /// Takes an event out of whatever holds it — lane, wheel, attempt —
+    /// leaving it in the arena with no place.
     fn take_out(&mut self, index: Index) {
         let Some(slot) = self.slots.get(index) else { return };
-        let (place, lane, key, root) = (slot.place.clone(), slot.lane(), slot.fixed.key, slot.fixed.root);
+        let (place, lane, key) = (slot.place.clone(), slot.lane(), slot.fixed.key);
         match place {
             Place::Waiting => {
                 if let Some(found) = self.lanes.get_mut(&lane) {
@@ -254,36 +179,24 @@ impl State {
                 }
                 self.tidy(&lane);
             }
-            Place::Held => self.unhold(root, &lane, key),
             Place::Delayed { .. } => {}
             Place::Claimed(attempt) => self.unclaim(index, &attempt),
         }
     }
 
     /// Takes an event out of the ledger wherever it is. Records nothing.
-    /// `ended`: its lineage ends here (a completion without follow-ups, a
-    /// deletion, an expiry), counted before the root's share goes down.
-    pub(super) fn remove_event(&mut self, index: Index, ended: bool) -> Option<Slot> {
+    pub(super) fn remove_event(&mut self, index: Index) -> Option<Slot> {
         self.take_out(index);
         let slot = self.slots.remove(index)?;
-        if ended {
-            if let Some(root) = self.roots.get_mut(&slot.fixed.root) {
-                root.ended += 1;
-            }
-        }
         let usage = self.usage(&slot);
-        self.account_remove(slot.fixed.root, usage);
+        self.account_remove(usage);
         self.free_payload(slot.at, slot.fixed.durable);
         Some(slot)
     }
 
-    /// Puts the event in its lane: waiting, announced, offered. An event that
-    /// expired meanwhile is expired instead.
+    /// Puts the event in its lane: waiting, announced, offered.
     pub(super) fn wait(&mut self, index: Index) {
         let Some(slot) = self.slots.get(index) else { return };
-        if slot.expires.is_some_and(|at| at <= self.now) {
-            return self.expire(index);
-        }
         let (lane, key, channel) = (slot.lane(), slot.fixed.key, slot.channel);
         let notice = slot.envelope().notice();
         if let Some(slot) = self.slots.get_mut(index) {
@@ -291,7 +204,7 @@ impl State {
         }
         self.lane_mut(&lane).queue.insert(key, index);
         let gate = self.gate_for(index);
-        for session in self.readers(&channel, false, lane.1) {
+        for session in self.subscribers.of(&channel, false) {
             self.send(session, Outbound::Notice(notice.clone()), gate);
         }
         match gate {
@@ -301,49 +214,6 @@ impl State {
                 }
             }
             None => self.to_offer.push(lane),
-        }
-    }
-
-    /// Moves a waiting event to its root's hold lane.
-    pub(super) fn hold(&mut self, index: Index) {
-        let Some(slot) = self.slots.get(index) else { return };
-        let (lane, key, root) = (slot.lane(), slot.fixed.key, slot.fixed.root);
-        if let Some(found) = self.lanes.get_mut(&lane) {
-            found.queue.remove(&key);
-        }
-        self.tidy(&lane);
-        if let Some(slot) = self.slots.get_mut(index) {
-            slot.place = Place::Held;
-        }
-        self.holds.entry((root, lane)).or_default().insert(key, index);
-        if let Some(paused) = self.roots.get_mut(&root).and_then(|root| root.paused.as_mut()) {
-            paused.holds.insert(lane);
-        }
-    }
-
-    pub(super) fn unhold(&mut self, root: u16, lane: &LaneKey, key: WorkKey) {
-        let hold = (root, *lane);
-        if let Some(held) = self.holds.get_mut(&hold) {
-            held.remove(&key);
-            if held.is_empty() {
-                self.holds.remove(&hold);
-            }
-        }
-    }
-
-    /// Puts a root's held events back in their lanes, ahead of what came
-    /// after them (they keep their work keys).
-    pub(super) fn release_holds(&mut self, root: u16) {
-        let lanes: Vec<LaneKey> = self.roots.get_mut(&root).and_then(|root| root.paused.as_mut()).map(|paused| paused.holds.drain().collect()).unwrap_or_default();
-        for lane in lanes {
-            let Some(held) = self.holds.remove(&(root, lane)) else { continue };
-            for (key, index) in held {
-                if let Some(slot) = self.slots.get_mut(index) {
-                    slot.place = Place::Waiting;
-                }
-                self.lane_mut(&lane).queue.insert(key, index);
-            }
-            self.to_offer.push(lane);
         }
     }
 
@@ -361,18 +231,6 @@ impl State {
                 Some(true) => self.reclaim(entry.index),
                 Some(false) => self.wait(entry.index),
                 None => {}
-            }
-        }
-    }
-
-    /// Expiries collected from the quiet side of the wheel: no timer wakes for
-    /// them, the batch that runs anyway does (2.4).
-    pub(super) fn purge_expired(&mut self) {
-        while let Some((at, index, generation)) = self.wheel.pop_expired(self.now) {
-            let Some(slot) = self.slots.current(index, generation) else { continue };
-            // A claimed event is checked when it comes back.
-            if slot.expires == Some(at) && slot.attempt().is_none() {
-                self.expire(index);
             }
         }
     }

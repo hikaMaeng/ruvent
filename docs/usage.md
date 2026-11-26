@@ -47,12 +47,11 @@ cargo run --release -p ruvent-server -- crates/ruvent-server/server.example.json
   "journal": "data/journal",
   "durability": "strict",
   "credentials": [
-    { "name": "workers", "token": "…", "methods": ["register_claimable", "register_dispatch", "claim", "complete"], "types": ["10-19", "100-199"] },
+    { "name": "workers", "token": "…", "methods": ["register_claimable", "register_dispatch", "claim", "complete"] },
     { "name": "ops", "token": "…", "methods": ["operate"] }
   ],
   "memory": { "limit": 8589934592 },
   "storage": { "disk_capacity": 107374182400 },
-  "types": { "rules": [ { "types": ["20-29"], "isolate_after": 3 }, { "types": ["100-199"], "volatile": true } ] },
   "connection": { "unsent": 268435456, "close_ms": 5000, "keepalive": { "idle_ms": 15000 } }
 }
 ```
@@ -60,11 +59,10 @@ cargo run --release -p ruvent-server -- crates/ruvent-server/server.example.json
 | 절 | 담는 것 |
 | --- | --- |
 | `journal` | 세그먼트 로그 디렉터리. 없으면 휘발 서버 |
-| `credentials` | 자격마다 토큰, 메서드(`operate`는 `Stats`·`Drain`), 타입 집합(`types`, 생략 = 모든 타입), 위임 허용 |
-| `engine`, `producers` | 누적 확인 N(S2), 재접속 유예(S20), 후속 상한(S10), 정지 뒤 허용량(S14), 생산자 순번표(B4, S15) |
-| `memory`, `storage` | 관리 메모리 상한과 수위(S5, S19, S22), 세그먼트·체크포인트·디스크 예산(S3, S4, S6) |
-| `types` | 타입 집합별 격리 문턱(B6), 만료 격리(B9), `max_backlog`(B17), `serialize_group`(B26), 휘발. 채널은 설정에 없다(이름 없는 UUIDv7) |
-| `connection` | 사전 상한(S18), 본문 상한(B13), 작은 본문 문턱(S11), 관찰 연결 미송신 상한(S7), 닫기 기한(S20), keepalive(S13) |
+| `credentials` | 자격마다 토큰과 메서드(`operate`는 `Stats`·`Drain`). 그보다 좁은 범위는 없다 |
+| `engine`, `producers` | 누적 확인 N(S2), 재접속 유예(S20), 후속 상한(S10), 생산자 순번표(B4, S15) |
+| `memory`, `storage` | 관리 메모리 상한과 수위(S5, S22, 넘으면 캐시된 본문을 내린다), 세그먼트·체크포인트·디스크 예산(S3, S4, S6) |
+| `connection` | 본문 상한(B13), 작은 본문 문턱(S11), 관찰 연결 미송신 상한(S7), 닫기 기한(S20), keepalive(S13) |
 
 모든 키와 기본값은 [crates/ruvent-server/README.md](../crates/ruvent-server/README.md)에 있다.
 Ctrl-C로 정상 종료한다: drain(생산 연결에 최종 확인과 `Bye{draining}`) → 나머지 연결에 `Bye{draining}` →
@@ -103,7 +101,6 @@ while let Ok(Some(observed)) = tokio::time::timeout(Duration::from_secs(30), inb
     match observed {
         // 이 채널로 오는 것은 모두 이 요청의 것. 끝 조건(예: 결과 타입)을 보고 구독을 푼다.
         Observed::Delivery { event, .. } if event.event_type == FRAGMENT => { /* 조각 */ }
-        Observed::Notice { event, .. } if event.isolated => break, // 요청이 격리됐다: 일을 포기했다
         _ => {}
     }
 }
@@ -150,11 +147,11 @@ while let Some(event) = events.recv().await { /* Arc<Envelope>를 클라이언�
 ## 워커가 정하는 것
 
 * 핸들러의 끝은 셋이다: `Ok(())`(완료, 영구 실패도 실패 후속과 함께 완료), `Err(Retry::later(지연))`(기본, 이벤트
-  탓 아님: 실패 횟수 그대로), `Err(Retry::failed(지연))`(이벤트 탓: 실패 횟수가 오른다). 몇 번까지인지는 서버의
-  타입 설정 `isolate_after`(기본 5)가 정하고, SDK는 횟수를 세지 않는다. 핸들러 없이 완료하는 경로도 없다. 격리된
-  이벤트는 제자리에 남고 `Service::typed().on(타입, …).isolated()`(또는 채널 서비스에 `.isolated()`)만 받는다.
+  탓 아님: 실패 횟수 그대로), `Err(Retry::failed(지연))`(이벤트 탓: 실패 횟수가 오른다). 몇 번까지인지는 핸들러가
+  `cx.failures()`를 보고 정한다. 서버는 세기만 하고 격리도 만료도 하지 않는다(계획 9.15). 그만둘 때는 `Ok(())`로 완료하고,
+  필요하면 실패 후속을 함께 낸다.
 * lease(기본 30초)는 SDK가 절반마다 자동으로 연장한다. 작업의 최대 시간은 실행 한도(이벤트 워커 30초,
-  `Service::executor` 1시간)다. 넘으면 끊고 `Release{실패 = 예}`로 돌려준다. 정지된 타입의 `cx.send`를
+  `Service::executor` 1시간)다. 넘으면 끊고 `Release{실패 = 예}`로 돌려준다. 미확인 버퍼가 차거나 서버가 없어 `cx.send`가
   기다리다 넘긴 실행은 실패로 세지 않는다.
 * 슬롯 P(`Service::slots`)를 서버들의 창에 나눈다. 창의 합은 P를 넘지 않고, 굶는 서버(`Pending`)가 있으면 슬롯
   하나씩 옮긴다(계획 2.4).

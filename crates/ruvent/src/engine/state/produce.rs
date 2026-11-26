@@ -18,11 +18,11 @@ fn delete_payload(id: EventId, failure: Option<DeleteFailure>) -> Bytes {
 }
 
 impl State {
-    /// Checks a registration request or a follow-up and resolves its names.
-    /// Faults (once per kind) and returns `None` when it may not be applied.
+    /// Checks a registration request or a follow-up. Faults (once per kind)
+    /// and returns `None` when it may not be applied.
     pub(super) fn admit(&mut self, session: SessionId, credential: &Name, event: Envelope) -> Option<Envelope> {
-        if event.failures != 0 || event.key.is_some() || event.principal.is_some() || event.isolated {
-            self.fault(session, FaultKind::Malformed, "a request may not carry failures, a work key, a principal or the isolated bit");
+        if event.failures != 0 || event.key.is_some() || event.claim.is_some() {
+            self.fault(session, FaultKind::Malformed, "a request may not carry failures, a work key or a claim mark");
             return None;
         }
         if !event.channel.is_valid() {
@@ -33,8 +33,8 @@ impl State {
             self.fault(session, FaultKind::Malformed, "type 0 is the server's own");
             return None;
         }
-        if event.kind == Kind::Dispatch && (event.not_before.is_some() || event.expires.is_some() || event.group.is_some()) {
-            self.fault(session, FaultKind::Malformed, "timing and group are for claimable events");
+        if event.kind == Kind::Dispatch && event.not_before.is_some() {
+            self.fault(session, FaultKind::Malformed, "not_before is for claimable events");
             return None;
         }
         if !event.id.is_nil() && !event.id.is_uuid() {
@@ -45,15 +45,10 @@ impl State {
             Kind::Claimable => Method::RegisterClaimable,
             Kind::Dispatch => Method::RegisterDispatch,
         };
-        if !self.allowed(credential, method, event.event_type) || (event.delegate.is_some() && !self.may_delegate(credential)) {
-            self.fault(session, FaultKind::Forbidden, "the credential may not register this type");
+        if !self.allowed(credential, method) {
+            self.fault(session, FaultKind::Forbidden, "the credential may not register this kind");
             return None;
         }
-        let mut event = event;
-        for name in [&mut event.delegate].into_iter().flatten() {
-            *name = self.names.adopt(name);
-        }
-        event.principal = Some(credential.clone());
         Some(event)
     }
 
@@ -71,9 +66,7 @@ impl State {
                         return self.same_id(session, index, &event, FaultKind::IdConflict);
                     }
                 }
-                let root = event.event_type;
-                self.pause_notice(session, root, event.payload.len() as u64);
-                self.enqueue(event, root, None);
+                self.enqueue(event, None);
             }
         }
     }
@@ -92,58 +85,47 @@ impl State {
     /// Queues an admitted claimable event (its id may still be nil) under
     /// `root`. `streamed`: its payload was received to disk there (2.6) and
     /// `event.payload` is empty.
-    pub(super) fn enqueue(&mut self, mut event: Envelope, root: u16, streamed: Option<Location>) -> Index {
+    pub(super) fn enqueue(&mut self, mut event: Envelope, streamed: Option<Location>) -> Index {
         let explicit = !event.id.is_nil();
         if !explicit {
             event.id = self.fresh_id();
         }
-        let durable = self.journaled && !self.config.types.settings(event.event_type).volatile;
+        let durable = self.journaled;
         let digest = match streamed {
             Some(at) => at.digest(),
             None => Digest::of(&event.payload),
         };
         let key = self.next_key();
         let not_before = event.not_before.map(|delay| self.now.saturating_add(delay));
-        let expires = event.expires.map(|life| self.now.saturating_add(life));
         let fixed = Fixed {
             id: event.id,
             key,
             event_type: event.event_type,
-            root,
-            principal: event.principal,
-            delegate: event.delegate,
-            group: event.group,
             not_before,
             durable,
             registered_at: self.now,
             visible_from: if durable { self.carrying } else { 0 },
             digest: explicit.then_some(digest),
         };
-        let slot = Slot { fixed, channel: event.channel, isolated: false, failures: 0, expires, place: Place::Waiting, commit: 0, serial: 0, payload: event.payload, at: streamed };
+        let slot = Slot { fixed, channel: event.channel, failures: 0, place: Place::Waiting, commit: 0, serial: 0, payload: event.payload, at: streamed };
         let usage = self.usage(&slot);
         let index = self.slots.insert(slot);
-        self.account_add(root, usage);
+        self.account_add(usage);
         let generation = self.slots.generation(index);
         if let Some(at) = streamed {
             // A streamed payload is live in its body segment from now on.
             self.book.live_add(&at);
-            if !durable {
-                self.counters.spilled_bytes += u64::from(at.len);
-            }
         }
         let envelope = self.slots.get(index).map(|slot| slot.envelope());
         if let Some(envelope) = envelope {
             if durable {
                 let serial = self.serial;
-                self.record_for(index, Record::Register { event: envelope.clone(), root, at: streamed });
+                self.record_for(index, Record::Register { event: envelope.clone(), at: streamed });
                 if streamed.is_none() {
                     self.unlocated.push_back((serial, index, generation));
                 }
             }
             self.observe(&envelope);
-        }
-        if let Some(at) = expires {
-            self.wheel.expire_at(at, index, generation);
         }
         match not_before {
             Some(until) if until > self.now => {
@@ -158,9 +140,9 @@ impl State {
     }
 
     /// Hands a dispatch event to the channel's subscribers and dispatch joins
-    /// as of now whose credential reads its type, and forgets it.
+    /// as of now, and forgets it.
     pub(super) fn deliver(&mut self, event: Envelope, gate: Option<u64>) {
-        for session in self.readers(&event.channel, true, event.event_type) {
+        for session in self.subscribers.of(&event.channel, true) {
             self.send(session, Outbound::Delivery(event.clone()), gate);
         }
         self.observe(&event);
@@ -172,22 +154,16 @@ impl State {
         }
     }
 
-    /// `Delete`: a waiting (or delayed, or held) event goes; the outcome is a
-    /// dispatch event of type 0 on `result` either way. The grant is checked
-    /// against the event's type when it is there, the method alone when not.
+    /// `Delete`: a waiting (or delayed) event goes; the outcome is a dispatch
+    /// event of type 0 on `result` either way.
     pub(super) fn delete(&mut self, session: SessionId, credential: &Name, id: EventId, result: Channel, key: Option<WorkKey>) {
         if !result.is_valid() {
             return self.fault(session, FaultKind::Malformed, "the result channel is not a UUIDv7");
         }
-        let found = self.slots.by_id(&id);
-        let event_type = found.and_then(|index| self.slots.get(index)).map(|slot| slot.fixed.event_type);
-        let granted = match event_type {
-            Some(event_type) => self.allowed(credential, Method::Delete, event_type),
-            None => self.has_method(credential, Method::Delete),
-        };
-        if !granted {
-            return self.fault(session, FaultKind::Forbidden, "the credential may not delete this type");
+        if !self.allowed(credential, Method::Delete) {
+            return self.fault(session, FaultKind::Forbidden, "the credential may not delete");
         }
+        let found = self.slots.by_id(&id);
         let failure = match found.and_then(|index| self.slots.get(index).map(|slot| (index, slot))) {
             None => Some(DeleteFailure::Missing),
             Some((_, slot)) if key.is_some_and(|key| key != slot.fixed.key) => Some(DeleteFailure::OtherRegistration),
@@ -196,14 +172,14 @@ impl State {
         };
         let mut gate = None;
         if let (None, Some(index)) = (failure, found) {
-            if let Some(slot) = self.remove_event(index, true) {
+            if let Some(slot) = self.remove_event(index) {
                 if slot.fixed.durable {
                     self.record(Record::Remove(slot.fixed.key));
                     gate = self.strict.then_some(self.carrying);
                 }
             }
         }
-        let notice = Envelope { id: self.fresh_id(), principal: Some(credential.clone()), ..Envelope::dispatch(result, SERVER_TYPE, delete_payload(id, failure)) };
+        let notice = Envelope { id: self.fresh_id(), ..Envelope::dispatch(result, SERVER_TYPE, delete_payload(id, failure)) };
         self.deliver(notice, gate);
     }
 }

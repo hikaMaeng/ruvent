@@ -6,15 +6,12 @@
     {
       "name": "workers",
       "token": "workers-secret-change-me",
-      "methods": ["register_claimable", "register_dispatch", "claim", "complete", "subscribe", "unsubscribe"],
-      "types": ["10-29", "100-199"]
+      "methods": ["register_claimable", "register_dispatch", "claim", "complete", "subscribe", "unsubscribe"]
     },
     {
       "name": "proxy",
       "token": "proxy-secret-change-me",
-      "methods": ["register_claimable", "register_dispatch", "delete", "claim", "complete", "subscribe", "unsubscribe"],
-      "types": ["10-19", "100-199"],
-      "delegate": true
+      "methods": ["register_claimable", "register_dispatch", "delete", "subscribe", "unsubscribe"]
     },
     {
       "name": "ops",
@@ -26,13 +23,6 @@
   "producers": { "linger_ms": 3600000, "max_entries": 1000000 },
   "memory": { "limit": 8589934592, "high_watermark": 0.8 },
   "storage": { "segment_bytes": 67108864, "disk_capacity": 107374182400 },
-  "types": {
-    "default": { "isolate_after": 5 },
-    "rules": [
-      { "types": ["20-29"], "isolate_after": 3, "serialize_group": true },
-      { "types": ["100-199"], "volatile": true }
-    ]
-  },
   "connection": {
     "unsent": 268435456,
     "close_ms": 5000,
@@ -40,7 +30,7 @@
   },
   "snapshot": {
     "directory": "data/snapshots",
-    "types": ["10-19"],
+    "types": [10, 11, 12],
     "max_events": 4096,
     "max_age_ms": 5000
   }

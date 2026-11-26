@@ -73,7 +73,7 @@ async fn deletion_removes_only_a_waiting_event_and_always_announces_its_outcome(
     let engine = Engine::volatile(EngineConfig::default()).await;
     let ((producer, _), (worker, mut assignments), (observer, mut inbox)) = roles(&engine, "svc").await;
     observer.subscribe(ch("results"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     let (_, waiting) = producer.register(work()).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let claimed = assignment(&mut assignments).await.event.id;
@@ -102,10 +102,10 @@ async fn a_claim_carries_the_attempt_and_the_time_out_the_worker_chose_and_compl
     let (_, id) = producer.register(work()).await.unwrap();
     let before = engine.uptime();
     let claimed = worker.claim(id, Duration::from_secs(90)).await.unwrap();
-    assert_eq!(claimed.lease_ms, 90_000, "the worker chose the time-out");
+    assert_eq!(claimed.lease_ms(), 90_000, "the worker chose the time-out");
     assert!(claimed.until >= before + 90_000, "the time it runs out at: {}", claimed.until);
     assert_eq!(claimed.event.id, id);
-    let seq = worker.complete(id, claimed.token, Vec::new()).await.unwrap();
+    let seq = worker.complete(id, claimed.token(), Vec::new()).await.unwrap();
     worker.committed(seq).await.unwrap();
     assert!(observer.subscribe(ch("work"), None).await.unwrap().notices.is_empty(), "completion removed it from the queue");
 }
@@ -121,20 +121,20 @@ async fn registration_claim_and_completion_are_idempotent_and_a_reclaimed_event_
     producer.register_committed(event.clone()).await.unwrap();
     assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices.len(), 1);
     // A lease that runs out gives the event back under the same id; the late report has no effect.
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(1), false).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(1), false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let first = assignment(&mut assignments).await;
     tokio::time::advance(Duration::from_secs(2)).await;
     let (other, mut others) = connect(&engine, Hello::worker("svc"), 64).await.unwrap();
-    let other_join = other.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    let other_join = other.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     other.window(other_join, 1, 0).await.unwrap();
     let second = assignment(&mut others).await;
     assert_eq!(second.event.id, event.id, "the logical id does not change");
-    let late = worker.complete(event.id, first.token, Vec::new()).await.unwrap();
+    let late = worker.complete(event.id, first.token(), Vec::new()).await.unwrap();
     worker.committed(late).await.unwrap();
     assert_eq!(observer.stats().await.unwrap().claimed, 1, "the stale completion changed nothing");
     // Completion: the right attempt removes it once.
-    let done = other.complete(event.id, second.token, Vec::new()).await.unwrap();
+    let done = other.complete(event.id, second.token(), Vec::new()).await.unwrap();
     other.committed(done).await.unwrap();
     assert_eq!(observer.stats().await.unwrap().claimed + observer.stats().await.unwrap().waiting, 0);
 }
@@ -147,13 +147,13 @@ async fn a_failure_is_a_completion_and_what_follows_is_new_events_the_worker_cho
     let ((producer, _), (worker, mut assignments), (observer, mut inbox)) = roles(&engine, "svc").await;
     observer.subscribe(ch("failures"), None).await.unwrap();
     observer.subscribe(ch("retry"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let (_, id) = producer.register(work()).await.unwrap();
     let claimed = assignment(&mut assignments).await;
     // The worker failed, and decided: report it, and try again as a new event.
     let follow_ups = vec![Envelope::dispatch(ch("failures"), 31, Bytes::from_static(b"boom")), Envelope::claimable(ch("retry"), 1, claimed.event.payload.clone())];
-    worker.complete(id, claimed.token, follow_ups).await.unwrap();
+    worker.complete(id, claimed.token(), follow_ups).await.unwrap();
     let mut seen = [next(&mut inbox).await, next(&mut inbox).await];
     seen.sort_by_key(|incoming| matches!(incoming, Incoming::Notice(_)));
     assert!(matches!(&seen[0], Incoming::Delivery(event) if event.event_type == 31));
@@ -172,7 +172,7 @@ async fn an_active_id_is_not_registered_twice_ids_are_uuidv7_and_a_departed_id_m
     assert!(matches!(next(&mut producer_inbox).await, Incoming::Fault { kind: ruvent::FaultKind::IdConflict, .. }), "other content under an active id is a conflict, told");
     assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices.len(), 1);
     let claimed = worker.claim(id, Duration::from_secs(5)).await.unwrap();
-    let seq = worker.complete(id, claimed.token, Vec::new()).await.unwrap();
+    let seq = worker.complete(id, claimed.token(), Vec::new()).await.unwrap();
     worker.committed(seq).await.unwrap();
     producer.register_committed(work().with_id(id)).await.unwrap();
     assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices[0].id, id, "not unique forever: once gone it may be used again");
@@ -208,7 +208,7 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
             }
             let (_, done) = producer.register_committed(work()).await.unwrap();
             let claimed = worker.claim(done, Duration::from_secs(5)).await.unwrap();
-            let seq = worker.complete(done, claimed.token, Vec::new()).await.unwrap();
+            let seq = worker.complete(done, claimed.token(), Vec::new()).await.unwrap();
             worker.committed(seq).await.unwrap();
             if !crash {
                 drop((producer, worker));
@@ -232,19 +232,29 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
 #[tokio::test]
 async fn one_small_envelope_carries_id_channel_failures_and_the_attempt_for_both_kinds() {
     let engine = Engine::volatile(EngineConfig::default()).await;
-    let ((producer, _), (worker, _), (observer, mut inbox)) = roles(&engine, "svc").await;
+    let (producer, _) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
+    let hello = Hello::worker("svc");
+    let worker_id = hello.producer.unwrap();
+    let (worker, _) = connect(&engine, hello, 64).await.unwrap();
+    let (observer, mut inbox) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
     let (_, id) = producer.register(Envelope::claimable(ch("work"), 1, Bytes::new())).await.unwrap();
     let claimed = worker.claim(id, Duration::from_secs(30)).await.unwrap();
     assert_eq!((claimed.event.id, claimed.event.channel, claimed.event.failures), (id, ch("work"), 0));
-    assert!(claimed.token.seq < u64::MAX && claimed.until > 0, "the attempt: a token and the time it runs out at");
-    let bare = Envelope { principal: None, ..claimed.event.clone() };
-    assert_eq!(codec::size(&bare, Layout::Assigned), 47, "38-byte head (id, channel id, type, flags, failures), a 5-byte work key, a 4-byte payload length: no names or addresses");
+    // The attempt is in the envelope: who took it (the worker's uuid), its token, its lease.
+    let mark = claimed.event.claim.expect("an assigned event carries its claim mark");
+    assert_eq!((mark.worker, mark.token, mark.lease_ms), (worker_id, claimed.token(), 30_000));
+    assert!(claimed.until > 0, "and the time it runs out at");
+    assert_eq!(
+        codec::size(&claimed.event, Layout::Assigned),
+        38 + 5 + (16 + 4 + 1 + 3) + 4,
+        "38-byte head (id, channel id, type, flags, failures), a 5-byte work key, the claim mark (worker 16, token, lease), a 4-byte payload length: no names or addresses"
+    );
     observer.subscribe(ch("feed"), None).await.unwrap();
     producer.register(Envelope::dispatch(ch("feed"), 30, Bytes::new())).await.unwrap();
     let Incoming::Delivery(sent) = next(&mut inbox).await else { panic!() };
-    // The same type, `Envelope`, for a dispatch event; 42 bytes without the server's principal.
+    // The same type, `Envelope`, for a dispatch event: the head and the payload length, 42 bytes.
     let sent: Envelope = sent;
-    assert_eq!(codec::size(&Envelope { principal: None, ..sent }, Layout::Delivery), 42);
+    assert_eq!(codec::size(&sent, Layout::Delivery), 42);
 }
 
 /// > 변하지 않는 원칙중에 하나는 이벤트는 반드시 하나의 워커가 가져간다는것이다. 혹은 발송되거나. 만약 둘이상의 워커나 프로세스에 할당되어야하면 이벤트 자체를 여러개 발급해야해.
@@ -275,11 +285,11 @@ async fn any_program_may_open_any_role_and_the_server_never_asks_what_it_is() {
     let ((_, _), (worker, mut assigned), (_, _)) = roles(&engine, "worker").await;
     let ((proxy_producer, _), (proxy_worker, _), (proxy, mut proxied)) = roles(&engine, "proxy").await;
     proxy.subscribe(ch("done"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let (_, id) = client.register(work()).await.unwrap();
     let claimed = assignment(&mut assigned).await;
-    worker.complete(id, claimed.token, vec![Envelope::dispatch(ch("done"), 32, Bytes::new())]).await.unwrap();
+    worker.complete(id, claimed.token(), vec![Envelope::dispatch(ch("done"), 32, Bytes::new())]).await.unwrap();
     assert!(matches!(next(&mut proxied).await, Incoming::Delivery(event) if event.channel == ch("done")));
     // And any of them may do what another did.
     let (_, again) = proxy_producer.register_committed(work()).await.unwrap();
@@ -322,7 +332,7 @@ async fn a_claim_does_not_wait_for_the_disk_even_under_strict() {
 async fn an_open_window_takes_work_as_it_arrives_without_a_request_per_event() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let ((producer, _), (worker, mut assignments), (observer, _)) = roles(&engine, "svc").await;
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     worker.window(worker_join, 64, 0).await.unwrap();
     for _ in 0..200 {
         producer.register(work()).await.unwrap();
@@ -330,7 +340,7 @@ async fn an_open_window_takes_work_as_it_arrives_without_a_request_per_event() {
     let mut done = 0;
     while done < 200 {
         let claimed = assignment(&mut assignments).await;
-        worker.complete(claimed.event.id, claimed.token, Vec::new()).await.unwrap();
+        worker.complete(claimed.event.id, claimed.token(), Vec::new()).await.unwrap();
         done += 1;
     }
     let stats = observer.stats().await.unwrap();
@@ -352,7 +362,7 @@ async fn registrations_are_not_answered_one_by_one_but_acknowledged_cumulatively
 
 /// > 거절은 안보내. 그런것들은 전부 부하를 일으켜 … 모든 부하를 클라이언트로 옮겨야 서버가 고가용상태가 된다.
 #[tokio::test]
-async fn a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_type_to_hold() {
+async fn a_full_server_refuses_nothing_and_holds_up_no_producer() {
     let memory = ruvent::MemoryConfig { limit: Some(40_000), slot_bytes: 1_000, ..ruvent::MemoryConfig::default() };
     let engine = Engine::volatile(EngineConfig { memory, ..EngineConfig::default() }).await;
     let (producer, mut inbox) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
@@ -362,11 +372,11 @@ async fn a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_type_t
         last = producer.register(work()).await.unwrap().0;
     }
     producer.committed(last).await.unwrap();
-    // The root paused at the end of a batch; the next registration to it is told.
+    // Past the memory limit: still applied and acknowledged, and nobody is told to hold (plan 9.15).
     let (more, _) = producer.register(work()).await.unwrap();
     producer.committed(more).await.unwrap();
-    assert_eq!(next(&mut inbox).await, Incoming::Paused(1), "flow control by the root type, not a refusal");
+    assert!(quiet(&mut inbox).await, "no refusal, no pause: a producer is never held up by the server");
     let stats = observer.stats().await.unwrap();
     assert_eq!(stats.waiting, 41, "every registration was applied");
-    assert!(stats.roots.iter().any(|root| root.root == 1 && root.paused));
+    assert!(stats.memory_used >= stats.memory_limit, "the limit was passed: {} of {}", stats.memory_used, stats.memory_limit);
 }

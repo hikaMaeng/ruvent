@@ -18,8 +18,6 @@ pub enum ProtocolError {
     TooLarge(usize),
     /// A body on a record that carries none.
     UnexpectedBody(u8),
-    /// A dictionary rule was broken: over its bound, or a number redefined without a reset.
-    Dictionary(&'static str),
     /// A text field was not UTF-8.
     Utf8,
     /// A code byte this version does not know.
@@ -37,7 +35,6 @@ impl fmt::Display for ProtocolError {
             ProtocolError::Version(version) => write!(f, "unsupported protocol version {version}"),
             ProtocolError::TooLarge(length) => write!(f, "{length} bytes exceed the bound"),
             ProtocolError::UnexpectedBody(tag) => write!(f, "record tag {tag:#04x} carries no body"),
-            ProtocolError::Dictionary(rule) => write!(f, "name dictionary: {rule}"),
             ProtocolError::Utf8 => f.write_str("text field is not UTF-8"),
             ProtocolError::UnknownCode(code) => write!(f, "unknown code {code}"),
             ProtocolError::Handshake(reason) => write!(f, "handshake: {reason}"),

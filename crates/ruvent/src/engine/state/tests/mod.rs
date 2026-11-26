@@ -12,9 +12,8 @@ mod timing;
 
 use super::slots::{Place, Slot};
 use super::*;
-use crate::engine::config::{Durability, Grant, MemoryConfig, TypeRule, TypeSettings};
+use crate::engine::config::{Durability, Grant, MemoryConfig};
 use crate::engine::ops::{Assignment, ByeReason, FaultKind, Hello, Outbound, Refusal, Role};
-use crate::types::TypeSet;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -43,9 +42,6 @@ pub struct H {
     joined: HashMap<(SessionId, String), u32>,
 }
 
-/// The tests' volatile type (a type rule, see [`config`]).
-pub const VOLATILE: u16 = 900;
-
 /// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
 pub fn ch(label: &str) -> Channel {
     let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
@@ -57,18 +53,10 @@ pub fn ch(label: &str) -> Channel {
     Channel(bytes)
 }
 
-/// A type rule over `types` with `settings`.
-pub fn rule(types: impl IntoIterator<Item = u16>, settings: TypeSettings) -> TypeRule {
-    TypeRule { types: TypeSet::of(types), settings }
-}
-
-/// The tests' engine: a memory limit far from every test's size, so no pause
-/// happens unless the test asks for one, and [`VOLATILE`] a volatile type (no
-/// default rule makes any type volatile).
+/// The tests' engine: a memory limit far from every test's size, so no
+/// payload is released unless the test asks for it.
 pub fn config() -> EngineConfig {
-    let mut config = EngineConfig { memory: MemoryConfig { limit: Some(1 << 40), ..MemoryConfig::default() }, ..EngineConfig::default() };
-    config.types.rules.insert(0, rule([VOLATILE], TypeSettings { volatile: true, ..TypeSettings::default() }));
-    config
+    EngineConfig { memory: MemoryConfig { limit: Some(1 << 40), ..MemoryConfig::default() }, ..EngineConfig::default() }
 }
 
 pub fn strict() -> EngineConfig {
@@ -76,7 +64,7 @@ pub fn strict() -> EngineConfig {
 }
 
 pub fn hello(role: Role, byte: u8) -> Hello {
-    Hello { role, credential: "svc".into(), producer: (role != Role::Observe).then_some([byte; 16]), nonce: [byte; 16], linger_ms: None, acks: true, types: Vec::new() }
+    Hello { role, credential: "svc".into(), producer: (role != Role::Observe).then_some([byte; 16]), nonce: [byte; 16], linger_ms: None, acks: true }
 }
 
 pub fn id(byte: u8) -> EventId {
@@ -89,11 +77,6 @@ pub fn id(byte: u8) -> EventId {
 /// A claimable event of type 1 on the channel labelled `channel`.
 pub fn work(channel: &str) -> Envelope {
     Envelope::claimable(ch(channel), 1, Bytes::from_static(b"p"))
-}
-
-/// A claimable event of the volatile type on the channel labelled `channel`.
-pub fn volatile(channel: &str) -> Envelope {
-    Envelope::claimable(ch(channel), VOLATILE, Bytes::from_static(b"p"))
 }
 
 /// What `session` was sent, in order (closes left out).
@@ -143,7 +126,7 @@ impl H {
         H { s, now: 0, durable: 1, carrying: 2, records, log, written: 0, firsts: HashMap::new(), seqs: HashMap::new(), joined: HashMap::new() }
     }
 
-    /// No journal: every channel volatile, every operation committed when applied.
+    /// No journal: nothing written, every operation committed when applied.
     pub fn volatile() -> H {
         Self::with(config(), false)
     }
@@ -278,7 +261,7 @@ impl H {
     pub fn join(&mut self, session: SessionId, channel: &str, count: u32) -> Effects {
         let req = 100 + self.joined.keys().filter(|(joiner, _)| *joiner == session).count() as u32;
         let req = *self.joined.entry((session, channel.to_string())).or_insert(req);
-        let mut effects = self.call(session, Call::Join { req, channel: Some(ch(channel)), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false });
+        let mut effects = self.call(session, Call::Join { req, channel: Some(ch(channel)), types: Vec::new(), lease_ms: 30_000, dispatch: false });
         let more = self.call(session, Call::Window { join: req, count, bytes: 0 });
         effects.sends.extend(more.sends);
         effects
@@ -291,7 +274,7 @@ impl H {
 
     pub fn complete(&mut self, session: SessionId, assignment: &Assignment, follow_ups: Vec<Envelope>) -> Effects {
         let seq = self.next_seq(session);
-        self.call(session, Call::Complete { seq, id: assignment.event.id, token: assignment.token, follow_ups, spooled: Vec::new() })
+        self.call(session, Call::Complete { seq, id: assignment.event.id, token: assignment.token(), follow_ups, spooled: Vec::new() })
     }
 
     /// The slot holding `id`.

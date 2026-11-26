@@ -29,7 +29,7 @@ mod unsent;
 mod write;
 
 use ruvent::Engine;
-use ruvent_protocol::{features, DICTIONARY, DIRECT, INLINE, MAX_BODY};
+use ruvent_protocol::{features, DIRECT, INLINE, MAX_BODY};
 use socket::Keepalive;
 use std::collections::HashMap;
 use std::future::Future;
@@ -68,8 +68,6 @@ impl Credentials {
 /// with its default (plan chapter 8 is configuration, not constants).
 #[derive(Clone, Copy, Debug)]
 pub struct ServerOptions {
-    /// S18: bound on each direction's name dictionary.
-    pub dictionary: usize,
     /// B13: the largest body one record may carry.
     pub max_body: usize,
     /// S11: a body below this many bytes is copied next to its head when sent.
@@ -97,7 +95,6 @@ pub struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         ServerOptions {
-            dictionary: DICTIONARY,
             max_body: MAX_BODY,
             inline: INLINE,
             direct: DIRECT,
@@ -182,8 +179,8 @@ async fn connection(stream: TcpStream, engine: Engine, credentials: Arc<Credenti
     let _ = socket::tune(&stream, &options.keepalive);
     let (read, write) = stream.into_split();
     let mut reader = ruvent_protocol::RecordReader::with_limits(read, options.direct, options.max_body);
-    let mut decoder = ruvent_protocol::Decoder::new(ruvent_protocol::Side::Server, options.dictionary);
-    let encoder = ruvent_protocol::Encoder::new(options.dictionary).with_features(options.features).with_inline(options.inline).with_max_body(options.max_body);
+    let mut decoder = ruvent_protocol::Decoder::new(ruvent_protocol::Side::Server);
+    let encoder = ruvent_protocol::Encoder::new().with_features(options.features).with_inline(options.inline).with_max_body(options.max_body);
     let hello = match handshake::hello(&mut reader, &mut decoder, &credentials, options.handshake).await {
         Ok(hello) => hello,
         Err(refusal) => {

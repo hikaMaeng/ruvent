@@ -70,7 +70,7 @@ impl fmt::Display for Closed {
 impl std::error::Error for Closed {}
 
 pub(crate) enum Op {
-    Open { session: SessionId, hello: Hello, out: mpsc::Sender<Outbound>, reading: watch::Sender<bool> },
+    Open { session: SessionId, hello: Hello, out: mpsc::Sender<Outbound> },
     Close { session: SessionId, unwritten: Vec<ClaimToken> },
     Call { session: SessionId, call: Call },
     Drain,
@@ -105,8 +105,6 @@ pub struct Engine {
     server_id: [u8; 16],
     gauge: Arc<Gauge>,
     spool: Option<Spool>,
-    journaled: bool,
-    config: Arc<EngineConfig>,
 }
 
 /// One connection to the engine, below the client API: send calls, read
@@ -115,7 +113,6 @@ pub struct Engine {
 pub struct Session {
     pub id: SessionId,
     ops: mpsc::Sender<Op>,
-    reading: watch::Receiver<bool>,
     closed: bool,
 }
 
@@ -133,13 +130,6 @@ impl Session {
     pub async fn close(mut self, unwritten: Vec<ClaimToken>) {
         self.closed = true;
         let _ = self.ops.send(Op::Close { session: self.id, unwritten }).await;
-    }
-
-    /// `false` while the ledger wants this connection's reading stopped: a
-    /// production connection that kept writing to a paused root (2.6). The
-    /// connection owner watches it.
-    pub fn reading(&self) -> watch::Receiver<bool> {
-        self.reading.clone()
     }
 }
 
@@ -266,29 +256,15 @@ impl Engine {
         };
         core.route(effects);
         tokio::spawn(core.run());
-        Ok(Engine {
-            ops,
-            next_session: Arc::new(AtomicU64::new(1)),
-            stopped,
-            outbound: config.outbound.max(1),
-            snapshot,
-            clock,
-            generation,
-            server_id,
-            gauge,
-            spool,
-            journaled,
-            config: Arc::new(config),
-        })
+        Ok(Engine { ops, next_session: Arc::new(AtomicU64::new(1)), stopped, outbound: config.outbound.max(1), snapshot, clock, generation, server_id, gauge, spool })
     }
 
     /// Opens a connection. Its first message is `Welcome`, or `Bye`.
     pub async fn open(&self, hello: Hello) -> Result<(Session, mpsc::Receiver<Outbound>), Closed> {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
         let (out, rx) = mpsc::channel(self.outbound);
-        let (reading, watching) = watch::channel(true);
-        self.ops.send(Op::Open { session, hello, out, reading }).await.map_err(|_| Closed)?;
-        Ok((Session { id: session, ops: self.ops.clone(), reading: watching, closed: false }, rx))
+        self.ops.send(Op::Open { session, hello, out }).await.map_err(|_| Closed)?;
+        Ok((Session { id: session, ops: self.ops.clone(), closed: false }, rx))
     }
 
     /// Starts draining without an operator connection: what `Call::Drain`
@@ -335,26 +311,18 @@ impl Engine {
     }
 
     /// Whether a work connection should receive a follow-up's body of `len`
-    /// bytes of `event_type` to disk instead of memory (2.6, items 4 and 5):
-    ///
-    /// * a durable type, once managed memory is at the high watermark;
-    /// * a volatile type, only once memory past the reserve would be used
-    ///   (B15: the event stays volatile, its body on disk until a restart).
+    /// bytes to disk instead of memory (2.6, item 4): once managed memory is
+    /// at the high watermark.
     ///
     /// When it says yes, read the body through [`Engine::spool`] and hand the
     /// [`crate::journal::Spooled`] with the completion (`Call::Complete::spooled`).
     /// Always `false` without a spool (no segment log).
-    pub fn body_to_disk(&self, event_type: u16, len: u64) -> bool {
+    pub fn body_to_disk(&self, len: u64) -> bool {
         if self.spool.is_none() {
             return false;
         }
         let pressure = self.gauge.get();
-        let durable = self.journaled && !self.config.types.settings(event_type).volatile;
-        if durable {
-            pressure.memory_used.saturating_add(len) >= pressure.memory_high
-        } else {
-            pressure.memory_used.saturating_add(len) > pressure.memory_limit
-        }
+        pressure.memory_used.saturating_add(len) >= pressure.memory_high
     }
 
     /// Where streamed follow-up bodies are received, if the journal has one.
@@ -452,14 +420,13 @@ async fn due(after: Option<u64>) {
 /// | bound | open connections |
 struct Conn {
     out: mpsc::Sender<Outbound>,
-    reading: watch::Sender<bool>,
 }
 
 /// The tokens of the assignments in held sends: never written to the socket.
 fn tokens(held: VecDeque<Held>) -> Vec<ClaimToken> {
     held.into_iter()
         .filter_map(|held| match held.message {
-            Some(Outbound::Assign(assignment)) | Some(Outbound::Claimed { assignment, .. }) => Some(assignment.token),
+            Some(Outbound::Assign(assignment)) | Some(Outbound::Claimed { assignment, .. }) => Some(assignment.token()),
             _ => None,
         })
         .collect()
@@ -624,8 +591,8 @@ impl Core {
         self.begin();
         for op in batch.drain(..) {
             match op {
-                Op::Open { session, hello, out, reading } => {
-                    self.conns.insert(session, Conn { out, reading });
+                Op::Open { session, hello, out } => {
+                    self.conns.insert(session, Conn { out });
                     self.state.open(session, hello);
                 }
                 Op::Close { session, mut unwritten } => {
@@ -713,11 +680,6 @@ impl Core {
                     self.gated.entry(gate).or_default().push(send.session);
                 }
                 self.held.entry(send.session).or_default().push_back(Held { gate, read, message: send.message });
-            }
-            for (session, reading) in effects.reading {
-                if let Some(conn) = self.conns.get(&session) {
-                    let _ = conn.reading.send(reading);
-                }
             }
             if !effects.records.is_empty() {
                 if self.pending.is_empty() {

@@ -22,7 +22,7 @@ impl Default for ProducerConfig {
     }
 }
 
-/// S5, S19, S22: managed memory and channel pause. Ratios are fractions.
+/// S5, S22: managed memory and its watermark. Ratios are fractions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryConfig {
     /// The managed memory limit in bytes. `None`: half the physical memory
@@ -30,25 +30,20 @@ pub struct MemoryConfig {
     pub limit: Option<u64>,
     /// Kept back from the budget for completions, checkpoints and relocation.
     pub reserve: f64,
-    /// The high watermark, of the budget left after paused roots' shares.
+    /// The high watermark, of the budget: cached payloads are released past it.
     pub high_watermark: f64,
-    /// A paused root resumes below this fraction of its share at the pause.
+    /// Cached payloads are released down to this fraction of the high watermark.
     pub release: f64,
-    /// S19: a root none of whose lineages has ended is paused at this
-    /// fraction of the budget.
-    pub early_pause: f64,
-    /// S19: completions per lane over which "net growth" is judged.
-    pub net_growth_window: u32,
     /// Managed bytes counted per event, besides its payload (metadata).
     pub slot_bytes: u64,
-    /// S22: the queue depth the budget should hold without pausing producers.
-    /// Compared once at start; reported in `Stats`.
+    /// S22: the queue depth the budget should hold. Reported in `Stats`;
+    /// nothing is paused or refused when it is passed.
     pub depth_target: u64,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { limit: None, reserve: 0.10, high_watermark: 0.80, release: 0.875, early_pause: 0.125, net_growth_window: 256, slot_bytes: 180, depth_target: 100_000_000 }
+        Self { limit: None, reserve: 0.10, high_watermark: 0.80, release: 0.875, slot_bytes: 180, depth_target: 100_000_000 }
     }
 }
 

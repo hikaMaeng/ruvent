@@ -41,7 +41,7 @@ pub(super) struct Unsent {
 /// The token of an assignment message.
 pub(super) fn token_of(message: &Outbound) -> Option<ClaimToken> {
     match message {
-        Outbound::Assign(assignment) | Outbound::Claimed { assignment, .. } => Some(assignment.token),
+        Outbound::Assign(assignment) | Outbound::Claimed { assignment, .. } => Some(assignment.token()),
         _ => None,
     }
 }

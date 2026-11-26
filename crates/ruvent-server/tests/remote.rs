@@ -4,10 +4,10 @@
 
 use ruvent::{
     Assignment, ByeReason, Bytes, Call, Channel, Client, Engine, EngineConfig, Envelope, EventId, FaultKind, Grant, Grants, Hello, Inbox, Incoming, MemoryConfig, Method, Methods, Name, Outbound,
-    Refusal, Role, SegmentLog, TypeSet, Welcome,
+    Refusal, Role, SegmentLog, Welcome,
 };
 use ruvent_client::remote::{connect, Options, Refused};
-use ruvent_protocol::{features, Body, Decoder, Encoder, Message, RecordReader, Side, DICTIONARY, VERSION};
+use ruvent_protocol::{features, Body, Decoder, Encoder, Message, RecordReader, Side, VERSION};
 use ruvent_server::{serve, Credentials, ServerOptions};
 use std::io;
 use std::path::PathBuf;
@@ -27,8 +27,6 @@ const WAIT: Duration = Duration::from_secs(10);
 /// How long "nothing arrives" is watched for.
 const QUIET: Duration = Duration::from_millis(150);
 const LEASE: Duration = Duration::from_secs(60);
-/// The tests' volatile type (plan 9.15: volatility is a type's setting).
-const VOLATILE: u16 = 900;
 
 struct Server {
     address: String,
@@ -118,7 +116,7 @@ pub fn ch(label: &str) -> Channel {
 }
 
 fn raw_hello(role: Role, producer: [u8; 16], nonce: [u8; 16]) -> Hello {
-    Hello { role, credential: Name::new(""), producer: (role != Role::Observe).then_some(producer), nonce, linger_ms: None, acks: true, types: Vec::new() }
+    Hello { role, credential: Name::new(""), producer: (role != Role::Observe).then_some(producer), nonce, linger_ms: None, acks: true }
 }
 
 /// One wire v2 connection driven by hand.
@@ -172,7 +170,7 @@ impl Raw {
         let stream = TcpStream::connect(address).await.unwrap();
         stream.set_nodelay(true).unwrap();
         let (read, write) = stream.into_split();
-        let mut raw = Raw { reader: RawReader { reader: RecordReader::new(read), decoder: Decoder::new(Side::Client, DICTIONARY) }, writer: RawWriter { write, encoder: Encoder::new(DICTIONARY) } };
+        let mut raw = Raw { reader: RawReader { reader: RecordReader::new(read), decoder: Decoder::new(Side::Client) }, writer: RawWriter { write, encoder: Encoder::new() } };
         raw.writer.send([Message::Hello { version: VERSION, features: features::ALL, token: token.into(), hello }]).await.unwrap();
         let first = raw.reader.expect().await;
         (raw, first)
@@ -216,46 +214,49 @@ async fn each_role_does_its_own_work_over_tcp() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let server = server(&engine).await;
     let (producer, _produced) = dial(&server, Hello::producer("x")).await;
-    let (worker, mut work) = dial(&server, Hello::worker("x")).await;
+    let worker_hello = Hello::worker("x");
+    let worker_uuid = worker_hello.producer.unwrap();
+    let (worker, mut work) = dial(&server, worker_hello).await;
     let (observer, mut seen) = dial(&server, Hello::observer("x")).await;
     observer.subscribe(ch("feed"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("orders")), Vec::new(), false, LEASE, false).await.unwrap();
+    let worker_join = worker.join(Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 4, 0).await.unwrap();
 
     let (seq, id) = producer.register(job("orders", b"p")).await.unwrap();
     producer.committed(seq).await.unwrap();
     let assigned = assignment(&mut work).await;
-    assert_eq!((assigned.event.id, assigned.event.payload.as_ref(), assigned.event.principal.as_deref()), (id, &b"p"[..], Some("svc")));
+    assert_eq!((assigned.event.id, assigned.event.payload.as_ref()), (id, &b"p"[..]));
+    let claim = assigned.event.claim.expect("an assignment carries its claim mark");
+    assert_eq!((claim.worker, claim.token, claim.lease_ms), (worker_uuid, assigned.token(), LEASE.as_millis() as u64), "the claim mark names the worker's uuid");
     assert!(assigned.until > 0 && assigned.until <= LEASE.as_millis() as u64, "the lease left when it was written: {}", assigned.until);
-    let done = worker.complete(id, assigned.token, vec![Envelope::dispatch(ch("feed"), 2, Bytes::from_static(b"x"))]).await.unwrap();
+    let done = worker.complete(id, assigned.token(), vec![Envelope::dispatch(ch("feed"), 2, Bytes::from_static(b"x"))]).await.unwrap();
     worker.committed(done).await.unwrap();
     let created = delivery(&mut seen).await;
-    assert_eq!((created.event_type, created.payload.as_ref(), created.principal.as_deref()), (2, &b"x"[..], Some("svc")));
+    assert_eq!((created.event_type, created.payload.as_ref(), created.claim), (2, &b"x"[..], None));
 
     let (_, posted) = producer.register(Envelope::dispatch(ch("feed"), 3, Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
     assert_eq!(delivery(&mut seen).await.id, posted);
-    assert_eq!(producer.join(Some(ch("orders")), Vec::new(), false, LEASE, false).await, Err(Refusal::Malformed));
+    assert_eq!(producer.join(Some(ch("orders")), Vec::new(), LEASE, false).await, Err(Refusal::Malformed));
     let stats = observer.stats().await.unwrap();
     assert_eq!((stats.waiting, stats.claimed), (0, 0));
 }
 
-/// A wrong token, a production connection declaring a type it may not
+/// A wrong token, a production connection whose credential may not
 /// register, and an observer asking for what its grant lacks are refused
-/// with their reason (2.7). Grants are by type (plan 9.15): a subscription
-/// is the method alone, and hands the reader only the types it is granted;
-/// a channel that is not a UUIDv7 is refused as malformed.
+/// with their reason (2.7). A grant is methods alone (plan 9.15): a
+/// subscription hands the reader every type on the channel; a channel that is
+/// not a UUIDv7 is refused as malformed.
 #[tokio::test]
-async fn a_wrong_token_and_a_forbidden_type_are_refused_with_their_reason() {
+async fn a_wrong_token_and_a_forbidden_method_are_refused_with_their_reason() {
     let mut grants = Grants::new();
     grants.insert("svc".into(), Grant::all());
-    grants.insert("reader".into(), Grant { methods: vec![Method::Subscribe, Method::Unsubscribe], types: TypeSet::from_ranges([(100, 199)]), delegate: false });
+    grants.insert("reader".into(), Grant { methods: vec![Method::Subscribe, Method::Unsubscribe] });
     let engine = Engine::volatile(EngineConfig { grants: Some(grants), ..EngineConfig::default() }).await;
     let server = server(&engine).await;
     let error = connect(&server.address, "nope", Hello::producer("x"), Options::default()).await.err().unwrap();
     assert_eq!((error.kind(), Refused::of(&error)), (io::ErrorKind::PermissionDenied, Some(ByeReason::Token)));
-    let declared = Hello { types: vec![150], ..Hello::producer("x") };
-    let error = connect(&server.address, "reader-token", declared, Options::default()).await.err().unwrap();
-    assert_eq!(Refused::of(&error), Some(ByeReason::Forbidden), "it may read type 150, not register it");
+    let error = connect(&server.address, "reader-token", Hello::producer("x"), Options::default()).await.err().unwrap();
+    assert_eq!(Refused::of(&error), Some(ByeReason::Forbidden), "it may read, not register");
     let (reader, mut inbox) = connect(&server.address, "reader-token", Hello::observer("x"), Options::default()).await.unwrap();
     assert_eq!(reader.subscribe(Channel([0; 16]), None).await, Err(Refusal::Malformed));
     assert!(reader.subscribe(ch("pub.news"), None).await.is_ok());
@@ -263,7 +264,7 @@ async fn a_wrong_token_and_a_forbidden_type_are_refused_with_their_reason() {
     for event_type in [5, 150] {
         producer.register_committed(Envelope::dispatch(ch("pub.news"), event_type, Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
     }
-    assert_eq!(delivery(&mut inbox).await.event_type, 150, "type 5 is not the reader's to read");
+    assert_eq!((delivery(&mut inbox).await.event_type, delivery(&mut inbox).await.event_type), (5, 150), "every type on the channel");
     assert_eq!(reader.stats().await, Err(Refusal::Forbidden));
     assert_eq!(reader.drain().await, Err(Refusal::Forbidden));
 }
@@ -356,13 +357,13 @@ async fn a_window_takes_work_up_to_its_size_and_a_completion_frees_a_slot() {
         producer.register_committed(Envelope::claimable(ch("orders"), 1, Bytes::from_static(payload))).await.unwrap();
     }
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    let worker_join = worker.join(Some(ch("orders")), Vec::new(), false, LEASE, false).await.unwrap();
+    let worker_join = worker.join(Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 2, 0).await.unwrap();
     let first = assignment(&mut work).await;
     let second = assignment(&mut work).await;
     assert!(second.more, "the window is full and one more waits");
     assert!(tokio::time::timeout(QUIET, assignment(&mut work)).await.is_err(), "no more than the window");
-    let seq = worker.complete(first.event.id, first.token, Vec::new()).await.unwrap();
+    let seq = worker.complete(first.event.id, first.token(), Vec::new()).await.unwrap();
     let third = assignment(&mut work).await;
     worker.committed(seq).await.unwrap();
     let mut payloads = vec![first.event.payload, second.event.payload, third.event.payload];
@@ -381,12 +382,12 @@ async fn a_large_body_arrives_whole() {
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
     let (observer, mut seen) = dial(&server, Hello::observer("x")).await;
     observer.subscribe(ch("feed"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("big")), Vec::new(), false, LEASE, false).await.unwrap();
+    let worker_join = worker.join(Some(ch("big")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     producer.register_committed(Envelope::claimable(ch("big"), 1, body.clone())).await.unwrap();
     let assigned = assignment(&mut work).await;
     assert_eq!(assigned.event.payload, body);
-    worker.complete(assigned.event.id, assigned.token, vec![Envelope::dispatch(ch("feed"), 5, body.clone())]).await.unwrap();
+    worker.complete(assigned.event.id, assigned.token(), vec![Envelope::dispatch(ch("feed"), 5, body.clone())]).await.unwrap();
     assert_eq!(delivery(&mut seen).await.payload, body);
     // Over the bound, the client refuses it before it leaves (B13).
     let over = Bytes::from(vec![0u8; ruvent_protocol::MAX_BODY + 1]);
@@ -395,44 +396,37 @@ async fn a_large_body_arrives_whole() {
 }
 
 /// Under memory pressure a work connection does not stop reading: a
-/// follow-up's body is streamed to disk. The durable one survives a restart
-/// pointing at its body; the volatile one past the reserve is counted
-/// (2.6 items 4 and 5, B15).
+/// follow-up's body is streamed to disk, and the event survives a restart
+/// pointing at its body (2.6 item 4). Nothing pauses the producer meanwhile.
 #[tokio::test]
 async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
     let path = scratch("spool");
     let durable_body = Bytes::from(vec![7u8; 20_000]);
-    let volatile_body = Bytes::from(vec![9u8; 32]);
     {
-        let memory = MemoryConfig { limit: Some(10_000), slot_bytes: 100, early_pause: 1.0, ..MemoryConfig::default() };
-        let engine = durable(&path, {
-            let mut config = EngineConfig { memory, ..EngineConfig::default() };
-            config.types.rules.insert(0, ruvent::TypeRule { types: TypeSet::of([VOLATILE]), settings: ruvent::TypeSettings { volatile: true, ..ruvent::TypeSettings::default() } });
-            config
-        })
-        .await;
+        let memory = MemoryConfig { limit: Some(10_000), slot_bytes: 100, ..MemoryConfig::default() };
+        let engine = durable(&path, EngineConfig { memory, ..EngineConfig::default() }).await;
         let server = server(&engine).await;
         let (producer, _) = dial(&server, Hello::producer("x")).await;
         let (worker, mut work) = dial(&server, Hello::worker("x")).await;
         producer.register_committed(job("work", b"p")).await.unwrap();
-        let worker_join = worker.join(Some(ch("work")), Vec::new(), false, LEASE, false).await.unwrap();
+        let worker_join = worker.join(Some(ch("work")), Vec::new(), LEASE, false).await.unwrap();
         worker.window(worker_join, 1, 0).await.unwrap();
         let assigned = assignment(&mut work).await;
         for _ in 0..11 {
-            producer.register_committed(Envelope::claimable(ch("scratch.x"), VOLATILE, Bytes::from(vec![0u8; 1000]))).await.unwrap();
+            producer.register_committed(Envelope::claimable(ch("filler"), 2, Bytes::from(vec![0u8; 1000]))).await.unwrap();
         }
-        assert!(engine.body_to_disk(1, durable_body.len() as u64) && engine.body_to_disk(VOLATILE, volatile_body.len() as u64), "{:?}", engine.pressure());
-        let follow_ups = vec![Envelope::claimable(ch("next"), 1, durable_body.clone()), Envelope::claimable(ch("scratch.y"), VOLATILE, volatile_body.clone())];
-        let seq = worker.complete(assigned.event.id, assigned.token, follow_ups).await.unwrap();
+        assert!(engine.body_to_disk(durable_body.len() as u64), "{:?}", engine.pressure());
+        let follow_ups = vec![Envelope::claimable(ch("next"), 1, durable_body.clone())];
+        let seq = worker.complete(assigned.event.id, assigned.token(), follow_ups).await.unwrap();
         worker.committed(seq).await.unwrap();
-        assert_eq!(stats(&server).await.counters.spilled_bytes, volatile_body.len() as u64, "the volatile body went to disk");
+        assert_eq!(stats(&server).await.waiting, 12, "every registration was taken: nothing paused the producer");
         drop((producer, worker));
         server.stop().await;
     }
     let engine = durable(&path, EngineConfig::default()).await;
     let server = server(&engine).await;
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    let worker_join = worker.join(Some(ch("next")), Vec::new(), false, LEASE, false).await.unwrap();
+    let worker_join = worker.join(Some(ch("next")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     assert_eq!(assignment(&mut work).await.event.payload, durable_body);
 }
@@ -545,12 +539,10 @@ async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
         let (producer, _) = dial(&server, Hello::producer("x")).await;
         let (_, id) = producer.register_committed(job("work", b"p")).await.unwrap();
         let (mut worker, welcome) = Raw::welcomed(&server.address, raw_hello(Role::Work, [21; 16], [22; 16])).await;
-        worker
-            .send([call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false }), call(Call::Window { join: 1, count: 1, bytes: 0 })])
-            .await;
+        worker.send([call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }), call(Call::Window { join: 1, count: 1, bytes: 0 })]).await;
         assert_eq!(worker.expect().await, Message::Outbound(Outbound::Joined { req: 1 }));
         let token = match worker.expect().await {
-            Message::Outbound(Outbound::Assign(assignment)) => assignment.token,
+            Message::Outbound(Outbound::Assign(assignment)) => assignment.token(),
             other => panic!("expected an assignment, got {other:?}"),
         };
         drop(producer);
@@ -570,7 +562,7 @@ async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
     assert!(welcome.generation > generation);
     worker
         .send([
-            call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false }),
+            call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }),
             call(Call::Window { join: 1, count: 1, bytes: 0 }),
             call(Call::Extend { id, token }),
             call(Call::Complete { seq: 1, id, token, follow_ups: Vec::new(), spooled: Vec::new() }),
@@ -640,7 +632,7 @@ async fn version_1_and_other_versions_are_refused() {
     assert_eq!(&answer[4..9], &[1, 0, 0, 0, 0x03], "one record: bye");
     assert!(String::from_utf8_lossy(&answer).contains("unsupported protocol version 1"));
 
-    let mut encoder = Encoder::new(DICTIONARY);
+    let mut encoder = Encoder::new();
     encoder.push(&Message::Hello { version: VERSION, features: 0, token: TOKEN.into(), hello: Hello::producer("x") }).unwrap();
     let mut bytes = encoder.take().concat();
     // Version 3 (the type as a name number) is another version now.
@@ -648,7 +640,7 @@ async fn version_1_and_other_versions_are_refused() {
     let stream = TcpStream::connect(&server.address).await.unwrap();
     let (read, mut write) = stream.into_split();
     write.write_all(&bytes).await.unwrap();
-    let mut reader = RawReader { reader: RecordReader::new(read), decoder: Decoder::new(Side::Client, DICTIONARY) };
+    let mut reader = RawReader { reader: RecordReader::new(read), decoder: Decoder::new(Side::Client) };
     assert_eq!(reader.expect().await, Message::Outbound(Outbound::Bye(ByeReason::Version)));
     assert_eq!(reader.recv().await.unwrap(), None);
 }
@@ -667,9 +659,7 @@ async fn assignments_never_written_go_back_at_once_when_the_worker_goes() {
         producer.register_committed(Envelope::claimable(ch("big"), 1, payload.clone())).await.unwrap();
     }
     let (mut stalled, _) = Raw::welcomed(&server.address, raw_hello(Role::Work, [41; 16], [42; 16])).await;
-    stalled
-        .send([call(Call::Join { req: 1, channel: Some(ch("big")), types: Vec::new(), isolated: false, lease_ms: 600_000, dispatch: false }), call(Call::Window { join: 1, count: total, bytes: 0 })])
-        .await;
+    stalled.send([call(Call::Join { req: 1, channel: Some(ch("big")), types: Vec::new(), lease_ms: 600_000, dispatch: false }), call(Call::Window { join: 1, count: total, bytes: 0 })]).await;
     loop {
         let stats = stats(&server).await;
         if stats.claimed == u64::from(total) {
@@ -679,7 +669,7 @@ async fn assignments_never_written_go_back_at_once_when_the_worker_goes() {
     }
     drop(stalled);
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    let worker_join = worker.join(Some(ch("big")), Vec::new(), false, LEASE, false).await.unwrap();
+    let worker_join = worker.join(Some(ch("big")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, total, 0).await.unwrap();
     let mut returned = 0;
     while let Ok(incoming) = tokio::time::timeout(Duration::from_secs(1), work.recv()).await {

@@ -101,7 +101,6 @@ fn detail(error: &ProtocolError) -> &'static str {
         ProtocolError::Version(_) => "another protocol version",
         ProtocolError::TooLarge(_) => "a body or a count over the bound",
         ProtocolError::UnexpectedBody(_) => "a body on a record that carries none",
-        ProtocolError::Dictionary(_) => "the name dictionary rules were broken",
         ProtocolError::Utf8 => "text that is not UTF-8",
         ProtocolError::UnknownCode(_) => "a code this version does not know",
         ProtocolError::Handshake(_) => "a record before the handshake",

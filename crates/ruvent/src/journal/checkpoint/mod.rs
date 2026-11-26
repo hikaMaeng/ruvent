@@ -2,15 +2,15 @@
 //! and where replay starts, written slice by slice while the ledger runs.
 //!
 //! ```text
-//! "rvckpt\0" 0x03
+//! "rvckpt\0" 0x06
 //! frame = [len u32][crc32 u32][count v][item]…        (crc over count and items)
 //! item  = [tag u8] then
 //!    1 Head      start serial v, uptime u64, generation v, commit v
-//!    2 Name      number v, length v, UTF-8              (dictionary)
+//!    2 (unused; was Name: there are no names)
 //!    3 Producer  number v, producer id 16, seq v
-//!    4 Entry     root type v, head, serial v, standing, location?
+//!    4 Entry     head, serial v, standing, location?
 //!    5 End       entries v, producers v
-//! standing = 0 waiting | 1 delayed, until v | 2 claimed, token generation v, token seq v, lease ms v, credential name v
+//! standing = 0 waiting | 1 delayed, until v | 2 claimed, token generation v, token seq v, lease ms v, worker 16
 //! location? = 0 | 1 location (as in a segment)
 //! ```
 //!
@@ -24,16 +24,14 @@ use super::segment::{sync_directory, CHECKPOINT, CHECKPOINT_TEMP};
 use super::{CheckpointHead, Checkpoints, Entry, Part, ProducerEntry, Replay, Standing};
 use crate::envelope::codec::put_varint;
 use crate::envelope::ClaimToken;
-use crate::names::Name;
 use bytes::BufMut;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"rvckpt\0\x05";
+const MAGIC: &[u8; 8] = b"rvckpt\0\x06";
 const HEAD: u8 = 1;
-const NAME: u8 = 2;
 const PRODUCER: u8 = 3;
 const ENTRY: u8 = 4;
 const END: u8 = 5;
@@ -44,11 +42,10 @@ const PRODUCERS_PER_FRAME: usize = 4096;
 ///
 /// | state | key | lifetime | bound | cleared by |
 /// | --- | --- | --- | --- | --- |
-/// | the file being written and its names | one checkpoint | `begin` ~ `finish`, `abort` | the live metadata and the producer table | this writer |
+/// | the file being written | one checkpoint | `begin` ~ `finish`, `abort` | the live metadata and the producer table | this writer |
 pub struct CheckpointFile {
     dir: PathBuf,
     file: Option<BufWriter<File>>,
-    names: HashMap<Name, u32>,
     entries: u64,
     producers: u64,
     bytes: u64,
@@ -56,21 +53,7 @@ pub struct CheckpointFile {
 
 impl CheckpointFile {
     pub fn new(dir: PathBuf) -> Self {
-        CheckpointFile { dir, file: None, names: HashMap::new(), entries: 0, producers: 0, bytes: 0 }
-    }
-
-    fn name(&mut self, name: &Name, out: &mut Vec<u8>, count: &mut u64) -> u32 {
-        if let Some(number) = self.names.get(name) {
-            return *number;
-        }
-        let number = self.names.len() as u32;
-        self.names.insert(name.clone(), number);
-        out.put_u8(NAME);
-        put_varint(out, u64::from(number));
-        put_varint(out, name.len() as u64);
-        out.put_slice(name.as_bytes());
-        *count += 1;
-        number
+        CheckpointFile { dir, file: None, entries: 0, producers: 0, bytes: 0 }
     }
 
     fn frame(&mut self, items: &[u8], count: u64) -> io::Result<()> {
@@ -87,15 +70,8 @@ impl CheckpointFile {
     }
 
     fn entry(&mut self, entry: &Entry, out: &mut Vec<u8>, count: &mut u64) -> io::Result<()> {
-        let numbers: Vec<u32> = entry.event.names(crate::envelope::codec::Layout::Journal).map(|name| self.name(name, out, count)).collect();
-        let credential = match &entry.standing {
-            Standing::Claimed { credential, .. } => Some(self.name(credential, out, count)),
-            _ => None,
-        };
-        let mut lookup = numbers.into_iter();
         out.put_u8(ENTRY);
-        put_varint(out, u64::from(entry.root));
-        put_head(&entry.event, &mut |_| lookup.next().unwrap_or_default(), out)?;
+        put_head(&entry.event, out)?;
         put_varint(out, entry.serial);
         match &entry.standing {
             Standing::Waiting => out.put_u8(0),
@@ -103,12 +79,12 @@ impl CheckpointFile {
                 out.put_u8(1);
                 put_varint(out, *until);
             }
-            Standing::Claimed { token, lease_ms, .. } => {
+            Standing::Claimed { token, lease_ms, worker } => {
                 out.put_u8(2);
                 put_varint(out, u64::from(token.generation));
                 put_varint(out, token.seq);
                 put_varint(out, *lease_ms);
-                put_varint(out, u64::from(credential.unwrap_or_default()));
+                out.put_slice(worker);
             }
         }
         match &entry.at {
@@ -129,7 +105,6 @@ impl Checkpoints for CheckpointFile {
         let mut file = BufWriter::new(File::create(self.dir.join(CHECKPOINT_TEMP))?);
         file.write_all(MAGIC)?;
         self.file = Some(file);
-        self.names.clear();
         (self.entries, self.producers, self.bytes) = (0, 0, MAGIC.len() as u64);
         let mut out = Vec::with_capacity(32);
         out.put_u8(HEAD);
@@ -196,7 +171,6 @@ pub(super) struct CheckpointReader {
     path: PathBuf,
     file: BufReader<File>,
     left: u64,
-    names: HashMap<u32, Name>,
     buffered: VecDeque<Replay>,
     counted: (u64, u64),
     ended: bool,
@@ -213,9 +187,9 @@ impl CheckpointReader {
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic).map_err(|_| damaged(&path, "shorter than its header"))?;
         if &magic != MAGIC {
-            return Err(invalid(format!("{}: not a ruvent checkpoint of format 5 (format 4 and older are refused, not migrated); it was left untouched", path.display())));
+            return Err(invalid(format!("{}: not a ruvent checkpoint of format 6 (format 5 and older are refused, not migrated); it was left untouched", path.display())));
         }
-        Ok(CheckpointReader { path, file: BufReader::new(file), left: left - 8, names: HashMap::new(), buffered: VecDeque::new(), counted: (0, 0), ended: false })
+        Ok(CheckpointReader { path, file: BufReader::new(file), left: left - 8, buffered: VecDeque::new(), counted: (0, 0), ended: false })
     }
 
     fn frame(&mut self) -> io::Result<()> {
@@ -256,21 +230,19 @@ impl CheckpointReader {
                     let head = CheckpointHead { start: stream.varint()?, uptime: stream.u64()?, generation: stream.varint32()?, commit: stream.varint()? };
                     self.buffered.push_back(Replay::Head(head));
                 }
-                NAME => stream.define(&mut self.names)?,
                 PRODUCER => {
                     self.counted.1 += 1;
                     self.buffered.push_back(Replay::Producer(ProducerEntry { number: stream.varint32()?, id: stream.id16()?, seq: stream.varint()? }));
                 }
                 ENTRY => {
-                    let root = stream.type16()?;
-                    let event = stream.head(&self.names)?;
+                    let event = stream.head()?;
                     let serial = stream.varint()?;
                     let standing = match stream.u8()? {
                         0 => Standing::Waiting,
                         1 => Standing::Delayed { until: stream.varint()? },
                         2 => {
                             let token = ClaimToken { generation: stream.varint32()?, seq: stream.varint()? };
-                            Standing::Claimed { token, lease_ms: stream.varint()?, credential: stream.name(&self.names)? }
+                            Standing::Claimed { token, lease_ms: stream.varint()?, worker: stream.id16()? }
                         }
                         _ => return Err(Cut::Malformed("unknown standing")),
                     };
@@ -280,7 +252,7 @@ impl CheckpointReader {
                         _ => return Err(Cut::Malformed("location marker")),
                     };
                     self.counted.0 += 1;
-                    self.buffered.push_back(Replay::Entry(Entry { event, root, at, serial, standing }));
+                    self.buffered.push_back(Replay::Entry(Entry { event, at, serial, standing }));
                 }
                 END => {
                     let counts = (stream.varint()?, stream.varint()?);

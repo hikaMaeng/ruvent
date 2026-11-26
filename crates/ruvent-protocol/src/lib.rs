@@ -1,15 +1,14 @@
-//! The event server's binary wire protocol, version 4 (plan 2.2, 2.11).
+//! The event server's binary wire protocol, version 5 (plan 2.2, 2.11, 9.15).
 //!
-//! Version 4 differs from 3 in the channel, the type and the join. A channel
-//! is a 16-octet UUIDv7, not a dictionary name, and the type a 16-bit
-//! number, so the envelope head is 38 bytes and the only names left are the
-//! credential and the end user. A `Join` selects a channel, a set of types,
-//! or both, and isolated events or the others; it is named by its `req` in
-//! `Window` and `Pending`. A subscription names one channel (prefixes are
-//! gone with the names). `Paused` and `Resumed` name a root type, `Hello`
-//! declares types, and a delete outcome says what happened in its payload's
-//! last byte. Version 3 differed from 2 in having no `correlation` and an
-//! untagged `Delete`. An older peer is refused at `Hello`, not translated.
+//! Version 5 differs from 4 in carrying only what the server's own work
+//! needs. The envelope has no names and no policy fields: no `principal`,
+//! `delegate`, `expires`, `group` or isolated bit; an assignment's claim mark
+//! (worker uuid, token, lease) is in its envelope. With nothing left to name,
+//! the per-connection name dictionary (`NameDef`, `DictReset`) is gone, and
+//! so are `Paused`/`Resumed` (nothing pauses a producer) and the types a
+//! `Hello` declared. Version 4 made the channel a 16-octet UUIDv7, the type a
+//! u16, and named a `Join` by its `req`. An older peer is refused at `Hello`,
+//! not translated.
 //!
 //! ## Records
 //!
@@ -29,25 +28,23 @@
 //! decoder gathers them and hands over one message when the last one arrived.
 //!
 //! Inside a head: numbers (sequence numbers, keys, lengths, counts, times)
-//! are unsigned LEB128 varints; ids, channels, nonces and groups are 16
-//! octets; types are u16; booleans are one byte, 0 or 1; text is `[varint
-//! length][UTF-8]`; a name (credential, end user) is a varint number from the
-//! sender's dictionary ([`dictionary`]). An event's head is `ruvent::envelope::codec`'s
+//! are unsigned LEB128 varints; ids, channels and nonces are 16 octets;
+//! types are u16; booleans are one byte, 0 or 1; text (the `Hello` token, the
+//! `Welcome` credential, a fault detail) is `[varint length][UTF-8]`. There
+//! are no dictionary names. An event's head is `ruvent::envelope::codec`'s
 //! layout without the payload block ([`ruvent::envelope::codec::encode_head`]).
 //!
 //! ## Tags
 //!
 //! | tag | record | direction | head | body |
 //! | --- | --- | --- | --- | --- |
-//! | `0x01` | `Hello` | → server | version, features, role u8, token, presence u8, [producer 16], nonce 16, [linger ms], type count, types (u16 each) | — |
+//! | `0x01` | `Hello` | → server | version, features, role u8, token, presence u8, [producer 16], nonce 16, [linger ms] | — |
 //! | `0x02` | `Welcome` | ← server | version, features, server id 16, generation, credential (text), resume, superseded u8 | — |
 //! | `0x03` | `Bye` | ← server | reason code u8 | — |
 //! | `0x04` | `Fault` | ← server | kind code u8, detail (text, ≤ 255 bytes) | — |
-//! | `0x08` | `NameDef` | both | number, name (text) | — |
-//! | `0x09` | `DictReset` | both | — | — |
 //! | `0x10` | `Register` | → server | seq (0: none, a work connection's dispatch), event head (request layout) | payload |
 //! | `0x11` | `Delete` | → server | seq, id 16, result channel 16, key? | — |
-//! | `0x12` | `Join` | → server | req, has channel u8, channel 16?, type count, types (u16 each), isolated u8, lease ms, dispatch u8 | — |
+//! | `0x12` | `Join` | → server | req, has channel u8, channel 16?, type count, types (u16 each), lease ms, dispatch u8 | — |
 //! | `0x13` | `Window` | → server | join (its `Join`'s req), count, bytes | — |
 //! | `0x14` | `Complete` | → server | seq, id 16, token, follow-up count | — |
 //! | `0x15` | `FollowUp` | → server | event head (request layout) | payload |
@@ -59,8 +56,6 @@
 //! | `0x1b` | `Stats` | → server | req | — |
 //! | `0x1c` | `Drain` | → server | req | — |
 //! | `0x20` | `Committed` | ← server | seq | — |
-//! | `0x21` | `Paused` | ← server | root type u16 | — |
-//! | `0x22` | `Resumed` | ← server | root type u16 | — |
 //! | `0x23` | `Joined` | ← server | req | — |
 //! | `0x24` | `Refused` | ← server | req, refusal code u8 | — |
 //! | `0x25` | `Pending` | ← server | join (its `Join`'s req) | — |
@@ -70,38 +65,37 @@
 //! | `0x29` | `Unsubscribed` | ← server | req | — |
 //! | `0x2a` | `Notice` | ← server | event head (notice layout) | — |
 //! | `0x2b` | `Delivery` | ← server | event head (delivery layout) | payload |
-//! | `0x2c` | `StatsReply` | ← server | req, totals, counters, top types, idle lanes, top root types | — |
+//! | `0x2c` | `StatsReply` | ← server | req, totals, counters, top types, idle lanes | — |
 //! | `0x2d` | `Draining` | ← server | req | — |
 //!
 //! * token = generation, seq. key? = presence u8, then generation, arrival.
-//! * assignment = token, lease ms, remaining lease ms, more u8, event head
-//!   (assigned layout: work key and failure count included). The server
-//!   writes the lease left at the moment it starts writing the record; a
-//!   decoded `ruvent::Assignment` carries it in `until` (the client has no
-//!   server clock), so `until` on the client side is "ms left when sent".
+//! * assignment = remaining lease ms, more u8, event head (assigned layout:
+//!   work key, failure count and the claim mark — worker, token, lease —
+//!   included). The server writes the lease left at the moment it starts
+//!   writing the record; a decoded `ruvent::Assignment` carries it in `until`
+//!   (the client has no server clock), so `until` on the client side is "ms
+//!   left when sent".
+//! * Tags `0x08`, `0x09` (the dictionary) and `0x21`, `0x22` (pause) are
+//!   unused since version 5.
 //! * Hello presence bits: 1 producer id present, 2 linger present, 4 no `Committed` (acks off).
 //! * The reason, fault and refusal codes are `ruvent::ByeReason`,
 //!   `ruvent::FaultKind` and `ruvent::Refusal` (`code()`/`from_code()`).
 //! * Records without a body must say `body_len` 0. A body is at most the
 //!   agreed bound (B13, 16 MiB by default).
-//! * The first record of a connection is `Hello`; nothing may come before it
-//!   (its token is text, not a dictionary name).
+//! * The first record of a connection is `Hello`; nothing may come before it.
 //!
-//! The pre-dictionary `Reply` record of the plan's transition stage (3a) does
-//! not exist: the overhaul is implemented at once, so no per-call reply is
-//! ever carried.
 //!
 //! ## Feature bits ([`features`])
 //!
 //! | bit | feature |
 //! | --- | --- |
 //! | `1 << 0` | producer sequences and cumulative `Committed` (2.3) |
-//! | `1 << 1` | `Paused`/`Resumed` (2.6) |
+//! | `1 << 1` | reserved (was `Paused`/`Resumed`) |
 //! | `1 << 2` | windows: `Join`, `Window`, `Assign`, `Pending`, `Extend`, `Release` (2.4) |
-//! | `1 << 3` | `not_before` and `expires` (2.4) |
+//! | `1 << 3` | `not_before` (2.4) |
 //! | `1 << 4` | `Stats` and `Drain` (2.8) |
 //! | `1 << 5` | reserved (was prefix subscriptions; channels have no prefixes) |
-//! | `1 << 6` | `group` (B26) |
+//! | `1 << 6` | reserved (was `group`) |
 //!
 //! The server announces what it implements in `Welcome`; a client uses
 //! nothing the server did not announce.
@@ -117,23 +111,18 @@
 //! Anything this version does not know — an unknown tag, a record from the
 //! wrong direction, a forbidden envelope combination, an undefined name, a
 //! head with bytes left over, a body on a record that has none — refuses the
-//! record; the connection is then closed, because the dictionary may already
-//! be out of step.
+//! record; the connection is then closed.
 
-pub mod dictionary;
 pub mod error;
 pub mod io;
 pub mod records;
 
-pub use dictionary::{Incoming, Outgoing};
 pub use error::ProtocolError;
 pub use io::{sniff_v1, Parts, RawRecord, RecordReader, HEADER};
 pub use records::{validate, Body, Decoder, Encoder, Message, Side};
 
 /// The only protocol version this build speaks.
-pub const VERSION: u32 = 4;
-/// Default bound on each direction's name dictionary (S18).
-pub const DICTIONARY: usize = 4096;
+pub const VERSION: u32 = 5;
 /// Default bound on one record's body (B13).
 pub const MAX_BODY: usize = 16 << 20;
 /// Default: a body below this many bytes is copied into the head's buffer
@@ -147,13 +136,11 @@ pub const DIRECT: usize = 4096;
 /// The feature bits of `Hello` and `Welcome`.
 pub mod features {
     pub const SEQUENCE: u64 = 1 << 0;
-    pub const PAUSE: u64 = 1 << 1;
     pub const WINDOW: u64 = 1 << 2;
     pub const TIMING: u64 = 1 << 3;
     pub const OPERATE: u64 = 1 << 4;
-    pub const GROUP: u64 = 1 << 6;
     /// Everything this build implements.
-    pub const ALL: u64 = SEQUENCE | PAUSE | WINDOW | TIMING | OPERATE | GROUP;
+    pub const ALL: u64 = SEQUENCE | WINDOW | TIMING | OPERATE;
 }
 
 #[cfg(test)]

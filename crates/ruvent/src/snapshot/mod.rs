@@ -8,19 +8,16 @@
 //! the server carries on either way. On shutdown the last unit is written.
 //!
 //! ```text
-//! "ruvsnap" 0x01                                   file header
+//! "ruvsnap" 0x02                                   file header
 //! [len u32][crc32 u32] [count u32][item]…          one frame per file
-//! item = [1][number u32][length u16][UTF-8]        name definition
-//!      | [2] envelope body, journal layout         claimable
+//! item = [2] envelope body, journal layout         claimable
 //!      | [3] envelope body, delivery layout        dispatch
+//! (item 1, a name definition, was format 1's: an envelope has no names now)
 //! ```
 
 use crate::envelope::codec::{self as body, Layout, Malformed, Reader};
 use crate::envelope::{Envelope, Kind};
-use crate::names::Name;
-use crate::types::TypeSet;
 use bytes::{BufMut, Bytes};
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,8 +26,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-pub const MAGIC: &[u8; 8] = b"ruvsnap\x01";
-const NAME: u8 = 1;
+pub const MAGIC: &[u8; 8] = b"ruvsnap\x02";
 const CLAIMABLE: u8 = 2;
 const DISPATCH: u8 = 3;
 
@@ -38,8 +34,8 @@ const DISPATCH: u8 = 3;
 #[derive(Clone, Debug)]
 pub struct SnapshotConfig {
     pub directory: PathBuf,
-    /// Event types to collect, on every channel. Empty means none.
-    pub types: TypeSet,
+    /// Event types to collect, on every channel. Empty means every type.
+    pub types: Vec<u16>,
     /// A file is written once this many events are collected…
     pub max_events: usize,
     /// …or this long after the first event of the unit, whichever comes first.
@@ -49,12 +45,12 @@ pub struct SnapshotConfig {
 }
 
 impl SnapshotConfig {
-    pub fn new(directory: impl Into<PathBuf>, types: TypeSet) -> Self {
+    pub fn new(directory: impl Into<PathBuf>, types: Vec<u16>) -> Self {
         SnapshotConfig { directory: directory.into(), types, max_events: 4096, max_age: Duration::from_secs(5), buffer: 65_536 }
     }
 
     pub fn wants(&self, event_type: u16) -> bool {
-        self.types.contains(event_type)
+        self.types.is_empty() || self.types.contains(&event_type)
     }
 }
 
@@ -78,7 +74,6 @@ pub struct Collector {
 
 /// Encodes one unit as a snapshot file.
 pub fn encode(events: &[Envelope]) -> Result<Vec<u8>, Malformed> {
-    let mut numbers: HashMap<Name, u32> = HashMap::new();
     let mut items = Vec::new();
     let mut count = 0u32;
     for event in events {
@@ -86,24 +81,8 @@ pub fn encode(events: &[Envelope]) -> Result<Vec<u8>, Malformed> {
             Kind::Claimable => Layout::Journal,
             Kind::Dispatch => Layout::Delivery,
         };
-        let mut used = Vec::new();
-        for name in event.names(layout) {
-            let next = numbers.len() as u32;
-            let number = *numbers.entry(name.clone()).or_insert_with(|| {
-                let text = name.as_bytes();
-                let length = text.len().min(u16::MAX as usize);
-                items.put_u8(NAME);
-                items.put_u32_le(next);
-                items.put_u16_le(length as u16);
-                items.put_slice(&text[..length]);
-                count += 1;
-                next
-            });
-            used.push(number);
-        }
-        let mut used = used.into_iter();
         items.put_u8(if event.kind == Kind::Claimable { CLAIMABLE } else { DISPATCH });
-        body::encode(event, layout, &mut |_| used.next().unwrap_or_default(), &mut items)?;
+        body::encode(&Envelope { claim: None, ..event.clone() }, layout, &mut items)?;
         count += 1;
     }
     let mut file = MAGIC.to_vec();
@@ -133,18 +112,11 @@ pub fn read(path: &Path) -> io::Result<Vec<Envelope>> {
     let decode = || -> Result<Vec<Envelope>, Malformed> {
         let mut reader = Reader::new(&body);
         let count = reader.u32()?;
-        let mut names: HashMap<u32, Name> = HashMap::new();
         let mut events = Vec::new();
         for _ in 0..count {
             match reader.u8()? {
-                NAME => {
-                    let number = reader.u32()?;
-                    let length = reader.u16()? as usize;
-                    let text = std::str::from_utf8(reader.take(length)?).map_err(|_| Malformed::Forbidden("name not UTF-8"))?;
-                    names.insert(number, Name::new(text));
-                }
-                CLAIMABLE => events.push(body::decode(&mut reader, Layout::Journal, &|number| names.get(&number).cloned())?),
-                DISPATCH => events.push(body::decode(&mut reader, Layout::Delivery, &|number| names.get(&number).cloned())?),
+                CLAIMABLE => events.push(body::decode(&mut reader, Layout::Journal)?),
+                DISPATCH => events.push(body::decode(&mut reader, Layout::Delivery)?),
                 _ => return Err(Malformed::Forbidden("unknown snapshot item")),
             }
         }

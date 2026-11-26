@@ -1,9 +1,9 @@
-//! The producer (2.3, 2.9): acknowledgements, resumption, restarts, pauses,
-//! one id in two processes.
+//! The producer (2.3, 2.9): acknowledgements, resumption, restarts, a
+//! server that never pauses it, one id in two processes.
 
 mod support;
 
-use ruvent::{ByeReason, Engine, EngineConfig, Envelope, EventId, Hello, MaxBacklog, Methods, Role, TypeRule, TypeSet, TypeSettings};
+use ruvent::{ByeReason, Engine, EngineConfig, Envelope, EventId, MemoryConfig, Methods};
 use ruvent_client::link::{Connector, Tcp};
 use ruvent_client::producer::{Producer, ProducerConfig, ProducerError};
 use ruvent_client::servers::Servers;
@@ -93,49 +93,21 @@ async fn a_restart_with_the_journal_resumes_and_one_without_it_renumbers() {
     assert_eq!(producer.refused(), None);
 }
 
-/// 2.6, 2.9: `Paused{type}` holds that root type's sends to that server;
-/// another type goes on, on the same channel too (plan 9.15: the channel
-/// says nothing about who floods); `Resumed` lets the held send go.
+/// Plan 9.15: nothing pauses a producer. With no worker consuming and the
+/// waiting events far past what the old early pause allowed (an eighth of
+/// the budget for a root that never drained), every send of one type goes
+/// through and is committed; the memory watermark only pages payloads out.
 #[tokio::test]
-async fn a_paused_type_holds_only_its_own_sends() {
-    const SLOW: u16 = 7;
-    const FAST: u16 = 8;
-    let mut config = EngineConfig::default();
-    config.types.rules.insert(0, TypeRule { types: TypeSet::of([SLOW]), settings: TypeSettings { max_backlog: Some(MaxBacklog { count: 3, bytes: u64::MAX }), ..TypeSettings::default() } });
+async fn nothing_pauses_a_producer_while_nobody_consumes() {
+    let config = EngineConfig { memory: MemoryConfig { limit: Some(100_000), slot_bytes: 180, ..MemoryConfig::default() }, ..EngineConfig::default() };
     let (local, servers, engines) = locals(1, config).await;
     let producer = Producer::start(local, &servers, ProducerConfig::default());
-    // Fill `SLOW` until a send stays waiting.
-    let mut held = None;
-    for index in 0..64 {
-        let sending = {
-            let producer = producer.clone();
-            tokio::spawn(async move { producer.send(job_of("work", SLOW, index)).await })
-        };
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        if !sending.is_finished() {
-            held = Some(sending);
-            break;
-        }
-        sending.await.unwrap().unwrap();
+    for index in 0..300 {
+        tokio::time::timeout(Duration::from_secs(2), producer.send(job_of("work", 7, index))).await.expect("a send never waits on the server").unwrap();
     }
-    let held = held.expect("a send of the paused type waits");
-    for index in 0..20 {
-        tokio::time::timeout(Duration::from_secs(2), producer.send(job_of("work", FAST, index))).await.expect("another type goes on, on the same channel").unwrap();
-    }
-    assert!(!held.is_finished(), "still held");
-    // Drain `SLOW`: below 7/8 of its share at the pause it resumes.
-    let (worker, mut inbox) = ruvent::connect(&engines[0], Hello { role: Role::Work, ..Hello::worker("w") }, 1024).await.unwrap();
-    let worker_join = worker.join(None, vec![SLOW], false, Duration::from_secs(30), false).await.unwrap();
-    worker.window(worker_join, 100, 0).await.unwrap();
-    let drained = tokio::spawn(async move {
-        while let Some(incoming) = inbox.recv().await {
-            if let ruvent::Incoming::Assign(assignment) = incoming {
-                worker.complete(assignment.event.id, assignment.token, Vec::new()).await.unwrap();
-            }
-        }
-    });
-    within("the held send", held).await.unwrap().unwrap();
-    drained.abort();
+    within("everything committed", producer.flush()).await.unwrap();
+    let (observer, _) = ruvent::connect(&engines[0], ruvent::Hello::observer("o"), 16).await.unwrap();
+    assert_eq!(observer.stats().await.unwrap().waiting, 300);
 }
 
 /// M8-7: two processes with one producer id. The older one is told

@@ -30,7 +30,7 @@ pub use socket::Keepalive;
 
 use async_trait::async_trait;
 use ruvent::{ByeReason, Call, Client, Closed, Hello, Inbox, Link, Outbound, Welcome};
-use ruvent_protocol::{features, validate, Body, Decoder, Encoder, Message, ProtocolError, RecordReader, Side, DICTIONARY, DIRECT, INLINE, MAX_BODY, VERSION};
+use ruvent_protocol::{features, validate, Body, Decoder, Encoder, Message, ProtocolError, RecordReader, Side, DIRECT, INLINE, MAX_BODY, VERSION};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -44,8 +44,6 @@ use tokio::sync::mpsc;
 pub struct Options {
     /// Capacity of the inbox of unasked-for traffic.
     pub inbox: usize,
-    /// S18: bound on each direction's name dictionary.
-    pub dictionary: usize,
     /// B13: the largest body one record may carry.
     pub max_body: usize,
     /// S11: a body below this many bytes is copied next to its head when sent.
@@ -64,7 +62,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { inbox: 65_536, dictionary: DICTIONARY, max_body: MAX_BODY, inline: INLINE, direct: DIRECT, queue: 4096, batch: 1024, features: features::ALL, keepalive: Keepalive::default() }
+        Options { inbox: 65_536, max_body: MAX_BODY, inline: INLINE, direct: DIRECT, queue: 4096, batch: 1024, features: features::ALL, keepalive: Keepalive::default() }
     }
 }
 
@@ -178,8 +176,8 @@ pub async fn open_raw(address: &str, token: &str, hello: Hello, options: Options
     let stream = TcpStream::connect(address).await?;
     socket::tune(&stream, &options.keepalive)?;
     let (read, mut write) = stream.into_split();
-    let mut encoder = Encoder::new(options.dictionary).with_inline(options.inline).with_max_body(options.max_body);
-    let mut decoder = Decoder::new(Side::Client, options.dictionary);
+    let mut encoder = Encoder::new().with_inline(options.inline).with_max_body(options.max_body);
+    let mut decoder = Decoder::new(Side::Client);
     let mut reader = RecordReader::with_limits(read, options.direct, options.max_body);
 
     encoder.push(&Message::Hello { version: VERSION, features: options.features, token: token.to_owned(), hello })?;

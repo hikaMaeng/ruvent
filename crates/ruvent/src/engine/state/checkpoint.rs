@@ -114,9 +114,9 @@ fn entry(slot: &Slot) -> Entry {
     let mut event = slot.envelope();
     event.payload = Bytes::new();
     let standing = match &slot.place {
-        Place::Waiting | Place::Held => Standing::Waiting,
+        Place::Waiting => Standing::Waiting,
         Place::Delayed { until } => Standing::Delayed { until: *until },
-        Place::Claimed(attempt) => Standing::Claimed { token: attempt.token, lease_ms: attempt.lease_ms, credential: attempt.credential.clone() },
+        Place::Claimed(attempt) => Standing::Claimed { token: attempt.token, lease_ms: attempt.lease_ms, worker: attempt.worker },
     };
-    Entry { event, root: slot.fixed.root, at: slot.at, serial: slot.serial, standing }
+    Entry { event, at: slot.at, serial: slot.serial, standing }
 }

@@ -14,7 +14,6 @@
 //! | `Register` | [`Call::Register`] |
 //! | `Delete` | [`Call::Delete`] |
 //! | `Committed` | [`Outbound::Committed`] |
-//! | `Paused`, `Resumed` | [`Outbound::Paused`], [`Outbound::Resumed`] |
 //! | `Join` | [`Call::Join`] |
 //! | `Joined`, `Refused` | [`Outbound::Joined`], [`Outbound::Refused`] with [`Refusal`] |
 //! | `Window` | [`Call::Window`] |
@@ -43,7 +42,7 @@ use crate::journal::Spooled;
 use crate::names::Name;
 
 pub use codes::{ByeReason, FaultKind, Refusal};
-pub use stats::{Counters, IdleLane, Pressure, RootStat, Stats, TypeStat};
+pub use stats::{Counters, IdleLane, Pressure, Stats, TypeStat};
 
 /// One engine-wide connection number. Never reused by one engine.
 pub type SessionId = u64;
@@ -77,15 +76,13 @@ pub struct Hello {
     /// How long the server keeps this producer's entry after its last
     /// connection closes. `None`: the server's default (B4).
     pub linger_ms: Option<u64>,
-    /// `false`: no `Committed` on this connection (a volatile broadcast-only producer).
+    /// `false`: no `Committed` on this connection (a broadcast-only producer).
     pub acks: bool,
-    /// The types this producer will register, checked before `Welcome` (2.7).
-    pub types: Vec<u16>,
 }
 
 impl Hello {
     fn fresh(role: Role, credential: &str, producer: bool) -> Self {
-        Hello { role, credential: Name::new(credential), producer: producer.then(|| EventId::new_v7().0), nonce: EventId::new_v7().0, linger_ms: None, acks: true, types: Vec::new() }
+        Hello { role, credential: Name::new(credential), producer: producer.then(|| EventId::new_v7().0), nonce: EventId::new_v7().0, linger_ms: None, acks: true }
     }
 
     /// A production connection with a fresh producer id and nonce.
@@ -124,18 +121,27 @@ pub struct Welcome {
 /// to an explicit claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assignment {
-    /// Head, work key, failure count, optional fields and payload.
+    /// Head, work key, failure count, `not_before`, the claim mark (worker,
+    /// token, lease) and payload.
     pub event: Envelope,
-    /// The attempt's name and fencing token.
-    pub token: ClaimToken,
-    /// The lease length the attempt runs under.
-    pub lease_ms: u64,
     /// Absolute uptime at which the lease runs out. The connection owner puts
     /// "remaining lease" = `until` − uptime at the moment it starts writing,
     /// and drops an assignment whose `until` has passed before it starts.
     pub until: u64,
     /// This assignment filled the window and more work is waiting (2.4).
     pub more: bool,
+}
+
+impl Assignment {
+    /// The attempt's fencing token, from the claim mark.
+    pub fn token(&self) -> ClaimToken {
+        self.event.claim.map(|claim| claim.token).unwrap_or_default()
+    }
+
+    /// The lease length the attempt runs under, from the claim mark.
+    pub fn lease_ms(&self) -> u64 {
+        self.event.claim.map_or(0, |claim| claim.lease_ms)
+    }
 }
 
 /// A call from a connection. Which role may send which is in each variant.
@@ -157,20 +163,18 @@ pub enum Call {
     },
     /// Work. What this connection takes: the claimable events of `channel`
     /// (`None`: of every channel) whose type is in `types` (empty: every
-    /// type). At least one of the two is given; the credential must be granted
-    /// every type it asks for. With `isolated`, only isolated events (B6);
-    /// without, only the others. The join is named by this `req` in `Window`
-    /// and `Pending`; a name another join of the connection holds is refused
-    /// (`Malformed`) unless this join repeats that one's selection. A join that repeats one of the connection's selections
+    /// type). At least one of the two is given. The join is named by this
+    /// `req` in `Window` and `Pending`; a name another join of the connection
+    /// holds is refused (`Malformed`) unless this join repeats that one's
+    /// selection. A join that repeats one of the connection's selections
     /// changes its terms and takes this name; one that overlaps another is
     /// refused (`Overlap`), so every lane has at most one join per
     /// connection. With `dispatch` (a channel join only), the channel's
-    /// dispatch events of the credential's types come to this connection too (2.8).
+    /// dispatch events come to this connection too (2.8).
     Join {
         req: u32,
         channel: Option<Channel>,
         types: Vec<u16>,
-        isolated: bool,
         lease_ms: u64,
         dispatch: bool,
     },
@@ -211,8 +215,8 @@ pub enum Call {
         id: EventId,
         lease_ms: u64,
     },
-    /// Observation. From now on, the channel's notices and dispatch events
-    /// of the credential's types; with the waiting backlog after `after`.
+    /// Observation. From now on, the channel's notices and dispatch events;
+    /// with the waiting backlog after `after`.
     Subscribe {
         req: u32,
         channel: Channel,
@@ -248,13 +252,6 @@ pub enum Outbound {
     Committed {
         seq: u64,
     },
-    /// The root type is paused: hold registrations of it (2.6).
-    Paused {
-        event_type: u16,
-    },
-    Resumed {
-        event_type: u16,
-    },
     Joined {
         req: u32,
     },
@@ -282,7 +279,7 @@ pub enum Outbound {
     Unsubscribed {
         req: u32,
     },
-    /// Claimable work: head and work key. Also when an event is isolated (its isolated bit set).
+    /// Claimable work: head and work key.
     Notice(Envelope),
     /// A dispatch event.
     Delivery(Envelope),

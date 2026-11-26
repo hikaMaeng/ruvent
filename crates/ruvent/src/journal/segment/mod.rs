@@ -96,7 +96,7 @@ fn list(dir: &Path) -> io::Result<Vec<Found>> {
         match parse_segment_header(&head) {
             Some((lane, written, first)) if written == number => found.push(Found { number, lane, first, bytes }),
             None if (head.len() as u64) < SEGMENT_HEADER && magic_prefix(&head) => short.push((number, path)),
-            _ => return Err(invalid(format!("{}: not a ruvent segment of format 5 (format 4 and older are refused, not migrated); it was left untouched", path.display()))),
+            _ => return Err(invalid(format!("{}: not a ruvent segment of format 6 (format 5 and older are refused, not migrated); it was left untouched", path.display()))),
         }
     }
     let highest = found.iter().map(|segment| segment.number).max().unwrap_or(0);
@@ -208,7 +208,7 @@ impl Writer {
     }
 }
 
-/// The segment container (format 5; formats 3 and 4 had the same container, with `correlation` (3) and the type as a name number (3, 4) in the envelope).
+/// The segment container (format 6; formats 3 to 5 had the same container, with names in the records and policy fields in the envelope).
 ///
 /// Three things keep one write from damaging another, and none is a clock:
 /// the lock file; the serial chain (every frame starts where the previous one

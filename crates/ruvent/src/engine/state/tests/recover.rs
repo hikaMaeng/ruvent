@@ -12,10 +12,10 @@ fn restarted(records: Vec<Record>, uptime: u64) -> H {
     h
 }
 
-/// A restart keeps claims as they were: token, lease length, credential;
-/// the lease re-armed at its length; no failure counted (2.4, M8-6).
+/// A restart keeps claims as they were: token, lease length and the claim
+/// mark's worker; the lease re-armed at its length; no failure counted (2.4, M8-6).
 #[test]
-fn a_restart_restores_claims_with_token_lease_and_credential_and_counts_no_failure() {
+fn a_restart_restores_claims_with_token_lease_and_worker_and_counts_no_failure() {
     let mut h = H::durable(false).cast();
     h.join(W1, "work", 1);
     let assignment = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
@@ -25,27 +25,34 @@ fn a_restart_restores_claims_with_token_lease_and_credential_and_counts_no_failu
     assert_eq!(after.s.generation(), h.s.generation() + 1, "the generation rises at a start and only then");
     let slot = after.slot(id(1)).expect("the same id");
     let attempt = slot.attempt().expect("still claimed");
-    assert_eq!((attempt.token, attempt.lease_ms, attempt.until, attempt.credential.as_str(), slot.failures), (assignment.token, 30_000, 40_000, "svc", 0));
+    assert_eq!((attempt.token, attempt.lease_ms, attempt.until, attempt.worker, slot.failures), (assignment.token(), 30_000, 40_000, [2; 16], 0));
     assert!(attempt.join.is_none(), "no join until the worker extends it");
+    assert!(h.records.iter().any(|record| matches!(record, Record::Claim { worker, .. } if *worker == [2; 16])), "the claim record carries the worker's uuid");
+    // Another worker under the same credential may not take it over.
+    after.open(W2, hello(Role::Work, 3));
+    let seq = after.next_seq(W2);
+    let stolen = after.call(W2, Call::Complete { seq, id: id(1), token: assignment.token(), follow_ups: Vec::new(), spooled: Vec::new() });
+    assert_eq!(faults(&stolen, W2), [FaultKind::Forbidden]);
+    assert!(after.slot(id(1)).is_some());
     // The worker reconnects, extends what it holds, then opens its window (2.9).
-    after.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false });
-    after.call(W1, Call::Extend { id: id(1), token: assignment.token });
+    after.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    after.call(W1, Call::Extend { id: id(1), token: assignment.token() });
     let opened = after.call(W1, Call::Window { join: 1, count: 1, bytes: 0 });
     assert!(assigned(&opened, W1).is_empty(), "the extended attempt fills its window of one");
     let completed = after.complete(W1, &assignment, Vec::new());
     assert!(after.slot(id(1)).is_none(), "the original worker's completion is accepted");
     assert_eq!(assigned(&completed, W1)[0].event.id, id(2), "and its slot takes the next");
-    assert!(assigned(&completed, W1)[0].token.generation > assignment.token.generation);
+    assert!(assigned(&completed, W1)[0].token().generation > assignment.token().generation);
 }
 
-/// `not_before` and `expires` are absolute uptimes and keep their remaining
-/// time across a restart; the clock does not count the time the server was down (M8-11).
+/// `not_before` is an absolute uptime and keeps its remaining time across a
+/// restart; the clock does not count the time the server was down (M8-11).
 #[test]
-fn a_restart_keeps_the_remaining_time_of_not_before_and_expires() {
+fn a_restart_keeps_the_remaining_time_of_not_before() {
     let mut h = H::durable(false).cast();
     h.now = 1_000;
     h.produce(P, work("work").with_id(id(1)).with_not_before(Duration::from_millis(500)));
-    h.produce(P, work("work").with_id(id(2)).with_expires(Duration::from_millis(700)));
+    h.produce(P, work("work").with_id(id(2)));
     // The server stops at 1,200 and starts again at 1,200 on its own clock.
     let mut after = restarted(h.records.clone(), 1_200);
     assert_eq!(after.s.next_due(), Some(1_500), "300 ms of delay left, as before the stop");
@@ -54,7 +61,6 @@ fn a_restart_keeps_the_remaining_time_of_not_before_and_expires() {
     assert!(assigned(&after.advance(299), W1).is_empty());
     let visible = after.advance(1);
     assert_eq!(assigned(&visible, W1)[0].event.id, id(1));
-    assert_eq!(after.slot(id(2)).unwrap().expires, Some(1_700));
 }
 
 #[test]
@@ -72,35 +78,13 @@ fn the_producer_table_survives_a_restart_and_resume_is_the_last_journaled_sequen
     assert!(after.slot(id(4)).is_some() && faults(&next, P).is_empty());
 }
 
-/// Volatile types write nothing; a persistent parent with a volatile
-/// follow-up and the reverse come back as the table says (2.5).
-#[test]
-fn volatile_types_write_nothing_and_mixed_lineages_restart_as_the_table_says() {
-    let mut h = H::durable(false).cast();
-    h.produce(P, volatile("scratch.x").with_id(id(1)));
-    assert!(!h.records.iter().any(|record| matches!(record, Record::Register { .. })), "a volatile registration is not journaled");
-    h.join(W1, "work", 2);
-    h.join(W2, "scratch.y", 2);
-    let parent = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
-    h.complete(W1, &parent, vec![volatile("scratch.y").with_id(id(3))]);
-    let volatile_parent = assigned(&h.produce(P, volatile("scratch.y").with_id(id(4))), W2).remove(0);
-    h.complete(W2, &volatile_parent, vec![work("work").with_id(id(5))]);
-    let after = restarted(h.records.clone(), 0);
-    let held = |id| after.slot(id).is_some();
-    assert_eq!(
-        [held(id(1)), held(id(2)), held(id(3)), held(id(4)), held(id(5))],
-        [false, false, false, false, true],
-        "durable parent + volatile follow-up: both gone; volatile parent + durable follow-up: the follow-up stays"
-    );
-}
-
 #[test]
 fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
     let mut h = H::durable(false).cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 15, dispatch: false });
+    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 15, dispatch: false });
     for step in 0..40u8 {
         h.now = u64::from(step) * 10;
-        h.produce(P, work("work").with_id(id(step + 1)).with_expires(Duration::from_secs(600)));
+        h.produce(P, work("work").with_id(id(step + 1)).with_not_before(Duration::from_millis(u64::from(step % 4) * 5)));
         if step % 3 == 0 {
             h.call(W1, Call::Window { join: 1, count: 2, bytes: 0 });
         }
@@ -114,9 +98,10 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
             }
         }
     }
+    /// (work key, channel, failures, claim mark's worker, not_before) of every slot.
+    type View = Vec<(WorkKey, Channel, u16, Option<[u8; 16]>, Option<u64>)>;
     let view = |state: &State| {
-        let mut slots: Vec<(WorkKey, Channel, u16, bool, Option<u64>, bool)> =
-            state.slots.iter().map(|(_, slot)| (slot.fixed.key, slot.channel, slot.failures, slot.attempt().is_some(), slot.expires, slot.isolated)).collect();
+        let mut slots: View = state.slots.iter().map(|(_, slot)| (slot.fixed.key, slot.channel, slot.failures, slot.attempt().map(|attempt| attempt.worker), slot.fixed.not_before)).collect();
         slots.sort();
         slots
     };
@@ -136,46 +121,6 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
     assert_eq!(view(&replayed.s), view(&h.s), "and both are the ledger as it was");
 }
 
-/// Isolation is journaled in place: replaying the records, or a checkpoint
-/// of the ledger, gives back the isolated bit, the failure count, the keep
-/// expiry and the root, and the event waits for isolated joins only (B6).
-#[test]
-fn an_isolated_event_comes_back_isolated_from_the_records_and_from_a_checkpoint() {
-    let mut h = H::durable(false).cast();
-    h.join(W1, "work", 1);
-    let mut current = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
-    for round in 1..=5 {
-        let effects = h.call(W1, Call::Release { id: id(1), token: current.token, delay_ms: 0, failed: true });
-        if round < 5 {
-            current = assigned(&effects, W1).remove(0);
-        }
-    }
-    assert!(h.records.iter().any(|record| matches!(record, Record::Isolate { failures: 5, expires: Some(_), .. })), "{:?}", h.records);
-    let expected = |slot: &Slot| (slot.isolated, slot.failures, slot.expires, slot.fixed.root, slot.channel);
-    let before = expected(h.slot(id(1)).unwrap());
-    let mut replayed = restarted(h.records.clone(), h.now);
-    assert_eq!(expected(replayed.slot(id(1)).unwrap()), before);
-    let plain = replayed.join(W1, "work", 1);
-    assert!(assigned(&plain, W1).is_empty(), "a plain join does not take it after the restart");
-    let taken = replayed.call(W1, Call::Join { req: 9, channel: None, types: vec![1], isolated: true, lease_ms: 1000, dispatch: false });
-    assert_eq!(sent(&taken, W1), [Outbound::Joined { req: 9 }]);
-    let opened = replayed.call(W1, Call::Window { join: 9, count: 1, bytes: 0 });
-    assert!(assigned(&opened, W1).iter().any(|assignment| assignment.event.id == id(1) && assignment.event.isolated));
-    let serial = h.s.serial();
-    let (head, parts) = h.s.full_checkpoint(serial, h.durable);
-    let mut items = vec![Replay::Head(head)];
-    for part in parts {
-        match part {
-            Part::Producers(producers) => items.extend(producers.into_iter().map(Replay::Producer)),
-            Part::Entries(entries) => items.extend(entries.into_iter().map(Replay::Entry)),
-        }
-    }
-    let mut folded = State::new(&config(), Box::new(V7));
-    folded.recover_from(Recovered::from_replay(items, End { uptime: h.now, serial, commit: 0 }), true).unwrap();
-    let index = folded.slots.by_id(&id(1)).unwrap();
-    assert_eq!(expected(folded.slots.get(index).unwrap()), before, "the checkpoint entry carries the isolated bit");
-}
-
 #[test]
 fn work_keys_and_tokens_are_u64_past_the_u32_range() {
     let mut h = H::volatile().cast();
@@ -186,6 +131,6 @@ fn work_keys_and_tokens_are_u64_past_the_u32_range() {
     let first = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let second = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
     assert!(second.event.key.unwrap().arrival > u64::from(u32::MAX));
-    assert!(second.token > first.token);
+    assert!(second.token() > first.token());
     assert_eq!(h.s.generation(), generation, "running out of u32 does not start a generation");
 }

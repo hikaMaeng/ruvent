@@ -30,12 +30,11 @@ fn key(arrival: u64) -> WorkKey {
     WorkKey { generation: 1, arrival }
 }
 
-/// A registration of type 1 on the channel labelled `channel`, its own root.
+/// A registration of type 1 on the channel labelled `channel`.
 fn registration(arrival: u64, channel: &str) -> Record {
-    let mut event = Envelope::claimable(ch(channel), 1, Bytes::from(vec![arrival as u8; 3 + arrival as usize])).with_id(EventId::new_v7()).with_delegate("user-1");
+    let mut event = Envelope::claimable(ch(channel), 1, Bytes::from(vec![arrival as u8; 3 + arrival as usize])).with_id(EventId::new_v7());
     event.key = Some(key(arrival));
-    event.principal = Some("svc".into());
-    Record::Register { event, root: 1, at: None }
+    Record::Register { event, at: None }
 }
 
 fn batch(first: u64, records: Vec<Record>) -> Batch {
@@ -75,7 +74,7 @@ fn records(items: &[Replay]) -> Vec<(u64, Record)> {
 /// on disk, a registration comes with its location.
 fn as_recovered(record: &Record, at: Option<Location>) -> Record {
     match record {
-        Record::Register { event, root, at: None } => Record::Register { event: Envelope { payload: Bytes::new(), ..event.clone() }, root: *root, at },
+        Record::Register { event, at: None } => Record::Register { event: Envelope { payload: Bytes::new(), ..event.clone() }, at },
         other => other.clone(),
     }
 }
@@ -83,25 +82,22 @@ fn as_recovered(record: &Record, at: Option<Location>) -> Record {
 #[test]
 fn every_record_kind_survives_a_reopen_and_payloads_stay_on_disk() {
     let path = scratch();
-    let mut timed = Envelope::claimable(ch("orders"), 1, Bytes::from_static(b"t")).with_id(EventId::new_v7()).with_group([5; 16]);
+    let mut timed = Envelope::claimable(ch("orders"), 1, Bytes::from_static(b"t")).with_id(EventId::new_v7());
     timed.key = Some(key(9));
     timed.not_before = Some(70_000);
-    timed.expires = Some(90_000);
     timed.failures = 3;
     let streamed = Location { segment: 40, offset: 28, len: 5, crc: 77 };
     let written = vec![
         Record::Generation(1),
         Record::ProducerDef { number: 0, id: [9; 16] },
         registration(0, "orders"),
-        Record::Claim { key: key(0), token: ClaimToken { generation: 1, seq: u64::MAX }, lease_ms: 30_000, credential: "svc".into() },
+        Record::Claim { key: key(0), token: ClaimToken { generation: 1, seq: u64::MAX }, lease_ms: 30_000, worker: [0x77; 16] },
         Record::Reclaim { key: key(0), failures: 4 },
         Record::Release { key: key(0), failures: 5, visible_at: Some(123_456) },
         Record::Release { key: key(0), failures: 5, visible_at: None },
-        Record::Isolate { key: key(0), failures: 5, expires: Some(604_800_000) },
-        Record::Isolate { key: key(0), failures: 6, expires: None },
         Record::Relocate { key: key(0), at: Location { segment: 3, offset: 1 << 40, len: 16, crc: 9 } },
         Record::Body { payload: Bytes::from_static(b"inline, pointed at by nothing") },
-        Record::Register { event: Envelope { payload: Bytes::new(), ..timed }, root: u16::MAX, at: Some(streamed) },
+        Record::Register { event: Envelope { payload: Bytes::new(), ..timed }, at: Some(streamed) },
         registration(1, "orders"),
         Record::Remove(key(1)),
         Record::Producer { number: 0, seq: 77 },
@@ -133,7 +129,7 @@ fn every_record_kind_survives_a_reopen_and_payloads_stay_on_disk() {
 #[test]
 fn a_claim_removed_in_the_same_frame_is_not_written_and_keeps_its_serial() {
     let path = scratch();
-    let claim = |arrival| Record::Claim { key: key(arrival), token: ClaimToken { generation: 1, seq: arrival }, lease_ms: 30_000, credential: "svc".into() };
+    let claim = |arrival| Record::Claim { key: key(arrival), token: ClaimToken { generation: 1, seq: arrival }, lease_ms: 30_000, worker: [1; 16] };
     append(&path, DEFAULT_SEGMENT_BYTES, vec![batch(0, vec![registration(0, "work"), claim(0), Record::Remove(key(0)), registration(1, "work")]), batch(4, vec![claim(1)])]);
     let (items, _) = drain(SegmentLog::open(&path).unwrap().1).unwrap();
     let serials: Vec<u64> = records(&items).iter().map(|(serial, _)| *serial).collect();
@@ -242,17 +238,16 @@ fn a_completion_frame_cut_at_any_byte_recovers_all_or_nothing() {
     }
 }
 
-/// Segments roll at their size; each defines the names it uses, so its
-/// dictionary is its own (2.5, 2.10).
+/// Segments roll at their size; each decodes on its own: the channel is its
+/// 16 octets and there are no names to define (2.5, 2.10).
 #[test]
-fn segments_roll_at_their_size_and_each_defines_its_own_names() {
+fn segments_roll_at_their_size_and_each_decodes_on_its_own() {
     let path = scratch();
     let written = append(&path, 200, (0..12).map(|at| batch(at, vec![registration(at, "orders")])).collect());
     let created: Vec<u32> = written.iter().flat_map(|written| written.segments.iter().map(|segment| segment.number)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     assert!(created.len() >= 3, "{created:?}");
     for number in &created {
         let bytes = std::fs::read(path.join(format!("{number:010}.seg"))).unwrap();
-        assert!(bytes.windows(6).any(|window| window == b"user-1"), "segment {number} defines the names it uses (the delegate)");
         assert!(bytes.windows(16).any(|window| window == ch("orders").0), "segment {number} carries the channel as its 16 octets");
     }
     let (items, end) = drain(SegmentLog::open_with(&path, 200).unwrap().1).unwrap();
@@ -260,8 +255,8 @@ fn segments_roll_at_their_size_and_each_defines_its_own_names() {
 }
 
 fn entry(arrival: u64, at: Option<Location>, serial: u64) -> Entry {
-    let Record::Register { event, root, .. } = registration(arrival, "work") else { unreachable!() };
-    Entry { event: Envelope { payload: Bytes::new(), ..event }, root, at, serial, standing: Standing::Claimed { token: ClaimToken { generation: 1, seq: 4 }, lease_ms: 9, credential: "svc".into() } }
+    let Record::Register { event, .. } = registration(arrival, "work") else { unreachable!() };
+    Entry { event: Envelope { payload: Bytes::new(), ..event }, at, serial, standing: Standing::Claimed { token: ClaimToken { generation: 1, seq: 4 }, lease_ms: 9, worker: [0x66; 16] } }
 }
 
 /// Recovery reads the checkpoint, then the tail from the checkpoint's start:

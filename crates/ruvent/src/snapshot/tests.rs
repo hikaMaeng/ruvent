@@ -16,20 +16,21 @@ pub fn ch(label: &str) -> Channel {
 fn a_snapshot_file_holds_both_kinds_and_reads_back() {
     let mut claimable = Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"{}")).with_id(EventId::new_v7());
     claimable.key = Some(WorkKey { generation: 1, arrival: 2 });
-    claimable.principal = Some("svc".into());
     let dispatch = Envelope::dispatch(ch("orders"), 2, Bytes::from_static(b"ok")).with_id(EventId::new_v7());
     let directory = std::env::temp_dir().join(format!("ruvent-snapshot-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("one.rvs");
-    std::fs::write(&path, encode(&[claimable.clone(), dispatch.clone()]).unwrap()).unwrap();
+    let bytes = encode(&[claimable.clone(), dispatch.clone()]).unwrap();
+    assert!(bytes.starts_with(b"ruvsnap\x02"), "format 2: no name items");
+    std::fs::write(&path, bytes).unwrap();
     assert_eq!(read(&path).unwrap(), vec![claimable, dispatch]);
 }
 
 #[test]
 fn the_configuration_picks_types_on_every_channel() {
-    let mut config = SnapshotConfig::new("x", TypeSet::from_ranges([(10, 19)]));
+    let mut config = SnapshotConfig::new("x", vec![10, 19]);
     assert!(config.wants(10) && config.wants(19));
-    assert!(!config.wants(20) && !config.wants(0));
-    config.types = TypeSet::none();
-    assert!(!config.wants(10), "an empty set collects nothing");
+    assert!(!config.wants(11) && !config.wants(0));
+    config.types = Vec::new();
+    assert!(config.wants(10) && config.wants(u16::MAX), "no types listed collects every type");
 }

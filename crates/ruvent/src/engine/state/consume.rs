@@ -26,8 +26,7 @@ impl State {
                 }
             }
             members.sort();
-            let serialize = self.config.types.settings(key.1).serialize_group;
-            self.lanes.insert(*key, Lane { members: members.into_iter().map(|(_, join)| join).collect(), serialize, ..Lane::default() });
+            self.lanes.insert(*key, Lane { members: members.into_iter().map(|(_, join)| join).collect(), ..Lane::default() });
             self.typed_lanes.entry(key.1).or_default().insert(*key);
         }
         self.lanes.entry(*key).or_default()
@@ -66,7 +65,7 @@ impl State {
         }
         let mut found = Vec::new();
         for kind in &join.types {
-            found.extend(self.typed_lanes.get(kind).into_iter().flatten().filter(|lane| lane.2 == join.isolated));
+            found.extend(self.typed_lanes.get(kind).into_iter().flatten());
         }
         found
     }
@@ -77,10 +76,9 @@ impl State {
         open.joins.iter().map(|req| (session, *req)).find(|id| self.joins.get(id).is_some_and(|join| join.selects(lane)))
     }
 
-    /// `Join`: the claim grant covers every type asked for (empty: every
-    /// type), checked here once (2.7). The channel, if any, must be a UUIDv7.
+    /// `Join`: needs the claim grant (2.7). The channel, if any, must be a UUIDv7.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn join(&mut self, session: SessionId, credential: &Name, req: u32, channel: Option<Channel>, types: Vec<u16>, isolated: bool, lease_ms: u64, dispatch: bool) {
+    pub(super) fn join(&mut self, session: SessionId, credential: &Name, req: u32, channel: Option<Channel>, types: Vec<u16>, lease_ms: u64, dispatch: bool) {
         let refuse = |state: &mut State, reason| state.send(session, Outbound::Refused { req, reason }, None);
         if (channel.is_none() && (types.is_empty() || dispatch)) || channel.is_some_and(|channel| !channel.is_valid()) {
             return refuse(self, Refusal::Malformed);
@@ -88,17 +86,12 @@ impl State {
         let mut types = types;
         types.sort_unstable();
         types.dedup();
-        let granted = match self.config.grants.as_ref().map(|grants| grants.get(credential.as_str())) {
-            None => true,
-            Some(None) => false,
-            Some(Some(grant)) => grant.methods.contains(&Method::Claim) && if types.is_empty() { grant.types.is_all() } else { grant.types.contains_all(&types) },
-        };
-        if !granted {
+        if !self.allowed(credential, Method::Claim) {
             return refuse(self, Refusal::Forbidden);
         }
         let mine: Vec<JoinId> = self.sessions.get(&session).map(|open| open.joins.iter().map(|join| (session, *join)).collect()).unwrap_or_default();
-        let same = mine.iter().find(|id| self.joins.get(*id).is_some_and(|join| join.is(&channel, &types, isolated))).copied();
-        if mine.iter().any(|id| Some(id) != same.as_ref() && self.joins.get(id).is_some_and(|join| join.overlaps(&channel, &types, isolated))) {
+        let same = mine.iter().find(|id| self.joins.get(*id).is_some_and(|join| join.is(&channel, &types))).copied();
+        if mine.iter().any(|id| Some(id) != same.as_ref() && self.joins.get(id).is_some_and(|join| join.overlaps(&channel, &types))) {
             return refuse(self, Refusal::Overlap);
         }
         let id: JoinId = (session, req);
@@ -126,7 +119,7 @@ impl State {
             self.next_order += 1;
             (0, 0, 0, 0, HashSet::new(), order)
         });
-        let mut join = Join { channel, types, isolated, lease_ms, count, bytes, claimed, claimed_bytes, signalled: false, order, dispatch, lanes: Vec::new(), attempts };
+        let mut join = Join { channel, types, lease_ms, count, bytes, claimed, claimed_bytes, signalled: false, order, dispatch, lanes: Vec::new(), attempts };
         if let Some(channel) = &channel {
             let covered: Vec<LaneKey> = self.lanes.keys().filter(|key| join.selects(key)).cloned().collect();
             for key in &covered {
@@ -280,45 +273,16 @@ impl State {
         }
     }
 
-    /// The first event of the lane that may be assigned now. On the way it
-    /// removes what expired and moves what a paused root may not grow by to
-    /// the root's hold lane. Under Strict it stops at the first event whose
-    /// registration is not on disk: the rest of the lane is newer (2.7).
-    pub(super) fn head(&mut self, key: &LaneKey) -> Option<(WorkKey, Index, u64)> {
-        let lane = self.lanes.get(key)?;
-        let net = lane.growth.net();
-        if net && self.over_limit {
+    /// The first event of the lane that may be assigned now: its head, or,
+    /// under Strict, nothing while the head's registration is not on disk —
+    /// the rest of the lane is newer (2.7).
+    pub(super) fn head(&self, key: &LaneKey) -> Option<(WorkKey, Index, u64)> {
+        let (&work_key, &index) = self.lanes.get(key)?.queue.iter().next()?;
+        let slot = self.slots.get(index)?;
+        if self.strict && slot.fixed.durable && slot.fixed.visible_from > self.durable {
             return None;
         }
-        let mut expired = Vec::new();
-        let mut held = Vec::new();
-        let mut found = None;
-        for (&work_key, &index) in &lane.queue {
-            let Some(slot) = self.slots.get(index) else { continue };
-            if self.strict && slot.fixed.durable && slot.fixed.visible_from > self.durable {
-                break;
-            }
-            if slot.expires.is_some_and(|at| at <= self.now) {
-                expired.push(index);
-                continue;
-            }
-            if lane.serialize && slot.fixed.group.is_some_and(|group| self.groups.contains_key(&(slot.channel, group))) {
-                continue;
-            }
-            if net && self.roots.get(&slot.fixed.root).is_some_and(|root| root.blocks_growth()) {
-                held.push(index);
-                continue;
-            }
-            found = Some((work_key, index, slot.len()));
-            break;
-        }
-        for index in held {
-            self.hold(index);
-        }
-        for index in expired {
-            self.expire(index);
-        }
-        found
+        Some((work_key, index, slot.len()))
     }
 
     /// Hands the event to the join: one step for assignment, claim and delivery.
@@ -328,10 +292,10 @@ impl State {
         }
         // A lane only joins without a channel take goes once it is empty.
         self.tidy(lane);
-        let Some((lease_ms, credential)) = self.joins.get(id).map(|join| join.lease_ms).zip(self.sessions.get(&id.0).map(|open| open.credential.clone())) else { return };
+        let Some((lease_ms, worker)) = self.joins.get(id).map(|join| join.lease_ms).zip(self.worker_of(id.0)) else { return };
         let token = self.next_token();
         let until = self.now.saturating_add(lease_ms);
-        let attempt = Attempt { token, lease_ms, until, credential, join: Some(*id) };
+        let attempt = Attempt { token, lease_ms, until, worker, join: Some(*id) };
         let Some(len) = self.start(index, attempt) else { return };
         let more = {
             let Some(join) = self.joins.get_mut(id) else { return };
@@ -349,29 +313,24 @@ impl State {
             more
         };
         if let Some((event, cold)) = self.slots.get(index).map(|slot| (slot.envelope(), slot.cold())) {
-            self.send_event(id.0, Outbound::Assign(Assignment { event, token, lease_ms, until, more }), None, index);
+            self.send_event(id.0, Outbound::Assign(Assignment { event, until, more }), None, index);
             if cold {
                 self.read_ahead(lane);
             }
         }
     }
 
-    /// Marks the event claimed by `attempt`: lease on the wheel, group taken,
-    /// `Claim` journaled. Returns the payload length.
+    /// Marks the event claimed by `attempt`: its claim mark, the lease on the
+    /// wheel, `Claim` journaled. Returns the payload length.
     fn start(&mut self, index: Index, attempt: Attempt) -> Option<u64> {
         let generation = self.slots.generation(index);
         let slot = self.slots.get_mut(index)?;
-        let (token, until, lease_ms, credential) = (attempt.token, attempt.until, attempt.lease_ms, attempt.credential.clone());
+        let (token, until, lease_ms, worker) = (attempt.token, attempt.until, attempt.lease_ms, attempt.worker);
         slot.place = Place::Claimed(attempt);
-        let (len, durable, key, group, channel, event_type) = (slot.len(), slot.fixed.durable, slot.fixed.key, slot.fixed.group, slot.channel, slot.fixed.event_type);
-        if let Some(group) = group {
-            if self.config.types.settings(event_type).serialize_group {
-                *self.groups.entry((channel, group)).or_default() += 1;
-            }
-        }
+        let (len, durable, key) = (slot.len(), slot.fixed.durable, slot.fixed.key);
         self.wheel.wake_at(until, index, generation, Due::Lease(token));
         if durable {
-            self.record_for(index, Record::Claim { key, token, lease_ms, credential });
+            self.record_for(index, Record::Claim { key, token, lease_ms, worker });
         }
         Some(len)
     }
@@ -383,28 +342,23 @@ impl State {
         let refuse = |state: &mut State, reason| state.send(session, Outbound::Refused { req, reason }, None);
         let Some(index) = self.slots.by_id(&id) else { return refuse(self, Refusal::Missing) };
         let Some(slot) = self.slots.get(index) else { return refuse(self, Refusal::Missing) };
-        if !self.allowed(credential, Method::Claim, slot.fixed.event_type) {
+        if !self.allowed(credential, Method::Claim) {
             return refuse(self, Refusal::Forbidden);
         }
         match slot.place {
             Place::Claimed(_) => return refuse(self, Refusal::AlreadyClaimed),
             Place::Delayed { .. } => return refuse(self, Refusal::Missing),
-            Place::Waiting | Place::Held => {}
+            Place::Waiting => {}
         }
-        if slot.expires.is_some_and(|at| at <= self.now) {
-            self.expire(index);
-            return refuse(self, Refusal::Missing);
-        }
-        let (lane, key, root) = (slot.lane(), slot.fixed.key, slot.fixed.root);
-        if matches!(slot.place, Place::Held) {
-            self.unhold(root, &lane, key);
-        } else if let Some(found) = self.lanes.get_mut(&lane) {
+        let Some(worker) = self.worker_of(session) else { return refuse(self, Refusal::Malformed) };
+        let (lane, key) = (slot.lane(), slot.fixed.key);
+        if let Some(found) = self.lanes.get_mut(&lane) {
             found.queue.remove(&key);
         }
         let join = self.join_for(session, &lane);
         let token = self.next_token();
         let until = self.now.saturating_add(lease_ms);
-        let Some(len) = self.start(index, Attempt { token, lease_ms, until, credential: credential.clone(), join }) else { return };
+        let Some(len) = self.start(index, Attempt { token, lease_ms, until, worker, join }) else { return };
         if let Some(join) = join.and_then(|join| self.joins.get_mut(&join)) {
             join.claimed += 1;
             join.claimed_bytes += len;
@@ -413,18 +367,24 @@ impl State {
         self.tidy(&lane);
         let gate = self.gate_for(index);
         if let Some(event) = self.slots.get(index).map(|slot| slot.envelope()) {
-            self.send_event(session, Outbound::Claimed { req, assignment: Assignment { event, token, lease_ms, until, more: false } }, gate, index);
+            self.send_event(session, Outbound::Claimed { req, assignment: Assignment { event, until, more: false } }, gate, index);
         }
     }
 
-    /// The attempt at `index` if it is `token` and was made under `credential`.
-    /// A wrong token is a late or stale report: counted, not told (2.7).
-    pub(super) fn attempt_for(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken) -> Option<Index> {
-        let current = self.slots.by_id(&id).and_then(|index| self.slots.get(index).and_then(|slot| slot.attempt()).map(|attempt| (index, attempt.token, attempt.credential.clone())));
+    /// The worker uuid of a work connection: its producer id.
+    pub(super) fn worker_of(&self, session: SessionId) -> Option<crate::envelope::ProducerId> {
+        self.sessions.get(&session).and_then(|open| open.producer)
+    }
+
+    /// The attempt at `index` if it is `token` and its claim mark names this
+    /// connection's worker. A wrong token is a late or stale report: counted,
+    /// not told (2.7).
+    pub(super) fn attempt_for(&mut self, session: SessionId, id: EventId, token: ClaimToken) -> Option<Index> {
+        let current = self.slots.by_id(&id).and_then(|index| self.slots.get(index).and_then(|slot| slot.attempt()).map(|attempt| (index, attempt.token, attempt.worker)));
         match current {
             Some((index, held, owner)) if held == token => {
-                if owner != *credential {
-                    self.fault(session, FaultKind::Forbidden, "the attempt was made under another credential");
+                if Some(owner) != self.worker_of(session) {
+                    self.fault(session, FaultKind::Forbidden, "the attempt is another worker's");
                     return None;
                 }
                 Some(index)
@@ -439,8 +399,8 @@ impl State {
     /// `Extend`: re-arms the lease at its length from now, and moves the
     /// attempt to this connection's join that selects its lane, if it has one (2.4).
     /// Never journaled: a restart re-arms every lease anyway.
-    pub(super) fn extend(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken) {
-        let Some(index) = self.attempt_for(session, credential, id, token) else { return };
+    pub(super) fn extend(&mut self, session: SessionId, id: EventId, token: ClaimToken) {
+        let Some(index) = self.attempt_for(session, id, token) else { return };
         let generation = self.slots.generation(index);
         let now = self.now;
         let Some(slot) = self.slots.get_mut(index) else { return };

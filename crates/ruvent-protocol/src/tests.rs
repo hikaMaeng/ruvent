@@ -1,10 +1,10 @@
 use crate::io::{sniff_v1, v1_bye, Parts, RawRecord, RecordReader, HEADER};
-use crate::records::{Body, Decoder, Encoder, Message, Side, ASSIGN, BYE, DELIVERY, HELLO, NAME_DEF, NOTICE, REGISTER, RESET};
-use crate::{features, ProtocolError, DICTIONARY, MAX_BODY, VERSION};
+use crate::records::{Body, Decoder, Encoder, Message, Side, ASSIGN, BYE, DELIVERY, HELLO, REGISTER};
+use crate::{features, ProtocolError, MAX_BODY, VERSION};
 use bytes::Bytes;
 use proptest::prelude::*;
 use ruvent::envelope::codec::Malformed;
-use ruvent::{Assignment, ByeReason, Call, Channel, ClaimToken, Counters, Envelope, EventId, FaultKind, Hello, IdleLane, Name, Outbound, Refusal, Role, RootStat, Stats, TypeStat, Welcome, WorkKey};
+use ruvent::{Assignment, ByeReason, Call, Channel, ClaimMark, ClaimToken, Counters, Envelope, EventId, FaultKind, Hello, IdleLane, Name, Outbound, Refusal, Role, Stats, TypeStat, Welcome, WorkKey};
 
 /// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
 pub fn ch(label: &str) -> Channel {
@@ -36,16 +36,16 @@ fn concat(parts: Parts) -> Vec<u8> {
     parts.concat()
 }
 
-fn encode(messages: &[Message], dictionary: usize) -> Result<Vec<u8>, ProtocolError> {
-    let mut encoder = Encoder::new(dictionary);
+fn encode(messages: &[Message]) -> Result<Vec<u8>, ProtocolError> {
+    let mut encoder = Encoder::new();
     for message in messages {
         encoder.push(message)?;
     }
     Ok(concat(encoder.take()))
 }
 
-fn decode(bytes: &[u8], side: Side, dictionary: usize) -> Result<Vec<Message>, ProtocolError> {
-    let mut decoder = Decoder::new(side, dictionary);
+fn decode(bytes: &[u8], side: Side) -> Result<Vec<Message>, ProtocolError> {
+    let mut decoder = Decoder::new(side);
     let mut out = Vec::new();
     for (raw, body) in split(bytes) {
         let carries = decoder.admit(&raw)?;
@@ -58,20 +58,20 @@ fn decode(bytes: &[u8], side: Side, dictionary: usize) -> Result<Vec<Message>, P
 }
 
 /// Encodes, then decodes, with the handshake record first so the decoder accepts the rest.
-fn trip(messages: &[Message], side: Side, dictionary: usize) -> Result<Vec<Message>, ProtocolError> {
+fn trip(messages: &[Message], side: Side) -> Result<Vec<Message>, ProtocolError> {
     let opener = match side {
         Side::Server => hello(Role::Produce),
         Side::Client => welcome(),
     };
     let mut all = vec![opener];
     all.extend_from_slice(messages);
-    let mut decoded = decode(&encode(&all, dictionary)?, side, dictionary)?;
+    let mut decoded = decode(&encode(&all)?, side)?;
     decoded.remove(0);
     Ok(decoded)
 }
 
 fn hello(role: Role) -> Message {
-    let hello = Hello { role, credential: Name::new(""), producer: Some([3; 16]), nonce: [4; 16], linger_ms: Some(7_200_000), acks: false, types: vec![17, 0x1234] };
+    let hello = Hello { role, credential: Name::new(""), producer: Some([3; 16]), nonce: [4; 16], linger_ms: Some(7_200_000), acks: false };
     Message::Hello { version: VERSION, features: features::ALL, token: "secret".into(), hello }
 }
 
@@ -83,27 +83,28 @@ fn id(byte: u8) -> EventId {
     EventId([byte; 16])
 }
 
+fn claim(seq: u64) -> ClaimMark {
+    ClaimMark { worker: [0x77; 16], token: ClaimToken { generation: 2, seq }, lease_ms: 30_000 }
+}
+
 fn assigned(byte: u8, payload: &'static [u8]) -> Envelope {
-    let mut event = Envelope::claimable(ch("orders"), 17, Bytes::from_static(payload)).with_id(id(byte)).with_delegate("user-r").with_not_before(std::time::Duration::from_millis(9));
+    let mut event = Envelope::claimable(ch("orders"), 17, Bytes::from_static(payload)).with_id(id(byte)).with_not_before(std::time::Duration::from_millis(9));
     event.key = Some(WorkKey { generation: 2, arrival: 300 });
     event.failures = 3;
-    event.principal = Some("svc".into());
+    event.claim = Some(claim(77));
     event
 }
 
 fn every_call() -> Vec<Call> {
     let token = ClaimToken { generation: 2, seq: 1 << 40 };
     vec![
-        Call::Register {
-            seq: Some(1),
-            event: Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"payload")).with_id(id(1)).with_expires(std::time::Duration::from_secs(5)).with_group([5; 16]),
-        },
+        Call::Register { seq: Some(1), event: Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"payload")).with_id(id(1)).with_not_before(std::time::Duration::from_secs(5)) },
         Call::Register { seq: None, event: Envelope::dispatch(ch("feed"), 18, Bytes::from(vec![7u8; 5000])) },
         Call::Delete { seq: 2, id: id(1), result: ch("results"), key: Some(WorkKey { generation: 1, arrival: 9 }) },
         Call::Delete { seq: 3, id: id(1), result: ch("results"), key: None },
-        Call::Join { req: 1, channel: Some(ch("orders")), types: vec![17, 23], isolated: false, lease_ms: 30_000, dispatch: true },
-        Call::Join { req: 7, channel: None, types: vec![17, u16::MAX], isolated: true, lease_ms: 1, dispatch: false },
-        Call::Join { req: 8, channel: Some(ch("orders")), types: Vec::new(), isolated: true, lease_ms: 0, dispatch: false },
+        Call::Join { req: 1, channel: Some(ch("orders")), types: vec![17, 23], lease_ms: 30_000, dispatch: true },
+        Call::Join { req: 7, channel: None, types: vec![17, u16::MAX], lease_ms: 1, dispatch: false },
+        Call::Join { req: 8, channel: Some(ch("orders")), types: Vec::new(), lease_ms: 0, dispatch: false },
         Call::Window { join: 1, count: 16, bytes: 1 << 20 },
         Call::Complete {
             seq: 4,
@@ -140,54 +141,38 @@ fn stats() -> Stats {
         disk_limit: 7,
         segments: 3,
         draining: true,
-        counters: Counters {
-            retransmits: 1,
-            duplicates: 2,
-            stale: 3,
-            expired: 4,
-            isolated: 5,
-            reclaimed: 6,
-            faults: 7,
-            over_limit: 8,
-            pauses: 9,
-            released: 10,
-            read_ahead: 11,
-            spilled_bytes: 12,
-            relocated: 13,
-            segments_removed: 14,
-            checkpoints: 15,
-        },
+        counters: Counters { retransmits: 1, duplicates: 2, stale: 3, reclaimed: 4, faults: 5, released: 6, read_ahead: 7, relocated: 8, segments_removed: 9, checkpoints: 10 },
         types: vec![TypeStat { event_type: 17, waiting: 9, oldest_ms: 300 }, TypeStat { event_type: u16::MAX, waiting: 1, oldest_ms: 0 }],
         idle_lanes: vec![IdleLane { channel: ch("orders"), event_type: 38, waiting: 4 }],
-        roots: vec![RootStat { root: 17, events: 12, bytes: 4096, disk: 8192, paused: true }, RootStat { root: 0, events: 1, bytes: 1, disk: 0, paused: false }],
     }
 }
 
 fn every_outbound() -> Vec<Outbound> {
-    let assignment = Assignment { event: assigned(1, b"body"), token: ClaimToken { generation: 2, seq: 77 }, lease_ms: 30_000, until: 29_000, more: true };
+    let assignment = Assignment { event: assigned(1, b"body"), until: 29_000, more: true };
     let mut notice = assigned(2, b"").notice();
     notice.failures = 0;
-    // An isolated event: its notice and its assignment carry the isolated bit (flag bit 9).
-    let isolated = Envelope { isolated: true, failures: 5, ..notice.clone() };
-    let isolated_assignment = Assignment { event: Envelope { isolated: true, ..assigned(4, b"again") }, ..assignment.clone() };
+    let failed = Envelope { failures: 5, ..notice.clone() };
+    // A claim mark with a large token and no `not_before`.
+    let other = Assignment {
+        event: Envelope { not_before: None, claim: Some(ClaimMark { worker: [1; 16], token: ClaimToken { generation: u32::MAX, seq: 1 << 50 }, lease_ms: 0 }), ..assigned(4, b"again") },
+        ..assignment.clone()
+    };
     vec![
         Outbound::Bye(ByeReason::Superseded),
         Outbound::Fault { kind: FaultKind::SequenceGap, detail: "sequence number skipped ahead" },
         Outbound::Committed { seq: 1 << 33 },
-        Outbound::Paused { event_type: 17 },
-        Outbound::Resumed { event_type: u16::MAX },
         Outbound::Joined { req: 1 },
         Outbound::Refused { req: 2, reason: Refusal::AlreadyClaimed },
         Outbound::Pending { join: 1 << 20 },
         Outbound::Assign(assignment.clone()),
-        Outbound::Assign(isolated_assignment),
+        Outbound::Assign(other),
         Outbound::Claimed { req: 3, assignment: Assignment { more: false, ..assignment } },
-        Outbound::Subscribed { req: 4, channel: ch("orders"), backlog: vec![notice.clone(), isolated.clone()], more: true },
+        Outbound::Subscribed { req: 4, channel: ch("orders"), backlog: vec![notice.clone(), failed.clone()], more: true },
         Outbound::Subscribed { req: 5, channel: ch("chat"), backlog: Vec::new(), more: false },
         Outbound::Unsubscribed { req: 6 },
         Outbound::Notice(notice),
-        Outbound::Notice(isolated),
-        Outbound::Delivery(Envelope::dispatch(ch("feed"), 3, Bytes::from(vec![1u8; 300])).with_id(id(3)).with_delegate("alice")),
+        Outbound::Notice(failed),
+        Outbound::Delivery(Envelope::dispatch(ch("feed"), 3, Bytes::from(vec![1u8; 300])).with_id(id(3))),
         Outbound::StatsReply { req: 7, stats: Box::new(stats()) },
         Outbound::Draining { req: 8 },
     ]
@@ -195,18 +180,11 @@ fn every_outbound() -> Vec<Outbound> {
 
 #[test]
 fn a_hello_record_has_these_exact_bytes() {
-    let hello = Hello { role: Role::Observe, credential: Name::new("ignored"), producer: None, nonce: [0xaa; 16], linger_ms: None, acks: true, types: Vec::new() };
-    let bytes = encode(&[Message::Hello { version: 2, features: 1, token: "ab".into(), hello: hello.clone() }], DICTIONARY).unwrap();
-    let mut expected = vec![HELLO, 24, 0, 0, 0, 0, 0, 2, 1, 3, 2, b'a', b'b', 0];
+    let hello = Hello { role: Role::Observe, credential: Name::new("ignored"), producer: None, nonce: [0xaa; 16], linger_ms: None, acks: true };
+    let bytes = encode(&[Message::Hello { version: 2, features: 1, token: "ab".into(), hello }]).unwrap();
+    // version, features, role, token, presence, nonce: no type list since version 5.
+    let mut expected = vec![HELLO, 23, 0, 0, 0, 0, 0, 2, 1, 3, 2, b'a', b'b', 0];
     expected.extend_from_slice(&[0xaa; 16]);
-    expected.push(0);
-    assert_eq!(bytes, expected);
-    // Declared types: a count, then each as a little-endian u16.
-    let typed = Hello { types: vec![7, 0x1234], ..hello };
-    let bytes = encode(&[Message::Hello { version: 2, features: 1, token: "ab".into(), hello: typed }], DICTIONARY).unwrap();
-    let mut expected = vec![HELLO, 28, 0, 0, 0, 0, 0, 2, 1, 3, 2, b'a', b'b', 0];
-    expected.extend_from_slice(&[0xaa; 16]);
-    expected.extend_from_slice(&[2, 7, 0, 0x34, 0x12]);
     assert_eq!(bytes, expected);
 }
 
@@ -216,7 +194,7 @@ fn a_hello_record_has_these_exact_bytes() {
 #[test]
 fn a_register_carries_its_channel_inline_and_its_payload_as_the_body_with_no_names() {
     let event = Envelope::dispatch(ch("c"), 10, Bytes::from_static(b"xyz")).with_id(id(0x22));
-    let bytes = encode(&[Message::Call(Call::Register { seq: Some(5), event })], DICTIONARY).unwrap();
+    let bytes = encode(&[Message::Call(Call::Register { seq: Some(5), event })]).unwrap();
     // seq 1 + head 38 (id 16, channel 16, type 2, flags 2, failures 2).
     let mut expected = vec![REGISTER, 39, 0, 3, 0, 0, 0, 5];
     expected.extend_from_slice(&[0x22; 16]);
@@ -226,71 +204,104 @@ fn a_register_carries_its_channel_inline_and_its_payload_as_the_body_with_no_nam
     assert_eq!(bytes, expected);
 }
 
-/// Channels and types never enter the dictionary: only the credential and
-/// the end user are names. Every record that names a channel is sent
-/// without a single `NameDef`.
+/// Version 5 has no names: no record of any message defines one, and the
+/// old dictionary tags (0x08, 0x09) and pause tags (0x21, 0x22) are unknown
+/// in both directions.
 #[test]
-fn the_dictionary_carries_no_channel_and_no_type() {
-    let calls = vec![
-        Message::Call(Call::Register { seq: Some(1), event: Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"p")) }),
-        Message::Call(Call::Delete { seq: 2, id: id(1), result: ch("results"), key: None }),
-        Message::Call(Call::Join { req: 1, channel: Some(ch("orders")), types: vec![17], isolated: false, lease_ms: 1, dispatch: true }),
-        Message::Call(Call::Subscribe { req: 2, channel: ch("feed"), after: None }),
-        Message::Call(Call::Unsubscribe { req: 3, channel: ch("feed") }),
-    ];
-    let bytes = encode(&calls, DICTIONARY).unwrap();
-    assert!(split(&bytes).iter().all(|(raw, _)| raw.tag != NAME_DEF), "no name was defined");
-    let named = encode(&[Message::Call(Call::Register { seq: Some(1), event: Envelope::claimable(ch("orders"), 17, Bytes::new()).with_delegate("user-r") })], DICTIONARY).unwrap();
-    assert_eq!(split(&named).iter().filter(|(raw, _)| raw.tag == NAME_DEF).count(), 1, "the end user is the one name");
+fn no_record_defines_a_name_and_the_retired_tags_are_unknown() {
+    let mut messages = vec![hello(Role::Produce)];
+    messages.extend(every_call().into_iter().map(Message::Call));
+    let bytes = encode(&messages).unwrap();
+    assert!(split(&bytes).iter().all(|(raw, _)| !matches!(raw.tag, 0x08 | 0x09)), "no NameDef, no DictReset");
+    let mut messages = vec![welcome()];
+    messages.extend(every_outbound().into_iter().map(Message::Outbound));
+    let bytes = encode(&messages).unwrap();
+    assert!(split(&bytes).iter().all(|(raw, _)| !matches!(raw.tag, 0x08 | 0x09 | 0x21 | 0x22)), "no dictionary or pause record");
+    for (opener, side) in [(hello(Role::Produce), Side::Server), (welcome(), Side::Client)] {
+        for tag in [0x08u8, 0x09, 0x21, 0x22] {
+            let mut bytes = encode(std::slice::from_ref(&opener)).unwrap();
+            bytes.extend_from_slice(&[tag, 1, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(decode(&bytes, side), Err(ProtocolError::UnknownTag(tag)), "tag {tag:#04x} on {side:?}");
+        }
+    }
 }
 
-/// A notice written by hand from the layout decodes: the 38-byte head, the
-/// isolated bit (9), then the work key.
+/// An assignment written by hand from the layout decodes: its head (remaining
+/// lease, more), the 38-byte event head, the work key, `not_before` (flag
+/// bit 1) and the claim mark (flag bit 2: worker, token, lease). The same
+/// event head is refused where a claim mark does not belong.
 #[test]
-fn a_38_byte_head_with_the_isolated_bit_decodes() {
-    let mut bytes = encode(&[welcome()], DICTIONARY).unwrap();
-    bytes.extend_from_slice(&[NOTICE, 43, 0, 0, 0, 0, 0]);
-    bytes.extend_from_slice(&[0x11; 16]);
-    bytes.extend_from_slice(&ch("orders").0);
-    bytes.extend_from_slice(&[17, 0, 0x00, 0x02, 3, 0]);
-    bytes.extend_from_slice(&[2, 0, 0, 0, 5]);
-    let decoded = decode(&bytes, Side::Client, DICTIONARY).unwrap();
-    let Message::Outbound(Outbound::Notice(notice)) = &decoded[1] else { panic!("{decoded:?}") };
-    assert_eq!((notice.id, notice.channel, notice.event_type, notice.isolated, notice.failures, notice.key), (id(0x11), ch("orders"), 17, true, 3, Some(WorkKey { generation: 2, arrival: 5 })));
-    assert_eq!(notice.kind, ruvent::Kind::Claimable);
-}
-
-/// Only the server sets the isolated bit: a registration carrying it is refused before it is written.
-#[test]
-fn a_request_with_the_isolated_bit_is_refused() {
-    let mut encoder = Encoder::new(DICTIONARY);
-    encoder.push(&hello(Role::Produce)).unwrap();
-    let event = Envelope { isolated: true, ..Envelope::claimable(ch("orders"), 17, Bytes::new()) };
-    assert_eq!(encoder.push(&Message::Call(Call::Register { seq: Some(1), event })), Err(ProtocolError::Malformed(Malformed::Forbidden("isolated"))));
-    let mut bytes = encode(&[hello(Role::Produce)], DICTIONARY).unwrap();
+fn a_38_byte_head_with_not_before_and_a_claim_mark_decodes_only_as_an_assignment() {
+    let mut head = Vec::new();
+    head.extend_from_slice(&[0x11; 16]);
+    head.extend_from_slice(&ch("orders").0);
+    head.extend_from_slice(&[17, 0, 0x06, 0x00, 3, 0]);
+    assert_eq!(head.len(), 38);
+    let mut assign = vec![5, 1];
+    assign.extend_from_slice(&head);
+    assign.extend_from_slice(&[2, 0, 0, 0, 44]);
+    assign.push(9);
+    assign.extend_from_slice(&[0x77; 16]);
+    assign.extend_from_slice(&[2, 0, 0, 0, 5, 7]);
+    let mut bytes = encode(&[welcome()]).unwrap();
+    bytes.extend_from_slice(&[ASSIGN, assign.len() as u8, 0, 2, 0, 0, 0]);
+    bytes.extend_from_slice(&assign);
+    bytes.extend_from_slice(b"hi");
+    let decoded = decode(&bytes, Side::Client).unwrap();
+    let Message::Outbound(Outbound::Assign(assignment)) = &decoded[1] else { panic!("{decoded:?}") };
+    let event = &assignment.event;
+    assert_eq!((event.id, event.channel, event.event_type, event.failures, event.key, event.not_before), (id(0x11), ch("orders"), 17, 3, Some(WorkKey { generation: 2, arrival: 44 }), Some(9)));
+    assert_eq!(event.claim, Some(ClaimMark { worker: [0x77; 16], token: ClaimToken { generation: 2, seq: 5 }, lease_ms: 7 }));
+    assert_eq!((assignment.token(), assignment.lease_ms(), assignment.until, assignment.more), (ClaimToken { generation: 2, seq: 5 }, 7, 5, true));
+    assert_eq!(&event.payload[..], b"hi");
+    // In a registration: the claim mark is a field it does not carry.
+    let mut bytes = encode(&[hello(Role::Produce)]).unwrap();
     bytes.extend_from_slice(&[REGISTER, 39, 0, 0, 0, 0, 0, 1]);
-    bytes.extend_from_slice(&[0; 16]);
-    bytes.extend_from_slice(&ch("orders").0);
-    bytes.extend_from_slice(&[17, 0, 0x00, 0x02, 0, 0]);
-    assert_eq!(decode(&bytes, Side::Server, DICTIONARY), Err(ProtocolError::Malformed(Malformed::Forbidden("isolated"))));
+    let mut request = head.clone();
+    request[36] = 0;
+    bytes.extend_from_slice(&request);
+    assert_eq!(decode(&bytes, Side::Server), Err(ProtocolError::Malformed(Malformed::Forbidden("a field this record does not carry"))));
+    // In a delivery: neither `not_before` nor a claim mark.
+    let mut delivery = head.clone();
+    delivery[36] = 0;
+    delivery[34] = 0x06;
+    let mut bytes = encode(&[welcome()]).unwrap();
+    bytes.extend_from_slice(&[DELIVERY, 38, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&delivery);
+    assert_eq!(decode(&bytes, Side::Client), Err(ProtocolError::Malformed(Malformed::Forbidden("a field this record does not carry"))));
 }
 
-/// Feature bit 5 (prefix subscriptions) is gone with channel names: this build never announces it.
+/// An assignment without a claim mark is refused before it is written, and a
+/// request's claim mark is never written (only the server sets one).
 #[test]
-fn the_prefix_feature_bit_is_reserved() {
-    assert_eq!(features::ALL & (1 << 5), 0);
+fn an_assignment_needs_a_claim_mark_and_a_request_never_carries_one() {
+    let mut encoder = Encoder::new();
+    encoder.push(&welcome()).unwrap();
+    let bare = Assignment { event: Envelope { claim: None, ..assigned(1, b"p") }, until: 1, more: false };
+    assert_eq!(encoder.push(&Message::Outbound(Outbound::Assign(bare))), Err(ProtocolError::Malformed(Malformed::Missing("claim mark"))));
+    let marked = Envelope { claim: Some(claim(1)), ..Envelope::claimable(ch("orders"), 17, Bytes::new()) };
+    let decoded = trip(&[Message::Call(Call::Register { seq: Some(1), event: marked.clone() })], Side::Server).unwrap();
+    assert_eq!(decoded, [Message::Call(Call::Register { seq: Some(1), event: Envelope { claim: None, ..marked } })]);
+}
+
+/// Feature bits of what version 5 dropped — pause (1), prefix subscriptions
+/// (5), `group` (6) — are never announced.
+#[test]
+fn the_retired_feature_bits_are_reserved() {
+    assert_eq!(features::ALL & ((1 << 1) | (1 << 5) | (1 << 6)), 0);
+    assert_eq!(features::ALL, features::SEQUENCE | features::WINDOW | features::TIMING | features::OPERATE);
 }
 
 /// Every record of 2.11 round-trips (property: equal after encode and decode).
 #[test]
 fn every_call_and_every_server_message_round_trips() {
     let calls: Vec<Message> = every_call().into_iter().map(Message::Call).collect();
-    assert_eq!(trip(&calls, Side::Server, DICTIONARY).unwrap(), calls);
+    assert_eq!(trip(&calls, Side::Server).unwrap(), calls);
     let outbound: Vec<Message> = every_outbound().into_iter().map(Message::Outbound).collect();
-    assert_eq!(trip(&outbound, Side::Client, DICTIONARY).unwrap(), outbound);
-    let opened = decode(&encode(&[hello(Role::Work)], DICTIONARY).unwrap(), Side::Server, DICTIONARY).unwrap();
+    assert_eq!(trip(&outbound, Side::Client).unwrap(), outbound);
+    let opened = decode(&encode(&[hello(Role::Work)]).unwrap(), Side::Server).unwrap();
     assert_eq!(opened, [hello(Role::Work)]);
-    let welcomed = decode(&encode(&[welcome()], DICTIONARY).unwrap(), Side::Client, DICTIONARY).unwrap();
+    let welcomed = decode(&encode(&[welcome()]).unwrap(), Side::Client).unwrap();
     assert_eq!(welcomed, [welcome()]);
 }
 
@@ -298,54 +309,55 @@ fn every_call_and_every_server_message_round_trips() {
 #[test]
 fn an_engine_welcome_is_sent_with_this_version_and_the_encoders_features() {
     let welcome = Welcome { server_id: [1; 16], generation: 1, credential: "svc".into(), resume: 0, superseded: false };
-    let mut encoder = Encoder::new(DICTIONARY).with_features(features::SEQUENCE | features::OPERATE);
+    let mut encoder = Encoder::new().with_features(features::SEQUENCE | features::OPERATE);
     encoder.push(&Message::Outbound(Outbound::Welcome(welcome.clone()))).unwrap();
-    let decoded = decode(&concat(encoder.take()), Side::Client, DICTIONARY).unwrap();
+    let decoded = decode(&concat(encoder.take()), Side::Client).unwrap();
     assert_eq!(decoded, [Message::Welcome { version: VERSION, features: features::SEQUENCE | features::OPERATE, welcome }]);
 }
 
 /// An assignment carries the lease left when the server starts writing it.
 #[test]
 fn an_assignment_carries_the_lease_left_at_the_moment_it_is_written() {
-    let assignment = Assignment { event: assigned(1, b"p"), token: ClaimToken { generation: 1, seq: 1 }, lease_ms: 30_000, until: 50_000, more: false };
-    let mut encoder = Encoder::new(DICTIONARY);
+    let assignment = Assignment { event: assigned(1, b"p"), until: 50_000, more: false };
+    let mut encoder = Encoder::new();
     encoder.push(&Message::Outbound(Outbound::Welcome(Welcome { server_id: [0; 16], generation: 1, credential: "s".into(), resume: 0, superseded: false }))).unwrap();
     encoder.set_now(45_500);
     encoder.push(&Message::Outbound(Outbound::Assign(assignment.clone()))).unwrap();
-    let decoded = decode(&concat(encoder.take()), Side::Client, DICTIONARY).unwrap();
+    let decoded = decode(&concat(encoder.take()), Side::Client).unwrap();
     assert_eq!(decoded[1], Message::Outbound(Outbound::Assign(Assignment { until: 4_500, ..assignment })));
 }
 
 fn arbitrary_event() -> impl Strategy<Value = Envelope> {
-    (any::<[u8; 16]>(), any::<u16>(), proptest::collection::vec(any::<u8>(), 0..600), any::<bool>(), any::<[u8; 16]>(), any::<bool>()).prop_map(|(channel, kind, payload, dispatch, raw, delegate)| {
-        let channel = Channel(channel);
-        let mut event = if dispatch { Envelope::dispatch(channel, kind, payload) } else { Envelope::claimable(channel, kind, payload) };
-        event.id = EventId(raw);
-        if delegate {
-            event = event.with_delegate(format!("user.{}", kind % 8));
-        }
-        event
-    })
+    (any::<[u8; 16]>(), any::<u16>(), proptest::collection::vec(any::<u8>(), 0..600), any::<bool>(), any::<[u8; 16]>(), proptest::option::of(any::<u32>())).prop_map(
+        |(channel, kind, payload, dispatch, raw, delay)| {
+            let channel = Channel(channel);
+            let mut event = if dispatch { Envelope::dispatch(channel, kind, payload) } else { Envelope::claimable(channel, kind, payload) };
+            event.id = EventId(raw);
+            if let (false, Some(delay)) = (dispatch, delay) {
+                event = event.with_not_before(std::time::Duration::from_millis(u64::from(delay)));
+            }
+            event
+        },
+    )
 }
 
 proptest! {
-    /// Arbitrary registrations and completions round-trip through
-    /// dictionaries small enough to reset often.
+    /// Arbitrary registrations and completions round-trip.
     #[test]
-    fn calls_round_trip_through_small_dictionaries(events in proptest::collection::vec(arbitrary_event(), 1..30), cap in 6usize..12) {
+    fn arbitrary_calls_round_trip(events in proptest::collection::vec(arbitrary_event(), 1..30)) {
         let mut calls = Vec::new();
         for (index, event) in events.iter().enumerate() {
             calls.push(Message::Call(Call::Register { seq: Some(index as u64 + 1), event: event.clone() }));
         }
         calls.push(Message::Call(Call::Complete { seq: 99, id: id(1), token: ClaimToken::default(), follow_ups: events.iter().take(2).cloned().collect(), spooled: Vec::new() }));
-        prop_assert_eq!(trip(&calls, Side::Server, cap).unwrap(), calls);
+        prop_assert_eq!(trip(&calls, Side::Server).unwrap(), calls);
     }
 
     /// No input makes the decoder panic; it refuses or decodes.
     #[test]
     fn arbitrary_bytes_never_panic_the_decoder(bytes in proptest::collection::vec(any::<u8>(), 0..400)) {
         for side in [Side::Server, Side::Client] {
-            let mut decoder = Decoder::new(side, 8);
+            let mut decoder = Decoder::new(side);
             let mut at = 0;
             while at + HEADER <= bytes.len() {
                 let head = u16::from_le_bytes([bytes[at + 1], bytes[at + 2]]) as usize;
@@ -370,8 +382,8 @@ fn a_completion_is_handed_over_only_when_its_last_follow_up_arrived() {
         follow_ups: vec![Envelope::dispatch(ch("a"), 20, Bytes::from_static(b"1")), Envelope::dispatch(ch("a"), 21, Bytes::from_static(b"2"))],
         spooled: Vec::new(),
     };
-    let bytes = encode(&[hello(Role::Work), Message::Call(call.clone())], DICTIONARY).unwrap();
-    let mut decoder = Decoder::new(Side::Server, DICTIONARY);
+    let bytes = encode(&[hello(Role::Work), Message::Call(call.clone())]).unwrap();
+    let mut decoder = Decoder::new(Side::Server);
     let mut handed = Vec::new();
     for (raw, body) in split(&bytes) {
         decoder.admit(&raw).unwrap();
@@ -380,35 +392,35 @@ fn a_completion_is_handed_over_only_when_its_last_follow_up_arrived() {
             assert!(decoder.gathering());
         }
     }
-    // hello, complete, follow-up, follow-up: no names (the channel and the type are inline)
+    // hello, complete, follow-up, follow-up
     assert_eq!(handed.iter().filter(|done| **done).count(), 2, "the hello and the completion: {handed:?}");
     assert!(!decoder.gathering());
 }
 
 #[test]
 fn a_record_from_the_wrong_direction_or_out_of_place_is_refused() {
-    let welcome_bytes = encode(&[welcome()], DICTIONARY).unwrap();
-    assert_eq!(decode(&welcome_bytes, Side::Server, DICTIONARY), Err(ProtocolError::WrongDirection(0x02)));
-    let call = encode(&[hello(Role::Work), Message::Call(Call::Stats { req: 1 })], DICTIONARY).unwrap();
-    assert_eq!(decode(&call, Side::Client, DICTIONARY), Err(ProtocolError::WrongDirection(HELLO)));
+    let welcome_bytes = encode(&[welcome()]).unwrap();
+    assert_eq!(decode(&welcome_bytes, Side::Server), Err(ProtocolError::WrongDirection(0x02)));
+    let call = encode(&[hello(Role::Work), Message::Call(Call::Stats { req: 1 })]).unwrap();
+    assert_eq!(decode(&call, Side::Client), Err(ProtocolError::WrongDirection(HELLO)));
     // Nothing before the hello.
-    let early = encode(&[Message::Call(Call::Stats { req: 1 })], DICTIONARY).unwrap();
-    assert!(matches!(decode(&early, Side::Server, DICTIONARY), Err(ProtocolError::Handshake(_))));
+    let early = encode(&[Message::Call(Call::Stats { req: 1 })]).unwrap();
+    assert!(matches!(decode(&early, Side::Server), Err(ProtocolError::Handshake(_))));
     // A second hello, and a follow-up outside a completion.
-    let twice = encode(&[hello(Role::Work), hello(Role::Work)], DICTIONARY).unwrap();
-    assert_eq!(decode(&twice, Side::Server, DICTIONARY), Err(ProtocolError::WrongDirection(HELLO)));
-    let mut stray = encode(&[hello(Role::Work)], DICTIONARY).unwrap();
+    let twice = encode(&[hello(Role::Work), hello(Role::Work)]).unwrap();
+    assert_eq!(decode(&twice, Side::Server), Err(ProtocolError::WrongDirection(HELLO)));
+    let mut stray = encode(&[hello(Role::Work)]).unwrap();
     stray.extend_from_slice(&[0x15, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(decode(&stray, Side::Server, DICTIONARY), Err(ProtocolError::WrongDirection(0x15)));
+    assert_eq!(decode(&stray, Side::Server), Err(ProtocolError::WrongDirection(0x15)));
 }
 
 #[test]
 fn unknown_tags_leftover_bytes_bodies_on_bodiless_records_and_forbidden_heads_are_refused() {
-    let opened = encode(&[hello(Role::Produce)], DICTIONARY).unwrap();
+    let opened = encode(&[hello(Role::Produce)]).unwrap();
     let with = |extra: &[u8]| {
         let mut bytes = opened.clone();
         bytes.extend_from_slice(extra);
-        decode(&bytes, Side::Server, DICTIONARY)
+        decode(&bytes, Side::Server)
     };
     assert_eq!(with(&[0x7f, 0, 0, 0, 0, 0, 0]), Err(ProtocolError::UnknownTag(0x7f)));
     assert_eq!(with(&[0x1b, 2, 0, 0, 0, 0, 0, 1, 9]), Err(ProtocolError::Malformed(Malformed::Trailing)));
@@ -417,38 +429,27 @@ fn unknown_tags_leftover_bytes_bodies_on_bodiless_records_and_forbidden_heads_ar
     let mut bad = vec![REGISTER, 40, 0, 0, 0, 0, 0, 1];
     bad.extend_from_slice(&[0; 16]);
     bad.extend_from_slice(&ch("c").0);
-    bad.extend_from_slice(&[0, 0, 0x41, 0, 0, 0, 5]);
-    assert_eq!(with(&bad), Err(ProtocolError::Malformed(Malformed::Forbidden("timing or group on a dispatch event"))));
+    bad.extend_from_slice(&[0, 0, 0x03, 0, 0, 0, 5]);
+    assert_eq!(with(&bad), Err(ProtocolError::Malformed(Malformed::Forbidden("not_before or a claim mark on a dispatch event"))));
+    // A reserved flag bit (3).
+    let mut reserved = vec![REGISTER, 39, 0, 0, 0, 0, 0, 1];
+    reserved.extend_from_slice(&[0; 16]);
+    reserved.extend_from_slice(&ch("c").0);
+    reserved.extend_from_slice(&[0, 0, 0x08, 0, 0, 0]);
+    assert_eq!(with(&reserved), Err(ProtocolError::Malformed(Malformed::Reserved)));
 }
 
-/// A refused message writes nothing, not even the names it would have defined,
-/// so the dictionaries stay in step.
+/// A refused message writes nothing: the next one decodes as if it were the first.
 #[test]
-fn a_refused_message_leaves_no_name_definition_behind() {
-    let mut encoder = Encoder::new(DICTIONARY);
+fn a_refused_message_writes_nothing() {
+    let mut encoder = Encoder::new();
     encoder.push(&hello(Role::Produce)).unwrap();
-    let bad = Envelope::dispatch(ch("never"), 22, Bytes::new()).with_delegate("someone").with_not_before(std::time::Duration::from_secs(1));
+    let bad = Envelope::dispatch(ch("never"), 22, Bytes::new()).with_not_before(std::time::Duration::from_secs(1));
     assert!(encoder.push(&Message::Call(Call::Register { seq: Some(1), event: bad })).is_err());
-    let good = Message::Call(Call::Register { seq: Some(1), event: Envelope::dispatch(ch("never"), 22, Bytes::new()).with_delegate("someone") });
+    let good = Message::Call(Call::Register { seq: Some(1), event: Envelope::dispatch(ch("never"), 22, Bytes::new()) });
     encoder.push(&good).unwrap();
-    let decoded = decode(&concat(encoder.take()), Side::Server, DICTIONARY).unwrap();
+    let decoded = decode(&concat(encoder.take()), Side::Server).unwrap();
     assert_eq!(decoded[1], good);
-}
-
-#[test]
-fn after_a_reset_an_old_number_is_never_read_as_a_new_name() {
-    let names: Vec<Message> =
-        (0..6).map(|index| Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, Bytes::new()).with_id(id(index)).with_delegate(format!("user-{index}"))))).collect();
-    let bytes = encode(&std::iter::once(welcome()).chain(names.clone()).collect::<Vec<_>>(), 2).unwrap();
-    assert!(split(&bytes).iter().filter(|(raw, _)| raw.tag == RESET).count() >= 2);
-    assert_eq!(decode(&bytes, Side::Client, 2).unwrap()[1..], names[..]);
-}
-
-#[test]
-fn the_receiver_holds_the_same_bound() {
-    let names: Vec<Message> = (0..3).map(|index| Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, Bytes::new()).with_delegate(format!("u{index}"))))).collect();
-    let bytes = encode(&std::iter::once(welcome()).chain(names).collect::<Vec<_>>(), 8).unwrap();
-    assert_eq!(decode(&bytes, Side::Client, 2), Err(ProtocolError::Dictionary("more definitions than the bound")));
 }
 
 /// A body past the inline bound is the payload itself, shared, not a copy;
@@ -457,13 +458,13 @@ fn the_receiver_holds_the_same_bound() {
 fn a_large_body_is_its_own_shared_vector_entry_and_a_small_one_is_inlined() {
     let large = Bytes::from(vec![5u8; 4096]);
     let small = Bytes::from_static(b"tiny");
-    let mut encoder = Encoder::new(DICTIONARY);
+    let mut encoder = Encoder::new();
     encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, large.clone())))).unwrap();
     assert!(encoder.shares(&large), "the large payload is an entry of its own, not copied");
-    let mut encoder = Encoder::new(DICTIONARY);
+    let mut encoder = Encoder::new();
     encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, small.clone())))).unwrap();
     assert!(!encoder.shares(&small), "a small payload is copied next to its head");
-    let mut encoder = Encoder::new(DICTIONARY);
+    let mut encoder = Encoder::new();
     for payload in [small, large] {
         encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, payload)))).unwrap();
     }
@@ -476,12 +477,12 @@ fn a_large_body_is_its_own_shared_vector_entry_and_a_small_one_is_inlined() {
 /// recognised by its first bytes.
 #[test]
 fn version_1_is_refused() {
-    let mut bytes = encode(&[hello(Role::Produce)], DICTIONARY).unwrap();
+    let mut bytes = encode(&[hello(Role::Produce)]).unwrap();
     bytes[7] = 1;
-    assert_eq!(decode(&bytes, Side::Server, DICTIONARY), Err(ProtocolError::Version(1)));
+    assert_eq!(decode(&bytes, Side::Server), Err(ProtocolError::Version(1)));
     let v1_hello = [11, 0, 0, 0, 1, 0, 0, 0, 0x01, 1, 0, 2, 0, b'a', b'b'];
     assert!(sniff_v1(&v1_hello));
-    assert!(!sniff_v1(&encode(&[hello(Role::Produce)], DICTIONARY).unwrap()));
+    assert!(!sniff_v1(&encode(&[hello(Role::Produce)]).unwrap()));
     let bye = v1_bye("unsupported protocol version 1");
     assert_eq!(&bye[..9], &[4 + 1 + 2 + 30, 0, 0, 0, 1, 0, 0, 0, BYE]);
 }
@@ -497,14 +498,14 @@ async fn records_are_read_head_first_and_each_body_into_its_own_buffer() {
         Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, big.clone()))),
         Message::Outbound(Outbound::Committed { seq: 3 }),
     ];
-    let bytes = encode(&messages, DICTIONARY).unwrap();
+    let bytes = encode(&messages).unwrap();
     let (mut client, server) = tokio::io::duplex(1024);
     let writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         client.write_all(&bytes).await.unwrap();
     });
     let mut reader = RecordReader::new(server);
-    let mut decoder = Decoder::new(Side::Client, DICTIONARY);
+    let mut decoder = Decoder::new(Side::Client);
     let mut decoded = Vec::new();
     while decoded.len() < messages.len() {
         let raw = reader.head().await.unwrap().unwrap();
@@ -547,7 +548,7 @@ async fn a_partial_write_continues_where_it_stopped() {
         }
     }
     let messages: Vec<Message> = std::iter::once(welcome()).chain(every_outbound().into_iter().map(Message::Outbound)).collect();
-    let mut encoder = Encoder::new(DICTIONARY);
+    let mut encoder = Encoder::new();
     for message in &messages {
         encoder.push(message).unwrap();
     }
@@ -555,5 +556,5 @@ async fn a_partial_write_continues_where_it_stopped() {
     let mut trickle = Trickle(Vec::new());
     parts.write_to(&mut trickle).await.unwrap();
     assert_eq!(parts.written(), parts.total());
-    assert_eq!(decode(&trickle.0, Side::Client, DICTIONARY).unwrap(), messages);
+    assert_eq!(decode(&trickle.0, Side::Client).unwrap(), messages);
 }

@@ -2,20 +2,17 @@
 
 use super::fields::{boolean, channel, intern, key, text, token, varint32};
 use super::*;
-use crate::dictionary::Incoming;
 use crate::error::ProtocolError;
 use crate::io::RawRecord;
 use crate::VERSION;
 use bytes::Bytes;
 use ruvent::envelope::codec::{self, Layout, Malformed, Reader};
-use ruvent::{Assignment, ByeReason, Channel, ClaimToken, Envelope, EventId, FaultKind, Refusal, Role};
+use ruvent::{Assignment, ByeReason, Channel, ClaimToken, Envelope, EventId, FaultKind, Name, Refusal, Role};
 
 /// Most follow-ups one `Complete`, or notices one `Subscribed`, may announce.
 /// The engine bounds both far lower (S10, `backlog_page`); this only keeps a
 /// count from a broken peer from meaning anything.
 const GATHERED: u64 = 1 << 16;
-/// Most types a `Hello` may declare.
-const DECLARED: u64 = 1 << 12;
 
 /// A message whose records are still arriving.
 enum Gather {
@@ -28,8 +25,8 @@ enum Gather {
 /// Reading one record is three steps, so the body can go where it belongs
 /// before it is read: [`Decoder::admit`] the head (may this record come now,
 /// does it carry a body), read the body, then [`Decoder::decode`]. Any error
-/// refuses the record and the connection must be closed, because the
-/// dictionary may already be out of step.
+/// refuses the record and the connection must be closed: what follows it
+/// cannot be trusted to start at a record boundary.
 ///
 /// The gathering state:
 ///
@@ -41,7 +38,6 @@ enum Gather {
 /// | cleared by | the last record of the message |
 pub struct Decoder {
     side: Side,
-    dictionary: Incoming,
     started: bool,
     gather: Option<Gather>,
 }
@@ -72,8 +68,8 @@ fn count(reader: &mut Reader<'_>, bound: u64) -> Result<u64, ProtocolError> {
 }
 
 impl Decoder {
-    pub fn new(side: Side, dictionary: usize) -> Self {
-        Decoder { side, dictionary: Incoming::new(dictionary), started: false, gather: None }
+    pub fn new(side: Side) -> Self {
+        Decoder { side, started: false, gather: None }
     }
 
     /// Whether a message is half gathered: a record boundary that is not a
@@ -108,8 +104,8 @@ impl Decoder {
             return Err(ProtocolError::WrongDirection(tag));
         }
         let fits = match &self.gather {
-            Some(Gather::Complete { .. }) => matches!(tag, FOLLOW_UP | NAME_DEF | RESET),
-            Some(Gather::Subscribed { .. }) => matches!(tag, NOTICE | NAME_DEF | RESET),
+            Some(Gather::Complete { .. }) => tag == FOLLOW_UP,
+            Some(Gather::Subscribed { .. }) => tag == NOTICE,
             None => tag != FOLLOW_UP,
         };
         if !fits {
@@ -123,7 +119,7 @@ impl Decoder {
     }
 
     /// The event head of a `FollowUp` (payload empty), read without
-    /// consuming the record: where its body should go depends on its channel.
+    /// consuming the record.
     pub fn follow_up(&self, record: &RawRecord) -> Result<Envelope, ProtocolError> {
         if record.tag != FOLLOW_UP {
             return Err(ProtocolError::WrongDirection(record.tag));
@@ -132,8 +128,8 @@ impl Decoder {
         self.event(&mut reader, Layout::Request)
     }
 
-    /// Decodes one admitted record whose body is `body`. `None`: a dictionary
-    /// record, or a record of a message still being gathered.
+    /// Decodes one admitted record whose body is `body`. `None`: a record of
+    /// a message still being gathered.
     pub fn decode(&mut self, record: &RawRecord, body: Body) -> Result<Option<Message>, ProtocolError> {
         self.admit(record)?;
         let mut reader = Reader::new(&record.head);
@@ -143,8 +139,7 @@ impl Decoder {
     }
 
     fn event(&self, reader: &mut Reader<'_>, layout: Layout) -> Result<Envelope, ProtocolError> {
-        let dictionary = &self.dictionary;
-        Ok(codec::decode_head(reader, layout, &|number| dictionary.get(number))?)
+        Ok(codec::decode_head(reader, layout)?)
     }
 
     /// An event head with the record's body as its payload.
@@ -155,27 +150,15 @@ impl Decoder {
     }
 
     fn assignment(&self, reader: &mut Reader<'_>, record: &RawRecord, body: Body) -> Result<Assignment, ProtocolError> {
-        let token = token(reader)?;
-        let lease_ms = reader.varint()?;
         let remaining = reader.varint()?;
         let more = boolean(reader)?;
         let event = self.carried(reader, Layout::Assigned, record, body)?;
-        Ok(Assignment { event, token, lease_ms, until: remaining, more })
+        Ok(Assignment { event, until: remaining, more })
     }
 
     fn record(&mut self, record: &RawRecord, reader: &mut Reader<'_>, body: Body) -> Result<Option<Message>, ProtocolError> {
         let tag = record.tag;
         let message = match tag {
-            NAME_DEF => {
-                let number = varint32(reader)?;
-                let name = Name::from(text(reader)?);
-                self.dictionary.define(number, name)?;
-                return Ok(None);
-            }
-            RESET => {
-                self.dictionary.reset();
-                return Ok(None);
-            }
             HELLO => {
                 let version = varint32(reader)?;
                 if version != VERSION {
@@ -192,12 +175,8 @@ impl Decoder {
                 let nonce = reader.bytes16()?;
                 let linger_ms = if presence & 2 != 0 { Some(reader.varint()?) } else { None };
                 let acks = presence & 4 == 0;
-                let mut types = Vec::new();
-                for _ in 0..count(reader, DECLARED)? {
-                    types.push(reader.u16()?);
-                }
                 self.started = true;
-                Message::Hello { version, features, token, hello: Hello { role, credential: Name::new(""), producer, nonce, linger_ms, acks, types } }
+                Message::Hello { version, features, token, hello: Hello { role, credential: Name::new(""), producer, nonce, linger_ms, acks } }
             }
             WELCOME => {
                 let version = varint32(reader)?;
@@ -241,9 +220,8 @@ impl Decoder {
                 for _ in 0..count(reader, GATHERED)? {
                     types.push(reader.u16()?);
                 }
-                let isolated = boolean(reader)?;
                 let lease_ms = reader.varint()?;
-                Message::Call(Call::Join { req, channel, types, isolated, lease_ms, dispatch: boolean(reader)? })
+                Message::Call(Call::Join { req, channel, types, lease_ms, dispatch: boolean(reader)? })
             }
             WINDOW => {
                 let join = varint32(reader)?;
@@ -311,8 +289,6 @@ impl Decoder {
             STATS => Message::Call(Call::Stats { req: req(reader)? }),
             DRAIN => Message::Call(Call::Drain { req: req(reader)? }),
             COMMITTED => Message::Outbound(Outbound::Committed { seq: reader.varint()? }),
-            PAUSED => Message::Outbound(Outbound::Paused { event_type: reader.u16()? }),
-            RESUMED => Message::Outbound(Outbound::Resumed { event_type: reader.u16()? }),
             JOINED => Message::Outbound(Outbound::Joined { req: req(reader)? }),
             REFUSED => {
                 let req = req(reader)?;

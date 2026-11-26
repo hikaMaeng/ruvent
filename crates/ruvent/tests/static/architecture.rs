@@ -9,16 +9,14 @@ use std::path::Path;
 ///
 /// ```text
 /// methods ──► engine ──► journal ──► envelope ──► names
-///                  ├───► snapshot ──┘
-///                  └───► types ◄── snapshot      (type sets: what settings and grants are keyed by)
+///                  └───► snapshot ──┘
 /// ```
 const LAYERS: &[(&str, &[&str])] = &[
     ("names", &[]),
-    ("types", &[]),
     ("envelope", &["names"]),
     ("journal", &["envelope", "names"]),
-    ("snapshot", &["envelope", "names", "types"]),
-    ("engine", &["envelope", "journal", "names", "snapshot", "types"]),
+    ("snapshot", &["envelope", "names"]),
+    ("engine", &["envelope", "journal", "names", "snapshot"]),
     ("methods", &["engine", "envelope", "names"]),
 ];
 

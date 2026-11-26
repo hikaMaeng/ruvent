@@ -455,7 +455,8 @@ impl Actor {
     }
 
     async fn assigned(&mut self, server: Server, assignment: Assignment) {
-        let Assignment { event, token, lease_ms, until, more } = assignment;
+        let (token, lease_ms) = (assignment.token(), assignment.lease_ms());
+        let Assignment { event, until, more } = assignment;
         let id = event.id;
         let index = self.service(&event);
         let arrival = match index {

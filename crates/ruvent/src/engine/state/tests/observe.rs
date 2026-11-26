@@ -44,40 +44,10 @@ fn a_channel_that_is_not_a_uuidv7_is_refused_everywhere() {
     assert!(h.slot(id).is_some(), "nothing was deleted");
 }
 
-/// Subscriptions, their backlog and dispatch joins hand a connection only the
-/// events of the types its credential is granted; the server's own type-0
-/// delete outcomes always pass (plan 9.15).
-#[test]
-fn readers_get_only_the_types_their_credential_is_granted() {
-    let mut grants = Grants::new();
-    grants.insert("svc".into(), Grant::all());
-    grants.insert("narrow".into(), Grant { methods: vec![Method::Subscribe, Method::Claim], types: TypeSet::of([10]), delegate: false });
-    let mut h = H::with(EngineConfig { grants: Some(grants), ..config() }, false).cast();
-    h.open(20, Hello { credential: "narrow".into(), ..hello(Role::Observe, 20) });
-    h.open(21, Hello { credential: "narrow".into(), ..hello(Role::Work, 21) });
-    h.produce(P, Envelope::claimable(ch("room"), 10, Bytes::new()).with_id(id(1)));
-    h.produce(P, Envelope::claimable(ch("room"), 11, Bytes::new()).with_id(id(2)));
-    let backlog = h.call(20, Call::Subscribe { req: 1, channel: ch("room"), after: None });
-    let Ok::<[Outbound; 1], _>([Outbound::Subscribed { backlog, .. }]) = sent(&backlog, 20).try_into() else { panic!() };
-    assert_eq!(backlog.iter().map(|notice| notice.id).collect::<Vec<_>>(), [id(1)], "the backlog skips type 11");
-    h.call(O, Call::Subscribe { req: 1, channel: ch("room"), after: None });
-    let joined = h.call(21, Call::Join { req: 1, channel: Some(ch("room")), types: vec![10], isolated: false, lease_ms: 1000, dispatch: true });
-    assert_eq!(sent(&joined, 21), [Outbound::Joined { req: 1 }]);
-    for (event_type, narrow) in [(10, 1), (11, 0)] {
-        let effects = h.produce(P, Envelope::dispatch(ch("room"), event_type, Bytes::new()));
-        assert_eq!((deliveries(&effects, 20), deliveries(&effects, 21), deliveries(&effects, O)), (narrow, narrow, 1), "type {event_type}");
-    }
-    let notice = h.produce(P, Envelope::claimable(ch("room"), 11, Bytes::new()));
-    assert!(sent(&notice, 20).is_empty(), "no notice of a type it may not read");
-    let seq = h.next_seq(P);
-    let outcome = h.call(P, Call::Delete { seq, id: id(2), result: ch("room"), key: None });
-    assert_eq!((deliveries(&outcome, 20), deliveries(&outcome, 21)), (1, 1), "a delete outcome is the server's own type");
-}
-
 #[test]
 fn a_dispatch_join_receives_the_channels_dispatch_events() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("answer.me")), types: Vec::new(), isolated: false, lease_ms: 5_000, dispatch: true });
+    h.call(W1, Call::Join { req: 1, channel: Some(ch("answer.me")), types: Vec::new(), lease_ms: 5_000, dispatch: true });
     let chunk = h.call(W2, Call::Register { seq: None, event: Envelope::dispatch(ch("answer.me"), 18, Bytes::new()) });
     assert_eq!(deliveries(&chunk, W1), 1, "a stream chunk emitted on a work connection reaches the requester's work connection");
 }
@@ -133,7 +103,7 @@ fn deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_wit
 }
 
 #[test]
-fn stats_report_totals_top_types_idle_lanes_and_root_types() {
+fn stats_report_totals_top_types_and_idle_lanes() {
     let mut h = H::with(EngineConfig { stats_top: 2, ..config() }, false).cast();
     for (channel, event_type, count) in [("a", 3, 3), ("b", 2, 2), ("c", 1, 1)] {
         for _ in 0..count {
@@ -147,15 +117,13 @@ fn stats_report_totals_top_types_idle_lanes_and_root_types() {
     assert_eq!((stats.waiting, stats.claimed, stats.oldest_ms), (5, 1, 50));
     assert_eq!(stats.types.iter().map(|stat| (stat.event_type, stat.waiting)).collect::<Vec<_>>(), [(3, 3), (2, 2)], "top K by waiting");
     assert_eq!(stats.idle_lanes.iter().map(|lane| (lane.channel, lane.event_type)).collect::<Vec<_>>(), [(ch("a"), 3), (ch("b"), 2)], "lanes nobody joined");
-    assert_eq!(stats.roots.len(), 2);
-    assert_eq!(stats.roots[0].root, 3, "the biggest root type first");
     assert!(stats.depth_capacity > 0 && stats.memory_used > 0);
 }
 
 #[test]
 fn stats_and_drain_need_the_operator_grant() {
     let mut grants = Grants::new();
-    grants.insert("svc".into(), Grant { methods: vec![Method::Subscribe], types: TypeSet::all(), delegate: false });
+    grants.insert("svc".into(), Grant { methods: vec![Method::Subscribe] });
     let mut h = H::with(EngineConfig { grants: Some(grants), ..config() }, false);
     h.open(O, hello(Role::Observe, 4));
     for call in [Call::Stats { req: 1 }, Call::Drain { req: 1 }] {

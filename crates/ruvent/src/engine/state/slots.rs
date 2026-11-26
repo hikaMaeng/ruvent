@@ -1,8 +1,7 @@
 //! The event slots: a dense arena, an id index and slot generations.
 
-use crate::envelope::{Channel, ClaimToken, Digest, Envelope, EventId, GroupId, Kind, WorkKey};
+use crate::envelope::{Channel, ClaimMark, ClaimToken, Digest, Envelope, EventId, Kind, ProducerId, WorkKey};
 use crate::journal::Location;
-use crate::names::Name;
 use bytes::Bytes;
 use std::collections::HashMap;
 
@@ -20,9 +19,9 @@ pub(super) struct Attempt {
     pub lease_ms: u64,
     /// Absolute uptime at which the lease runs out.
     pub until: u64,
-    /// The credential the attempt was made under; completion, extension and
-    /// release must come under the same one.
-    pub credential: Name,
+    /// The worker that holds it: its work connection's producer id (its
+    /// uuid). Completion, extension and release must come from it.
+    pub worker: ProducerId,
     /// The join it counts against. `None` after its connection closed or a
     /// restart, until an `Extend` moves it to a join.
     pub join: Option<JoinId>,
@@ -31,10 +30,8 @@ pub(super) struct Attempt {
 /// Where an event is.
 #[derive(Clone, Debug)]
 pub(super) enum Place {
-    /// In its lane, `(channel, type, isolated)`, at its work key.
+    /// In its lane, `(channel, type)`, at its work key.
     Waiting,
-    /// In its root's hold lane: skipped while the root is paused (2.6).
-    Held,
     /// In the wheel until `until` (absolute uptime).
     Delayed {
         until: u64,
@@ -50,14 +47,9 @@ pub(super) struct Fixed {
     pub id: EventId,
     pub key: WorkKey,
     pub event_type: u16,
-    /// The type of the event that started its lineage: what it is accounted and paused under (2.6).
-    pub root: u16,
-    pub principal: Option<Name>,
-    pub delegate: Option<Name>,
-    pub group: Option<GroupId>,
     /// The visibility time it was registered with (absolute), for the envelope.
     pub not_before: Option<u64>,
-    /// Journaled: of a durable type, on a server with a journal.
+    /// Journaled: on a server with a journal.
     pub durable: bool,
     /// Uptime when registered, for "oldest waiting" ages.
     pub registered_at: u64,
@@ -75,11 +67,7 @@ pub(super) struct Fixed {
 pub(super) struct Slot {
     pub fixed: Fixed,
     pub channel: Channel,
-    /// Reached the failure threshold (B6): waits in its isolated lane. Changes on isolation.
-    pub isolated: bool,
     pub failures: u16,
-    /// Absolute uptime; changes on isolation.
-    pub expires: Option<u64>,
     pub place: Place,
     /// The commit number and record serial of its last change: what the fuzzy
     /// checkpoint splits replay on (2.5). `0` before anything is written.
@@ -114,18 +102,14 @@ impl Slot {
             kind: Kind::Claimable,
             failures: self.failures,
             key: Some(fixed.key),
-            isolated: self.isolated,
-            principal: fixed.principal.clone(),
-            delegate: fixed.delegate.clone(),
             not_before: fixed.not_before,
-            expires: self.expires,
-            group: fixed.group,
+            claim: self.attempt().map(|attempt| ClaimMark { worker: attempt.worker, token: attempt.token, lease_ms: attempt.lease_ms }),
             payload: self.payload.clone(),
         }
     }
 
-    pub fn lane(&self) -> (Channel, u16, bool) {
-        (self.channel, self.fixed.event_type, self.isolated)
+    pub fn lane(&self) -> (Channel, u16) {
+        (self.channel, self.fixed.event_type)
     }
 
     /// The payload's length, wherever it is.
@@ -151,8 +135,8 @@ struct Entry {
 /// | key | slot index; `ids`: logical id → slot index |
 /// | --- | --- |
 /// | scope | one engine |
-/// | lifetime | registration to completion, deletion or expiry |
-/// | bound | managed memory (root pause stops registrations and net-growth assignment, 2.6) |
+/// | lifetime | registration to completion or deletion |
+/// | bound | the events registered and not completed; metadata stays, payloads page out (2.5) |
 /// | cleared by | the ledger, in `State::remove_event` |
 #[derive(Default)]
 pub(super) struct Slots {

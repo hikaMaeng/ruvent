@@ -8,13 +8,12 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
-/// What one service's `Join` asks for: the channel (`None`: every channel),
-/// the types (empty: every type) and whether isolated events.
+/// What one service's `Join` asks for: the channel (`None`: every channel)
+/// and the types (empty: every type).
 #[derive(Clone, Debug)]
 pub(crate) struct Selection {
     pub channel: Option<Channel>,
     pub types: Vec<u16>,
-    pub isolated: bool,
 }
 
 /// The claimable events one join selects and how to handle them. Every
@@ -23,15 +22,16 @@ pub(crate) struct Selection {
 /// [`Service::new`] joins one channel and takes the types it has handlers
 /// for. [`Service::typed`] joins no channel: it takes the types it has
 /// handlers for from every channel — a worker for one kind of request on a
-/// channel per request (plan 9.14). [`Service::isolated`] makes either take
-/// only isolated events (B6), for reprocessing. Two services of one worker
-/// may not select the same lane; the server refuses the second join (`Overlap`).
+/// channel per request (plan 9.14). Two services of one worker may not
+/// select the same lane; the server refuses the second join (`Overlap`).
+///
+/// The server counts an event's failures and does nothing else with them:
+/// a handler that wants a limit reads [`Context::failures`] and completes
+/// (with a failure follow-up, if it likes) instead of retrying (requirement 6).
 pub struct Service {
     /// `None`: every channel.
     pub(crate) channel: Option<Channel>,
     pub(crate) handlers: BTreeMap<u16, HandlerFn>,
-    /// Takes isolated events only; otherwise only the others.
-    pub(crate) isolated: bool,
     /// P: executions at once over every server (2.4).
     pub(crate) slots: u32,
     /// B7: the lease asked in `Join`. Extended automatically at half.
@@ -55,16 +55,7 @@ impl Service {
     /// An event worker on no channel: the types it has handlers for, from
     /// every channel. Same defaults as [`Service::new`].
     pub fn typed() -> Self {
-        Service {
-            channel: None,
-            handlers: BTreeMap::new(),
-            isolated: false,
-            slots: 16,
-            lease: Duration::from_secs(30),
-            run_limit: Duration::from_secs(30),
-            window_bytes: 0,
-            retry_delay: Duration::from_secs(1),
-        }
+        Service { channel: None, handlers: BTreeMap::new(), slots: 16, lease: Duration::from_secs(30), run_limit: Duration::from_secs(30), window_bytes: 0, retry_delay: Duration::from_secs(1) }
     }
 
     /// An executor: long jobs handed over as follow-ups. 4 slots, the same
@@ -83,30 +74,22 @@ impl Service {
         self
     }
 
-    /// Takes only isolated events (B6): a service that reprocesses or
-    /// inspects what its types gave up on.
-    pub fn isolated(mut self) -> Self {
-        self.isolated = true;
-        self
-    }
-
     /// Whether this service's join selects the event.
     pub(crate) fn selects(&self, event: &ruvent::Envelope) -> bool {
-        self.isolated == event.isolated && self.channel.is_none_or(|own| own == event.channel) && self.handlers.contains_key(&event.event_type)
+        self.channel.is_none_or(|own| own == event.channel) && self.handlers.contains_key(&event.event_type)
     }
 
     /// What the join asks for. A channel service with no handler asks for
     /// every type (and gives each back).
     pub(crate) fn selection(&self) -> Selection {
-        Selection { channel: self.channel, types: self.handlers.keys().copied().collect(), isolated: self.isolated }
+        Selection { channel: self.channel, types: self.handlers.keys().copied().collect() }
     }
 
     /// A name for logs and books: the channel, or the types.
     pub(crate) fn label(&self) -> Name {
-        let isolated = if self.isolated { " (isolated)" } else { "" };
         match &self.channel {
-            Some(channel) => Name::new(&format!("{channel}{isolated}")),
-            None => Name::new(&format!("types {:?}{isolated}", self.handlers.keys().collect::<Vec<_>>())),
+            Some(channel) => Name::new(&channel.to_string()),
+            None => Name::new(&format!("types {:?}", self.handlers.keys().collect::<Vec<_>>())),
         }
     }
 

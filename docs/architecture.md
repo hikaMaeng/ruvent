@@ -10,16 +10,18 @@
 ```
 
 서버는 접속자가 워커인지 프록시인지 묻지 않는다. 모든 접속은 서비스 자격(토큰 → 이름)으로 열리고, 권한은
-자격별 `Grant`(메서드, 타입 집합, 위임 허용)로 판정한다. 연결 수는 "프록시 수 + 워커 서버 수"다.
+자격별 `Grant`(메서드)로 판정한다. 그보다 좁은 범위는 없다(계획 9.15). 연결 수는 "프록시 수 + 워커 서버 수"다.
 
 **채널과 타입(계획 9.14).** 채널은 이름 없는 UUIDv7(16 B)이다. 서버는 채널에서 아무것도 읽지 않는다. 버전 7·RFC
 변형이 아니면 거절할 뿐이다. 보통 요청 하나가 채널 하나다. 타입은 u16이고 서버가 착수용 이벤트를 워커에게 배정할
-때 쓴다(`Join`: 채널, 타입 집합, 또는 둘). 설정(휘발, 격리, 대기 상한, 직렬화)·권한·스냅샷·정지가 모두 타입을
-키로 한다. 0은 서버 것(삭제 결과)이다.
+때 쓴다(`Join`: 채널, 타입 집합, 또는 둘). 스냅샷도 타입으로 고른다. 0은 서버 것(삭제 결과)이다.
+
+**서버가 하지 않는 일(계획 9.15).** 격리, 만료, 순서(그룹 직렬화), 생산자 정지, 휘발 설정, 권한의 범위, 대리
+사용자. 서버는 실패 횟수를 세기만 하고, 그 수로 무엇을 할지는 워커가 정한다. 그런 정책은 앞뒤 처리기와 프록시가 갖는다.
 
 ## 엔진 ([crates/ruvent/src/engine](../crates/ruvent/src/engine/mod.rs))
 
-개편 계획 [library-overhaul.md](proposals/library-overhaul.md) v4.9의 장부다. 큐 구조는 계획 2.2의 (가)다:
+개편 계획 [library-overhaul.md](proposals/library-overhaul.md) v5의 장부다. 큐 구조는 계획 2.2의 (가)다:
 tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받는다.
 
 ```text
@@ -34,23 +36,23 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 
 * `State`([state/mod.rs](../crates/ruvent/src/engine/state/mod.rs))는 순수 상태 기계다. 시각을 입력으로
   받고 태스크·소켓·시계가 없다. 부분은 폴더로 나뉜다: 생산(`produce`, `producers`), 소비(`consume`, `lanes`,
-  `wheel`), 정체(`pause`, `roots`), 디스크(`disk`, `checkpoint`), 복구(`recover`), 관찰(`observe`), 슬롯(`slots`).
+  `wheel`), 메모리(`memory`), 디스크(`disk`, `checkpoint`), 복구(`recover`), 관찰(`observe`), 슬롯(`slots`).
 * **식별자.** 논리 id는 회수해도 바뀌지 않는다. 시도는 착수 표지(`ClaimToken`, u64 순번)로 가른다. `WorkKey`
-  (세대, u64 도착 순번)가 대기 순서다. 세대는 기동 때만 오른다. 대기 줄은 (채널, 타입, 격리)별이다.
+  (세대, u64 도착 순번)가 대기 순서다. 세대는 기동 때만 오른다. 대기 줄은 (채널, 타입)별이다.
 * **생산.** 생산자 순번표가 재전송을 조용히 버리고, 연산별 기준(영속 레코드는 fsync, 그 밖은 적용)으로
   누적 `Committed`를 낸다. 계기는 로그 쓰기 완료와 장부 묶음 끝이다. 타이머는 없다.
-* **소비.** 작업 연결이 `Join`(채널, 타입 집합, 또는 둘. 격리된 것만 받는 참여도)하고 그 참여에 절댓값 창
+* **소비.** 작업 연결이 `Join`(채널, 타입 집합, 또는 둘)하고 그 참여에 절댓값 창
   (`Window{join}`)을 연다. 참여의 이름은 그 `Join`의 `req`다. 같은 연결의 겹치는 참여는 거절한다(`Overlap`).
   장부는 자리가 남은 참여자를 등록순으로 돌아가며 배정한다(`Assign`). 채널 참여는 줄의 구성원으로 들고, 타입
   참여는 타입별 목록(`type_joins`)과 타입별 줄 목록(`typed_lanes`)으로 찾는다. 타입 참여만 받는 줄은 비면
   지우므로 요청마다 새 채널이어도 줄이 남지 않는다. lease는 배정한 순간부터 재고, 회수하면 그 참여의 창을
-  닫는다. `Extend`, `Release{지연, 실패}`, `not_before`, `expires`, 격리(`isolate_after`), `serialize_group`이 있다.
-* **격리.** 제자리다. 채널·타입·뿌리·내구성은 그대로, 격리 비트를 켜고 격리 줄에서 `isolated` 참여만 기다린다.
-  채널 구독자는 격리 비트가 켜진 `Notice`를 받는다.
+  닫는다. `Extend`, `Release{지연, 실패}`, `not_before`가 있다.
+* **착수 마크.** 배정은 착수 마크(워커 uuid = 작업 연결의 producer id, 표지, lease)를 엔벨롭에 싣는다. 완료·연장·반환은
+  그 워커가 그 표지로 해야 한다. 저널의 `Claim` 레코드와 체크포인트가 워커 uuid를 남겨 재기동을 넘는다.
 * **커밋 가시성.** Strict에서 영속 이벤트는 등록이 커밋되기 전에는 배정·통지·backlog·명시 착수 어느 경로로도
   보이지 않는다. 같은 연결의 뒤 송신은 앞 송신의 커밋과 본문 읽기를 기다린다.
-* **자원.** 관리 메모리와 디스크를 바이트로 회계하고 뿌리 타입(계보를 시작한 이벤트의 타입)마다 몫을 센다.
-  고수위에서 몫이 가장 큰 뿌리를 정지시킨다: 그 타입을 등록한 생산 연결에 `Paused{타입}`, 순증 줄의 배정 정지.
+* **자원.** 관리 메모리와 디스크를 바이트로 회계한다. 고수위에서는 캐시된 본문만 내린다(페이징). 생산자를 멈추거나
+  등록을 거절하지 않는다.
 * **시각.** 누적 가동 시각(ms)이다. 로그의 마지막 묶음에서 이어 가고 정지 시간은 세지 않는다.
 * **장애.** 로그 쓰기, 체크포인트 쓰기, 본문 읽기(CRC 불일치 포함)가 실패하면 엔진은 멈추고
   `Engine::stopped()`가 사유와 함께 끝난다.
@@ -60,28 +62,23 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 ```text
  고정 머리 38   id 16 · channel 16 · type u16 · flags u16 · failures u16
  작업 키        generation 4 · arrival varint                       (착수용, 서버가 보내거나 기록할 때)
- 선택 필드      principal 4 · delegate 4 · not_before varint · expires varint · group 16
+ not_before     varint                                              (선택, 착수용)
+ 착수 마크      worker 16 · token generation 4 · token seq varint · lease ms varint   (배정에만)
  payload        길이 4 + 바이트(서버는 읽지 않는다)
 ```
 
-* 착수 블록은 엔벨롭에서 뺐다. 표지와 lease는 `Assign`·`Claimed` 레코드의 머리에 실린다.
-* `not_before`와 `expires`는 등록 요청에서는 적용 순간부터의 길이이고, 서버가 쥐거나 보낼 때는 누적 가동
-  시각의 절대값이다.
+* `not_before`는 등록 요청에서는 적용 순간부터의 길이이고, 서버가 쥐거나 보낼 때는 누적 가동 시각의 절대값이다.
 * 레코드 종류별로 실리는 필드는 `Layout`이 정한다(Request, Notice, Assigned, Delivery, Journal).
 * `failures`는 이벤트 탓인 실패 횟수다(lease 만료 회수, `Release{실패 = 예}`). 65,535에서 멈춘다.
-* `flags` 비트 9는 격리됨이다. 서버가 켜고, 요청과 발송에는 둘 수 없다.
+* `flags`: 비트 0 종류, 1 `not_before`, 2 착수 마크. 나머지는 예약이다. 이름은 없다.
 
 ## 이름표
 
-남은 이름은 자격과 대리 사용자뿐이다. 채널은 16 B 식별자, 타입은 u16이라 사전을 거치지 않는다. 세 공간으로 나뉜다.
-
-* 서버 안: 공유 핸들 `Name`, 사전 `Names`.
-* 접속마다: 프로토콜의 방향별 사전. 상한을 넘으면 초기화 레코드를 쓴다.
-* 파일마다: 저널 파일·스냅샷 파일이 각자 이름을 정의하므로 파일 하나만으로 해독된다.
+엔벨롭에는 이름이 없다. 서버 안의 `Name`·`Names`는 연결의 자격 이름에만 쓴다. wire와 저널·스냅샷 파일에는 이름 사전이 없다.
 
 엔벨롭에는 서버가 그 값으로 행동하는 필드만 있다(계획 v4.8, v4.9). 요청–응답의 "어느 요청의 답인가"는 채널이 정한다: 묻는 쪽이 요청마다 채널(UUIDv7)을 정해 구독하고 그 채널에 요청을 등록한다. 워커는 타입으로 참여해 받고 같은 채널에 낸다. 서버는 발송을 채널로만 나눈다.
 
-## 저널 형식 5 ([crates/ruvent/src/journal](../crates/ruvent/src/journal/mod.rs))
+## 저널 형식 6 ([crates/ruvent/src/journal](../crates/ruvent/src/journal/mod.rs))
 
 레코드 집합(`Record`)과 세그먼트 컨테이너(`SegmentLog`)로 나뉜다. 바이트 배치와 태그 표는
 `journal/codec.rs`(세그먼트)와 `journal/checkpoint/mod.rs`(체크포인트)의 doc comment에 있다.
@@ -90,7 +87,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 <dir>/lock               로그를 연 엔진 하나만
 <dir>/0000000001.seg     세그먼트. 열(lane)은 셋이고 번호는 하나로 이어진다
 <dir>/checkpoint.ckpt    마지막 완전한 체크포인트(rename으로 바뀐다)
-세그먼트 머리: "rvseg\0" 0x05 lane · 번호 u32 · 첫 일련번호 u64
+세그먼트 머리: "rvseg\0" 0x06 lane · 번호 u32 · 첫 일련번호 u64
 로그 프레임: [len u32][crc u32][kind][uptime u64][commit v][first v][next v][count v][item…]
 ```
 
@@ -102,8 +99,8 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 
 * **본문은 세그먼트가 유일한 사본이다.** 본문 위치(`Location`: 세그먼트, 오프셋, 길이, CRC)는 등록이 디스크에
   닿을 때 장부에 들어간다. 본문 CRC는 한 번만 계산해 프레임 CRC에 합친다(`crc32fast::Hasher::combine`).
-* **세그먼트 사전.** 세그먼트마다 쓰는 이름(자격, 대리 사용자)과 생산자 번호를 첫 사용 전에 스스로 정의한다.
-  뿌리는 타입 varint, 채널은 엔벨롭 머리의 16 B다. `Isolate`는 채널 없이 실패 횟수와 기한만 싣는다.
+* **세그먼트 사전.** 세그먼트마다 쓰는 생산자 번호를 첫 사용 전에 스스로 정의한다. 이름은 없다. `Claim`은 워커 uuid
+  16 B를 싣는다.
 * **넘김과 fsync.** 다음 프레임이 크기 S(`StorageConfig::segment_bytes`)를 넘기면 새 세그먼트로 넘긴다. 새
   세그먼트와 체크포인트 rename 뒤에는 디렉터리를 fsync한다(Windows는 NTFS 메타 저널에 맡긴다).
 * **삭제.** 살아 있는 본문 0(그 본문을 옮긴 레코드가 디스크에 닿은 뒤에 센다), 읽기 pin 없음, 봉인됨, 로그
@@ -116,23 +113,22 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 * **복구는 스트리밍이다.** 체크포인트를 읽고 시작 세그먼트부터 꼬리를 프레임 단위로 읽는다. 본문은 CRC만
   계산하고 건너뛰므로 복구 메모리는 메타 크기다. 마지막 세그먼트의 찢어진 꼬리만 열 때 잘라 내고, 중간
   손상과 일련번호 사슬 끊김은 멈추고 보고한다.
-* **옛 형식은 옮기지 않는다.** 경로가 파일이면(형식 2 이하, 형식 3의 단일 파일) 거부하고 그대로 둔다. 형식 3·4의 세그먼트(채널이 이름이던 것)도 거부한다.
+* **옛 형식은 옮기지 않는다.** 경로가 파일이면(형식 2 이하, 형식 3의 단일 파일) 거부하고 그대로 둔다. 형식 3~5의 세그먼트도 거부한다.
 * **읽기 경로.** 캐시에 없는 본문은 blocking 읽기가 가져와 엔진 inbox로 돌려준다. 그동안 그 연결의 뒤 송신은
   기다리고 세그먼트는 pin된다. 콜드 머리를 보낸 줄은 다음 본문을 미리 읽는다(`read_ahead`).
-* **흘려 읽기(B15 포함).** 작업 연결의 후속 본문은 `Engine::body_to_disk`가 예라고 하면 `Spool`로 본문 열에
-  받고 `Call::Complete::spooled`로 넘긴다. 영속이면 `Register`가 그 위치를 가리키고, 휘발이면 저널에 없이
-  재기동 때 버린다(`Counters::spilled_bytes`).
+* **흘려 읽기.** 작업 연결의 후속 본문은 `Engine::body_to_disk`가 예라고 하면 `Spool`로 본문 열에
+  받고 `Call::Complete::spooled`로 넘긴다. `Register`가 그 위치를 가리킨다.
 
 ## 운영 스냅샷 ([crates/ruvent/src/snapshot](../crates/ruvent/src/snapshot/mod.rs))
 
-고른 타입(`TypeSet`)의 이벤트(착수용·발송용)를 등록되는 순간 수집기에 복사한다. 수집기는 개수나 나이 중 먼저
+고른 타입(타입 목록, 빈 목록 = 모든 타입)의 이벤트(착수용·발송용)를 등록되는 순간 수집기에 복사한다. 수집기는 개수나 나이 중 먼저
 닿는 단위로 파일 하나(`snapshot-<ms>-<seq>.rvs`)를 쓴다. 재기동 때 재생하지 않는다. 쓰기 실패는 세고
 서버는 계속 돈다. 정상 종료 때 남은 단위를 쓴다.
 
 ## 와이어 ([crates/ruvent-protocol](../crates/ruvent-protocol/README.md))
 
-wire v4. 레코드 `[tag][head_len][body_len][head][body]`의 연속이고 바깥 프레임은 없다. 핸드셰이크(Hello/Welcome/Bye),
-호출·응답·알림·전달, 이름 정의·사전 초기화 레코드로 이뤄진다. 채널은 16 B, 타입은 u16으로 실린다. 엔벨롭 머리는
+wire v5. 레코드 `[tag][head_len][body_len][head][body]`의 연속이고 바깥 프레임은 없다. 핸드셰이크(Hello/Welcome/Bye),
+호출·응답·알림·전달 레코드로 이뤄진다. 이름 사전은 없다. 채널은 16 B, 타입은 u16으로 실린다. 엔벨롭 머리는
 코어 코덱 하나로 인코딩한다. 태그 표는 `crates/ruvent-protocol/src/lib.rs`의 모듈 문서에 있다.
 
 ## 메서드 계약 ([crates/ruvent/src/methods](../crates/ruvent/src/methods/mod.rs))
@@ -153,5 +149,5 @@ wire v4. 레코드 `[tag][head_len][body_len][head][body]`의 연속이고 바�
   확인(`Observed::Subscribed`) 이후의 발송만 그 구성원에게 보낸다. 엔벨롭은 허브가 `Arc`로 나눈다. 허브는 구독
   장부(`fanout/channels`, 순수 상태), 허브 태스크(`fanout/task.rs`), 핸들(`fanout/mod.rs`의 `Fanout`·`Member`)로
   나뉜다. 클라이언트 쪽 프로토콜, 인증, 등록(SDK 생산자), 요청–응답(요청별 응답 채널), 기한, 역압, 준비 상태의 노출은
-  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v4 하나만
+  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v5 하나만
   말하고, 프록시와 워커 서버만 그것으로 붙는다.

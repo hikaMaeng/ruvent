@@ -58,9 +58,9 @@ pub trait Methods: Send + Sync + 'static {
     /// Waits until the cumulative `Committed` reaches `seq`.
     async fn committed(&self, seq: u64) -> Result<(), Refusal>;
     /// Work: joins `channel` (`None`: every channel) for `types` (empty: all;
-    /// not empty without a channel) with this lease length; `isolated` takes
-    /// isolated events only (B6). Returns the join's name, the `req` of its `Join`.
-    async fn join(&self, channel: Option<Channel>, types: Vec<u16>, isolated: bool, lease: Duration, dispatch: bool) -> Result<u32, Refusal>;
+    /// not empty without a channel) with this lease length. Returns the
+    /// join's name, the `req` of its `Join`.
+    async fn join(&self, channel: Option<Channel>, types: Vec<u16>, lease: Duration, dispatch: bool) -> Result<u32, Refusal>;
     /// Work: sets the absolute window of the join named `join` (`bytes` 0: no byte bound). Not answered.
     async fn window(&self, join: u32, count: u32, bytes: u64) -> Result<(), Refusal>;
     /// Work: completes the attempt `token` on `id`, registering `follow_ups` in the same step.
@@ -96,15 +96,12 @@ pub trait Methods: Send + Sync + 'static {
 pub enum Incoming {
     /// Work from a window.
     Assign(Assignment),
-    /// Claimable work on a subscribed channel: head and work key (the isolated bit set when it was isolated).
+    /// Claimable work on a subscribed channel: head and work key.
     Notice(Envelope),
     /// A dispatch event.
     Delivery(Envelope),
     /// The full window of this join (its name, from `join`) would receive work that waits.
     Pending(u32),
-    /// This root type is paused: hold registrations of it.
-    Paused(u16),
-    Resumed(u16),
     Fault {
         kind: FaultKind,
         detail: &'static str,
@@ -201,8 +198,6 @@ impl Demux {
             Outbound::Notice(event) => Incoming::Notice(event),
             Outbound::Delivery(event) => Incoming::Delivery(event),
             Outbound::Pending { join } => Incoming::Pending(join),
-            Outbound::Paused { event_type } => Incoming::Paused(event_type),
-            Outbound::Resumed { event_type } => Incoming::Resumed(event_type),
             Outbound::Fault { kind, detail } => Incoming::Fault { kind, detail },
             _ => return true,
         };
@@ -342,8 +337,8 @@ impl Methods for Client {
         }
     }
 
-    async fn join(&self, channel: Option<Channel>, types: Vec<u16>, isolated: bool, lease: Duration, dispatch: bool) -> Result<u32, Refusal> {
-        match self.ask(|req| Call::Join { req, channel, types, isolated, lease_ms: millis(lease), dispatch }).await? {
+    async fn join(&self, channel: Option<Channel>, types: Vec<u16>, lease: Duration, dispatch: bool) -> Result<u32, Refusal> {
+        match self.ask(|req| Call::Join { req, channel, types, lease_ms: millis(lease), dispatch }).await? {
             Outbound::Joined { req } => Ok(req),
             _ => unexpected(),
         }

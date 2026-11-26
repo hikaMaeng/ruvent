@@ -1,8 +1,8 @@
-//! Journal format 5 in a segment: the frames of the log lane, and the pieces
+//! Journal format 6 in a segment: the frames of the log lane, and the pieces
 //! the checkpoint file shares with them.
 //!
 //! ```text
-//! segment header (20 bytes): "rvseg\0" 0x05 lane u8 · number u32 · first serial u64
+//! segment header (20 bytes): "rvseg\0" 0x06 lane u8 · number u32 · first serial u64
 //! log frame:  [len u32][crc32 u32] [kind u8][uptime u64][commit v][first v][next v][count v][item]…
 //!                                   '------------------- covered by crc --------------------'
 //! body frame (long and body lanes): [len u32][crc32 u32][payload]   (crc of the payload alone)
@@ -10,19 +10,19 @@
 //! head = length v, then the envelope in the journal layout without its trailing payload length
 //! location = segment v, offset v, length v, crc u32
 //! item = [tag u8] then
-//!    1 Register      root type v, head, body length v, body
+//!    1 Register      head, body length v, body
 //!    2 Body          length v, body
-//!    3 Claim         key, token generation v, token seq v, lease ms v, credential name v
+//!    3 Claim         key, token generation v, token seq v, lease ms v, worker 16
 //!    4 Remove        key
 //!    5 Reclaim       key, failures v
 //!    6 Release       key, failures v, visible u8 (0 none, 1 then uptime v)
-//!    7 Isolate       key, failures v, expires u8 (0 none, 1 then uptime v)
+//!    7 (unused; was Isolate)
 //!    8 Relocate      key, location
 //!    9 ProducerDef   number v, producer id 16
 //!   10 Producer      number v, seq v
 //!   11 Generation    v
-//!   12 Name          number v, length v, UTF-8          (dictionary; no serial)
-//!   13 RegisterAt    root type v, head, location        (the payload was streamed earlier)
+//!   12 (unused; was Name: there are no names)
+//!   13 RegisterAt    head, location                     (the payload was streamed earlier)
 //!   14 Gap           a serial whose record was not written
 //!   15 ProducerName  number v, producer id 16           (dictionary; no serial)
 //! ```
@@ -42,7 +42,6 @@
 use super::{Batch, Lane, Location, Record, Replay};
 use crate::envelope::codec::{self as body, put_varint, Layout, Malformed, Reader};
 use crate::envelope::{ClaimToken, Envelope, ProducerId, WorkKey};
-use crate::names::Name;
 use bytes::{BufMut, Bytes};
 use crc32fast::Hasher;
 use std::collections::{HashMap, HashSet};
@@ -53,7 +52,7 @@ pub const HEADER: u64 = 8;
 /// A frame appended to the log lane.
 pub const APPEND: u8 = 1;
 /// `"rvseg\0"`, the format, then the lane.
-pub const SEGMENT_MAGIC: &[u8; 7] = b"rvseg\0\x05";
+pub const SEGMENT_MAGIC: &[u8; 7] = b"rvseg\0\x06";
 /// Magic + lane + number + first serial.
 pub const SEGMENT_HEADER: u64 = 20;
 
@@ -63,12 +62,10 @@ const CLAIM: u8 = 3;
 const REMOVE: u8 = 4;
 const RECLAIM: u8 = 5;
 const RELEASE: u8 = 6;
-const ISOLATE: u8 = 7;
 const RELOCATE: u8 = 8;
 const PRODUCER_DEF: u8 = 9;
 const PRODUCER: u8 = 10;
 const GENERATION: u8 = 11;
-const NAME: u8 = 12;
 const REGISTER_AT: u8 = 13;
 const GAP: u8 = 14;
 const PRODUCER_NAME: u8 = 15;
@@ -104,17 +101,16 @@ pub fn segment_header(lane: Lane, number: u32, first: u64) -> Vec<u8> {
     out
 }
 
-/// The names and producer numbers one segment has defined.
+/// The producer numbers one segment has defined.
 ///
-/// | key | name text; producer number |
+/// | key | producer number |
 /// | --- | --- |
 /// | scope | one segment |
 /// | lifetime | the segment's; a new segment starts empty |
-/// | bound | the distinct names and producers written to that segment |
+/// | bound | the distinct producers written to that segment |
 /// | cleared by | the log writer, when it rolls to a new segment |
 #[derive(Default)]
 pub struct Dictionary {
-    names: HashMap<Name, u32>,
     producers: HashSet<u32>,
 }
 
@@ -142,21 +138,6 @@ impl Out {
         self.bytes.extend_from_slice(payload);
         self.hashed = self.bytes.len();
         crc
-    }
-
-    fn name(&mut self, dictionary: &mut Dictionary, name: &Name) -> u32 {
-        if let Some(number) = dictionary.names.get(name) {
-            return *number;
-        }
-        let number = dictionary.names.len() as u32;
-        dictionary.names.insert(name.clone(), number);
-        let text = name.as_bytes();
-        self.bytes.put_u8(NAME);
-        put_varint(&mut self.bytes, u64::from(number));
-        put_varint(&mut self.bytes, text.len() as u64);
-        self.bytes.put_slice(text);
-        self.count += 1;
-        number
     }
 
     fn finish(mut self) -> (Vec<u8>, Hasher) {
@@ -189,10 +170,10 @@ pub fn put_location(out: &mut Vec<u8>, at: &Location) {
 
 /// The envelope's head in the journal layout, without the payload: its
 /// trailing payload length (always zero here) is left out.
-pub fn put_head(event: &Envelope, number: &mut dyn FnMut(&Name) -> u32, out: &mut Vec<u8>) -> io::Result<()> {
-    let bare = Envelope { payload: Bytes::new(), ..event.clone() };
+pub fn put_head(event: &Envelope, out: &mut Vec<u8>) -> io::Result<()> {
+    let bare = Envelope { payload: Bytes::new(), claim: None, ..event.clone() };
     let mut head = Vec::with_capacity(64);
-    body::encode(&bare, Layout::Journal, number, &mut head).map_err(|error| invalid(error.to_string()))?;
+    body::encode(&bare, Layout::Journal, &mut head).map_err(|error| invalid(error.to_string()))?;
     head.truncate(head.len().saturating_sub(4));
     put_varint(out, head.len() as u64);
     out.extend_from_slice(&head);
@@ -200,13 +181,13 @@ pub fn put_head(event: &Envelope, number: &mut dyn FnMut(&Name) -> u32, out: &mu
 }
 
 /// Reads a head written by [`put_head`].
-pub fn head_from(bytes: &[u8], name: &dyn Fn(u32) -> Option<Name>) -> Result<Envelope, Malformed> {
+pub fn head_from(bytes: &[u8]) -> Result<Envelope, Malformed> {
     let mut whole = Vec::with_capacity(bytes.len() + 4);
     whole.extend_from_slice(bytes);
     whole.extend_from_slice(&[0; 4]);
     let whole = Bytes::from(whole);
     let mut reader = Reader::new(&whole);
-    let event = body::decode(&mut reader, Layout::Journal, name)?;
+    let event = body::decode(&mut reader, Layout::Journal)?;
     reader.finish()?;
     Ok(event)
 }
@@ -229,13 +210,9 @@ pub fn encode_frame(batch: &Batch, dictionary: &mut Dictionary, known: &mut Hash
     for (at, record) in batch.records.iter().enumerate() {
         let serial = batch.first + at as u64;
         match record {
-            Record::Register { event, root, at: place } => {
-                // Names first, so the definitions precede the record that uses them.
-                let numbers: Vec<u32> = event.names(Layout::Journal).map(|name| out.name(dictionary, name)).collect();
-                let mut lookup = numbers.into_iter();
+            Record::Register { event, at: place } => {
                 out.bytes.put_u8(if place.is_some() { REGISTER_AT } else { REGISTER });
-                put_varint(&mut out.bytes, u64::from(*root));
-                put_head(event, &mut |_| lookup.next().unwrap_or_default(), &mut out.bytes)?;
+                put_head(event, &mut out.bytes)?;
                 match place {
                     Some(place) => put_location(&mut out.bytes, place),
                     None => {
@@ -252,17 +229,16 @@ pub fn encode_frame(batch: &Batch, dictionary: &mut Dictionary, known: &mut Hash
                 put_varint(&mut out.bytes, payload.len() as u64);
                 out.body(payload);
             }
-            Record::Claim { key, token, lease_ms, credential } => {
+            Record::Claim { key, token, lease_ms, worker } => {
                 if removed.get(key).is_some_and(|removal| *removal > at) {
                     out.bytes.put_u8(GAP);
                 } else {
-                    let credential = out.name(dictionary, credential);
                     out.bytes.put_u8(CLAIM);
                     put_key(&mut out.bytes, *key);
                     put_varint(&mut out.bytes, u64::from(token.generation));
                     put_varint(&mut out.bytes, token.seq);
                     put_varint(&mut out.bytes, *lease_ms);
-                    put_varint(&mut out.bytes, u64::from(credential));
+                    out.bytes.put_slice(worker);
                 }
             }
             Record::Remove(key) => {
@@ -279,12 +255,6 @@ pub fn encode_frame(batch: &Batch, dictionary: &mut Dictionary, known: &mut Hash
                 put_key(&mut out.bytes, *key);
                 put_varint(&mut out.bytes, u64::from(*failures));
                 put_optional(&mut out.bytes, *visible_at);
-            }
-            Record::Isolate { key, failures, expires } => {
-                out.bytes.put_u8(ISOLATE);
-                put_key(&mut out.bytes, *key);
-                put_varint(&mut out.bytes, u64::from(*failures));
-                put_optional(&mut out.bytes, *expires);
             }
             Record::Relocate { key, at } => {
                 out.bytes.put_u8(RELOCATE);
@@ -514,11 +484,6 @@ impl<R: Read> Stream<R> {
         }
     }
 
-    pub fn name(&mut self, names: &HashMap<u32, Name>) -> Result<Name, Cut> {
-        let number = self.varint32()?;
-        names.get(&number).cloned().ok_or(Cut::Malformed("unknown name number"))
-    }
-
     pub fn key(&mut self) -> Result<WorkKey, Cut> {
         Ok(WorkKey { generation: self.varint32()?, arrival: self.varint()? })
     }
@@ -531,11 +496,6 @@ impl<R: Read> Stream<R> {
         }
     }
 
-    /// A type number, written as a varint.
-    pub fn type16(&mut self) -> Result<u16, Cut> {
-        u16::try_from(self.varint()?).map_err(|_| Cut::Malformed("type over 65535"))
-    }
-
     pub fn failures(&mut self) -> Result<u16, Cut> {
         u16::try_from(self.varint()?).map_err(|_| Cut::Malformed("overlong number"))
     }
@@ -544,21 +504,11 @@ impl<R: Read> Stream<R> {
         Ok(Location { segment: self.varint32()?, offset: self.varint()?, len: self.varint32()?, crc: self.u32()? })
     }
 
-    /// A head written by [`put_head`], names resolved from `names`.
-    pub fn head(&mut self, names: &HashMap<u32, Name>) -> Result<Envelope, Cut> {
+    /// A head written by [`put_head`].
+    pub fn head(&mut self) -> Result<Envelope, Cut> {
         let len = usize::try_from(self.varint()?).map_err(|_| Cut::Malformed("overlong number"))?;
         let bytes = self.take(len)?;
-        Ok(head_from(&bytes, &|number| names.get(&number).cloned())?)
-    }
-
-    /// A dictionary name definition, after its tag.
-    pub fn define(&mut self, names: &mut HashMap<u32, Name>) -> Result<(), Cut> {
-        let number = self.varint32()?;
-        let len = usize::try_from(self.varint()?).map_err(|_| Cut::Malformed("overlong number"))?;
-        let text = self.take(len)?;
-        let text = std::str::from_utf8(&text).map_err(|_| Cut::Malformed("name not UTF-8"))?;
-        names.insert(number, Name::new(text));
-        Ok(())
+        Ok(head_from(&bytes)?)
     }
 }
 
@@ -590,11 +540,10 @@ pub enum Frame {
     },
 }
 
-/// The segment-local dictionaries a frame reader keeps.
+/// What a frame reader keeps between frames of one segment: nothing since
+/// format 6 (the names are gone); kept as the reader's state slot.
 #[derive(Default)]
-pub struct Defined {
-    pub names: HashMap<u32, Name>,
-}
+pub struct Defined {}
 
 /// Reads the next log frame of segment `segment`, whose file is `file_len`
 /// bytes long. Payloads are skipped; `Register` items get their location.
@@ -636,7 +585,7 @@ pub fn read_frame<R: Read>(stream: &mut Stream<R>, file_len: u64, segment: u32, 
     }
 }
 
-fn decode_items<R: Read>(stream: &mut Stream<R>, segment: u32, defined: &mut Defined) -> Result<(Prefix, Vec<Replay>), Cut> {
+fn decode_items<R: Read>(stream: &mut Stream<R>, segment: u32, _defined: &mut Defined) -> Result<(Prefix, Vec<Replay>), Cut> {
     let kind = stream.u8()?;
     if kind != APPEND {
         return Err(Cut::Malformed("unknown frame kind"));
@@ -648,27 +597,21 @@ fn decode_items<R: Read>(stream: &mut Stream<R>, segment: u32, defined: &mut Def
     for _ in 0..count {
         let tag = stream.u8()?;
         let record = match tag {
-            NAME => {
-                stream.define(&mut defined.names)?;
-                continue;
-            }
             PRODUCER_NAME => {
                 items.push(Replay::ProducerName { number: stream.varint32()?, id: stream.id16()? });
                 continue;
             }
             GAP => None,
             REGISTER => {
-                let root = stream.type16()?;
-                let event = stream.head(&defined.names)?;
+                let event = stream.head()?;
                 let len = stream.varint32()?;
                 let offset = stream.pos;
                 let crc = stream.skip_body(u64::from(len))?;
-                Some(Record::Register { event, root, at: Some(Location { segment, offset, len, crc }) })
+                Some(Record::Register { event, at: Some(Location { segment, offset, len, crc }) })
             }
             REGISTER_AT => {
-                let root = stream.type16()?;
-                let event = stream.head(&defined.names)?;
-                Some(Record::Register { event, root, at: Some(stream.location()?) })
+                let event = stream.head()?;
+                Some(Record::Register { event, at: Some(stream.location()?) })
             }
             BODY => {
                 let len = stream.varint()?;
@@ -679,13 +622,12 @@ fn decode_items<R: Read>(stream: &mut Stream<R>, segment: u32, defined: &mut Def
                 let key = stream.key()?;
                 let token = ClaimToken { generation: stream.varint32()?, seq: stream.varint()? };
                 let lease_ms = stream.varint()?;
-                let credential = stream.name(&defined.names)?;
-                Some(Record::Claim { key, token, lease_ms, credential })
+                let worker = stream.id16()?;
+                Some(Record::Claim { key, token, lease_ms, worker })
             }
             REMOVE => Some(Record::Remove(stream.key()?)),
             RECLAIM => Some(Record::Reclaim { key: stream.key()?, failures: stream.failures()? }),
             RELEASE => Some(Record::Release { key: stream.key()?, failures: stream.failures()?, visible_at: stream.optional()? }),
-            ISOLATE => Some(Record::Isolate { key: stream.key()?, failures: stream.failures()?, expires: stream.optional()? }),
             RELOCATE => Some(Record::Relocate { key: stream.key()?, at: stream.location()? }),
             PRODUCER_DEF => Some(Record::ProducerDef { number: stream.varint32()?, id: stream.id16()? }),
             PRODUCER => Some(Record::Producer { number: stream.varint32()?, seq: stream.varint()? }),
