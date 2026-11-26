@@ -10,7 +10,7 @@
 //!  work key (claimable, when the server sends or journals it)
 //!  ┌── generation 4 · arrival varint ──┐
 //!  optional fields (only those whose flag bit is set)
-//!  reply 4 · correlation 16 · principal 4 · delegate 4 · not_before varint · expires varint · group 16
+//!  principal 4 · delegate 4 · not_before varint · expires varint · group 16
 //!  payload: length 4 + bytes
 //! ```
 //!
@@ -141,10 +141,6 @@ pub struct Envelope {
     pub failures: u16,
     /// Set by the server on claimable events.
     pub key: Option<WorkKey>,
-    /// Channel for the result.
-    pub reply: Option<Name>,
-    /// Ties one flow together.
-    pub correlation: Option<EventId>,
     /// The registering connection's service credential. Set by the server only.
     pub principal: Option<Name>,
     /// The end user a proxy registered this on behalf of.
@@ -171,8 +167,6 @@ impl Envelope {
             kind,
             failures: 0,
             key: None,
-            reply: None,
-            correlation: None,
             principal: None,
             delegate: None,
             not_before: None,
@@ -194,16 +188,6 @@ impl Envelope {
 
     pub fn with_id(mut self, id: EventId) -> Self {
         self.id = id;
-        self
-    }
-
-    pub fn with_reply(mut self, channel: impl Into<Name>) -> Self {
-        self.reply = Some(channel.into());
-        self
-    }
-
-    pub fn with_correlation(mut self, correlation: EventId) -> Self {
-        self.correlation = Some(correlation);
         self
     }
 
@@ -234,8 +218,6 @@ impl Envelope {
         let mut flags = 0;
         for (present, bit) in [
             (self.kind == Kind::Dispatch, codec::KIND),
-            (self.reply.is_some(), codec::REPLY),
-            (self.correlation.is_some(), codec::CORRELATION),
             (self.principal.is_some(), codec::PRINCIPAL),
             (self.delegate.is_some(), codec::DELEGATE),
             (self.not_before.is_some(), codec::NOT_BEFORE),
@@ -252,15 +234,12 @@ impl Envelope {
     /// Every name this envelope carries in `layout`, in encoding order.
     pub fn names(&self, layout: codec::Layout) -> impl Iterator<Item = &Name> {
         let optional = layout.has_optional();
-        [Some(&self.channel), Some(&self.event_type)]
-            .into_iter()
-            .chain([self.reply.as_ref(), self.principal.as_ref(), self.delegate.as_ref()].into_iter().map(move |name| if optional { name } else { None }))
-            .flatten()
+        [Some(&self.channel), Some(&self.event_type)].into_iter().chain([self.principal.as_ref(), self.delegate.as_ref()].into_iter().map(move |name| if optional { name } else { None })).flatten()
     }
 
     /// The same event as a notice: the head and the work key, nothing else.
     pub fn notice(&self) -> Envelope {
-        Envelope { reply: None, correlation: None, principal: None, delegate: None, not_before: None, expires: None, group: None, payload: Bytes::new(), ..self.clone() }
+        Envelope { principal: None, delegate: None, not_before: None, expires: None, group: None, payload: Bytes::new(), ..self.clone() }
     }
 }
 

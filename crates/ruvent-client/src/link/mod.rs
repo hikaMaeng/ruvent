@@ -4,7 +4,7 @@
 //!
 //! * [`Tcp`]: a socket and wire v2 ([`crate::remote::open_raw`]);
 //! * [`Local`]: an engine in this process ([`ruvent::Engine::open`]), for
-//!   tests and embedded use. The same producer, worker, requester and
+//!   tests and embedded use. The same producer, worker and
 //!   observer run on either.
 //!
 //! [`Conn`] normalises the one thing the two paths say differently: an

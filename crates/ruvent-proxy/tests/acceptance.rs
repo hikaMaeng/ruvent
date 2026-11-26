@@ -7,6 +7,9 @@
 mod support;
 
 use ruvent::{Engine, EngineConfig, Envelope, Target};
+use ruvent_client::link::Connector;
+use ruvent_client::producer::{Producer, ProducerConfig};
+use ruvent_client::worker::{Service, Worker};
 use ruvent_proxy::{Fanout, FanoutConfig, Servers, Tcp, Upstream};
 use ruvent_server::{serve, Credentials, ServerOptions};
 use std::io;
@@ -163,4 +166,52 @@ async fn an_upstream_that_goes_away_shows_in_health() {
     assert!(row(&kept).observing, "{health:?}");
     support::dispatch(&two.engine, "room", "7").await;
     assert_eq!(text(&next(&mut events).await), "7", "the server still up keeps serving");
+}
+
+/// > 요청–응답은 구성원 하나다. 요청마다 응답 채널을 구독하고, 그 채널 이름을 payload에 넣어 등록하고, 오는 것을 클라이언트에 쓴다.
+///
+/// (Plan 4장, v4.8.) No request–response helper and no flow id in the
+/// envelope: each request gets its own answer channel, named by the program
+/// and carried in the request's payload. A worker answers there with plain
+/// dispatch — pieces while it runs, the last one with its completion — and
+/// the event server routes by channel alone. Two requests in flight at once
+/// each get their own pieces, in order, and nothing of the other's.
+#[tokio::test]
+async fn each_request_is_answered_on_its_own_channel_in_order() {
+    let server = event_server().await;
+    let fanout = fanout(&[&server]).await;
+    let connector: Arc<dyn Connector> = Arc::new(Tcp::new("proxy-token"));
+    let list = Servers::new([server.address.to_string()]);
+    let worker = Worker::builder(connector.clone(), &list)
+        .service(Service::new("calls").on("call", |cx| async move {
+            let answer = String::from_utf8(cx.payload().to_vec()).unwrap();
+            for n in 0..3 {
+                cx.emit_now(Envelope::dispatch(answer.as_str(), "piece", format!("{answer}:{n}").into_bytes())).await.unwrap();
+            }
+            cx.emit_dispatch(answer.as_str(), "end", Vec::new());
+            Ok(())
+        }))
+        .start();
+    let producer = Producer::start(connector, &list, ProducerConfig::default());
+    let mut asks = Vec::new();
+    for name in ["answer.0b1e", "answer.7c2d"] {
+        let (member, events) = fanout.attach().await.unwrap();
+        member.subscribe(channel(name)).await.unwrap();
+        producer.send(Envelope::claimable("calls", "call", name.as_bytes().to_vec())).await.unwrap();
+        asks.push((name, member, events));
+    }
+    for (name, member, mut events) in asks {
+        let mut got = Vec::new();
+        loop {
+            let event = next(&mut events).await;
+            assert_eq!(event.channel.as_str(), name, "only this request's channel reaches its member");
+            if event.event_type.as_str() == "end" {
+                break;
+            }
+            got.push(text(&event));
+        }
+        assert_eq!(got, [format!("{name}:0"), format!("{name}:1"), format!("{name}:2")], "pieces in order, then the end");
+        drop(member); // the program's end condition: the subscription is let go
+    }
+    worker.shutdown().await;
 }

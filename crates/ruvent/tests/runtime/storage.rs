@@ -6,6 +6,7 @@ use ruvent::{
     async_trait, connect, Batch, Bytes, Call, CheckpointHead, Checkpoints, Engine, EngineConfig, Envelope, EventId, Hello, Journal, MemoryConfig, Methods, Outbound, Part, Parts, SegmentLog,
     StorageConfig, Target, Written,
 };
+use ruvent::{ChannelRule, ChannelSettings, Pattern};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -248,6 +249,13 @@ async fn spool(engine: &Engine, body: &'static [u8]) -> ruvent::Spooled {
     .unwrap()
 }
 
+/// An engine where `scratch.*` is volatile (no channel is by default).
+fn scratch_volatile() -> EngineConfig {
+    let mut config = EngineConfig::default();
+    config.channels.rules.insert(0, ChannelRule { pattern: Pattern("scratch.*".into()), settings: ChannelSettings { volatile: true, ..ChannelSettings::default() } });
+    config
+}
+
 /// A completion whose follow-ups' payloads the connection owner received to
 /// disk: the durable follow-up survives a restart pointing at its body; the
 /// volatile one goes out read from disk and is gone after the restart
@@ -257,7 +265,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a
     let path = scratch("streamed").join("journal");
     {
         let (journal, recovered) = SegmentLog::open(&path).unwrap();
-        let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
+        let engine = Engine::start(scratch_volatile(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         producer.register_committed(work("work")).await.unwrap();
         let (session, mut out) = engine.open(Hello::worker("svc")).await.unwrap();
@@ -271,7 +279,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a
         };
         let durable = spool(&engine, b"a durable body received to disk").await;
         let volatile = spool(&engine, b"a volatile body past the reserve").await;
-        let follow_ups = vec![Envelope::claimable("next", "do", Bytes::new()), Envelope::claimable("reply.r", "do", Bytes::new())];
+        let follow_ups = vec![Envelope::claimable("next", "do", Bytes::new()), Envelope::claimable("scratch.r", "do", Bytes::new())];
         session.call(Call::Complete { seq: 1, id: assignment.event.id, token: assignment.token, follow_ups, spooled: vec![(0, durable), (1, volatile)] }).await.unwrap();
         loop {
             if let Some(Outbound::Committed { seq: 1 }) = out.recv().await {
@@ -279,7 +287,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a
             }
         }
         let (taker, mut taken) = connect(&engine, Hello::worker("svc"), 64).await.unwrap();
-        for channel in ["next", "reply.r"] {
+        for channel in ["next", "scratch.r"] {
             taker.join(channel.into(), Vec::new(), Duration::from_secs(60), false).await.unwrap();
             taker.window(channel.into(), 1, 0).await.unwrap();
         }
@@ -292,27 +300,27 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a
         }
         // Given back with the windows shut, so they wait across the restart
         // instead of staying claimed.
-        for channel in ["next", "reply.r"] {
+        for channel in ["next", "scratch.r"] {
             taker.window(channel.into(), 0, 0).await.unwrap();
         }
         for assignment in held {
             taker.release(assignment.event.id, assignment.token, Duration::ZERO, false).await.unwrap();
         }
         assert_eq!(bodies["next"], Bytes::from_static(b"a durable body received to disk"));
-        assert_eq!(bodies["reply.r"], Bytes::from_static(b"a volatile body past the reserve"));
+        assert_eq!(bodies["scratch.r"], Bytes::from_static(b"a volatile body past the reserve"));
         let (observer, _) = observer(&engine).await;
         assert_eq!(observer.stats().await.unwrap().counters.spilled_bytes, 32, "the volatile body's bytes are counted");
         drop((taker, session, producer));
         engine.shutdown().await.unwrap();
     }
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
-    let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
+    let engine = Engine::start(scratch_volatile(), journal, recovered).await.unwrap();
     let (worker, mut assignments) = worker(&engine).await;
     worker.join("next".into(), Vec::new(), Duration::from_secs(60), false).await.unwrap();
     worker.window("next".into(), 1, 0).await.unwrap();
     assert_eq!(next_assignment(&mut assignments).await.event.payload, Bytes::from_static(b"a durable body received to disk"));
     let (observer, _) = observer(&engine).await;
-    assert!(observer.subscribe(Target::Channel("reply.r".into()), None).await.unwrap().notices.is_empty(), "the volatile follow-up is gone");
+    assert!(observer.subscribe(Target::Channel("scratch.r".into()), None).await.unwrap().notices.is_empty(), "the volatile follow-up is gone");
 }
 
 /// `body_to_disk`: a durable channel's body goes to disk at the memory high
@@ -323,20 +331,20 @@ async fn body_to_disk_says_yes_at_the_watermark_and_for_a_volatile_channel_only_
     let path = scratch("pressure").join("journal");
     let memory = MemoryConfig { limit: Some(10_000), slot_bytes: 100, early_pause: 1.0, ..MemoryConfig::default() };
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
-    let engine = Engine::start(EngineConfig { memory: memory.clone(), ..EngineConfig::default() }, journal, recovered).await.unwrap();
-    assert!(!engine.body_to_disk("work", 100) && !engine.body_to_disk("reply.x", 100));
+    let engine = Engine::start(EngineConfig { memory: memory.clone(), ..scratch_volatile() }, journal, recovered).await.unwrap();
+    assert!(!engine.body_to_disk("work", 100) && !engine.body_to_disk("scratch.x", 100));
     let (producer, _) = producer(&engine).await;
     for _ in 0..7 {
-        producer.register_committed(Envelope::claimable("reply.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
+        producer.register_committed(Envelope::claimable("scratch.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
     }
     let pressure = engine.pressure();
     assert!(pressure.memory_used >= pressure.memory_high && pressure.memory_used < pressure.memory_limit, "{pressure:?}");
     assert!(engine.body_to_disk("work", 10), "durable: at the high watermark");
-    assert!(!engine.body_to_disk("reply.y", 10), "volatile: the reserve is still there");
+    assert!(!engine.body_to_disk("scratch.y", 10), "volatile: the reserve is still there");
     for _ in 0..4 {
-        producer.register_committed(Envelope::claimable("reply.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
+        producer.register_committed(Envelope::claimable("scratch.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
     }
-    assert!(engine.body_to_disk("reply.y", 10), "volatile: past the limit");
+    assert!(engine.body_to_disk("scratch.y", 10), "volatile: past the limit");
     let volatile = Engine::volatile(EngineConfig { memory, ..EngineConfig::default() }).await;
     assert!(!volatile.body_to_disk("work", u64::MAX / 2) && volatile.spool().is_none());
 }

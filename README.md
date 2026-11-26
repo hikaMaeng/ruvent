@@ -8,7 +8,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
   구독 취소다.
 * **이벤트는 두 종류다.** 착수용 이벤트는 완료 보고로 큐에서 지워지고, 발송용 이벤트는 발송하는 순간 지워진다.
   둘 다 한 가지 엔벨롭을 쓴다(고정 머리 27바이트).
-* **이벤트 서버의 프로토콜은 하나다.** TCP 위의 ruvent wire(v2)다. 프록시와 워커 서버는 SDK로 그 프로토콜만
+* **이벤트 서버의 프로토콜은 하나다.** TCP 위의 ruvent wire(v3)다. 프록시와 워커 서버는 SDK로 그 프로토콜만
   써서 붙는다. 일반 클라이언트는 이벤트 서버에 직접 붙지 않는다. 클라이언트의 여러 프로토콜을 받는 일은 전부
   프록시의 몫이다.
 * **서버는 접속자를 구분하지 않는다.** 워커 서버, 프록시, 내장 워커 모두 같은 메서드를 부른다. 내장 워커는
@@ -28,7 +28,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 
 | 크레이트 | 내용 | 문서 |
 | --- | --- | --- |
-| `ruvent` | 엔벨롭과 코덱, 이름표, 엔진(두 큐, 메서드 일곱 개), 저널 v2, 운영 스냅샷, 메서드 계약과 인프로세스 연결 | [crates/ruvent/README.md](crates/ruvent/README.md) |
+| `ruvent` | 엔벨롭과 코덱, 이름표, 엔진(두 큐, 메서드 일곱 개), 저널 형식 4, 운영 스냅샷, 메서드 계약과 인프로세스 연결 | [crates/ruvent/README.md](crates/ruvent/README.md) |
 | `ruvent-protocol` | 이진 와이어 프로토콜: 핸드셰이크, 프레임, 접속별 이름 사전, 메서드 레코드 | [crates/ruvent-protocol/README.md](crates/ruvent-protocol/README.md) |
 | `ruvent-server` | 이벤트 서버 바이너리와 수신부. JSON 설정 | [crates/ruvent-server/README.md](crates/ruvent-server/README.md) |
 | `ruvent-client` | 원격 연결과 워커 프레임워크(`App`, `Service`, 실행기, 재시도 정책) | [crates/ruvent-client/README.md](crates/ruvent-client/README.md) |

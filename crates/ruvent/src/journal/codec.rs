@@ -1,8 +1,8 @@
-//! Journal format 3 in a segment: the frames of the log lane, and the pieces
+//! Journal format 4 in a segment: the frames of the log lane, and the pieces
 //! the checkpoint file shares with them.
 //!
 //! ```text
-//! segment header (20 bytes): "rvseg\0" 0x03 lane u8 · number u32 · first serial u64
+//! segment header (20 bytes): "rvseg\0" 0x04 lane u8 · number u32 · first serial u64
 //! log frame:  [len u32][crc32 u32] [kind u8][uptime u64][commit v][first v][next v][count v][item]…
 //!                                   '------------------- covered by crc --------------------'
 //! body frame (long and body lanes): [len u32][crc32 u32][payload]   (crc of the payload alone)
@@ -53,7 +53,7 @@ pub const HEADER: u64 = 8;
 /// A frame appended to the log lane.
 pub const APPEND: u8 = 1;
 /// `"rvseg\0"`, the format, then the lane.
-pub const SEGMENT_MAGIC: &[u8; 7] = b"rvseg\0\x03";
+pub const SEGMENT_MAGIC: &[u8; 7] = b"rvseg\0\x04";
 /// Magic + lane + number + first serial.
 pub const SEGMENT_HEADER: u64 = 20;
 

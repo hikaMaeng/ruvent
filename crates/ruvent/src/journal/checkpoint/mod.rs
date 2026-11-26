@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"rvckpt\0\x03";
+const MAGIC: &[u8; 8] = b"rvckpt\0\x04";
 const HEAD: u8 = 1;
 const NAME: u8 = 2;
 const PRODUCER: u8 = 3;
@@ -214,7 +214,7 @@ impl CheckpointReader {
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic).map_err(|_| damaged(&path, "shorter than its header"))?;
         if &magic != MAGIC {
-            return Err(invalid(format!("{}: not a ruvent checkpoint of format 3; it was left untouched", path.display())));
+            return Err(invalid(format!("{}: not a ruvent checkpoint of format 4 (format 3 and older are refused, not migrated); it was left untouched", path.display())));
         }
         Ok(CheckpointReader { path, file: BufReader::new(file), left: left - 8, names: HashMap::new(), buffered: VecDeque::new(), counted: (0, 0), ended: false })
     }

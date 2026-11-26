@@ -39,8 +39,8 @@ fn a_prefix_subscription_matches_at_dot_boundaries_unlike_a_grant_pattern() {
 #[test]
 fn a_dispatch_join_receives_the_channels_dispatch_events() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: "reply.me".into(), types: Vec::new(), lease_ms: 5_000, dispatch: true });
-    let chunk = h.call(W2, Call::Register { seq: None, event: Envelope::dispatch("reply.me", "chunk", Bytes::new()) });
+    h.call(W1, Call::Join { req: 1, channel: "answer.me".into(), types: Vec::new(), lease_ms: 5_000, dispatch: true });
+    let chunk = h.call(W2, Call::Register { seq: None, event: Envelope::dispatch("answer.me", "chunk", Bytes::new()) });
     assert_eq!(deliveries(&chunk, W1), 1, "a stream chunk emitted on a work connection reaches the requester's work connection");
 }
 
@@ -72,7 +72,7 @@ fn deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_wit
     let waiting = h.register("work");
     let delete = |h: &mut H, target| {
         let seq = h.next_seq(P);
-        h.call(P, Call::Delete { seq, id: target, result: "out".into(), tag: id(1), key: None })
+        h.call(P, Call::Delete { seq, id: target, result: "out".into(), key: None })
     };
     let outcome = |effects: &Effects| -> Vec<String> {
         sent(effects, O)

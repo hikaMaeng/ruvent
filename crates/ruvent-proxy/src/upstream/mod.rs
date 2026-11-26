@@ -4,8 +4,8 @@
 //! observation connection on each (one subscription per channel or prefix
 //! per server, however many members want it). It is the client SDK's
 //! observer: reconnection with back-off, TCP keepalive on every socket
-//! (S13), the `Bye` table. A program that also publishes or asks gives its
-//! own SDK producer or requester the same connector and list.
+//! (S13), the `Bye` table. A program that also publishes gives its own SDK
+//! producer the same connector and list.
 //!
 //! [`Upstream`] names the three things that decide it: how a connection is
 //! opened ([`Connector`]: [`Tcp`] to real servers, [`Local`] to engines in

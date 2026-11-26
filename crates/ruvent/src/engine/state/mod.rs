@@ -29,7 +29,6 @@
 //! | timing wheel | (time, slot, generation) (`Wheel`) | server | assignment, delay, expiry ~ due | claimed + delayed + expiring | ledger |
 //! | subscriptions | channel or prefix → connections (`Subscribers`) | server | subscribe ~ unsubscribe, close | subscriptions | ledger |
 //! | isolated events | logical id, on `isolated.<channel>` | server | isolation ~ completion, deletion, keep time | counted to the original root | workers, expiry |
-//! | reply-channel results | logical id, on `reply.<instance>` | server | follow-up ~ completion or expiry | counted to the request's root | requesters, expiry |
 //! | drain mark | server | server | `Drain` ~ stop | 1 | operator |
 //! | body cache | slot (`Slot::payload`; release order in `cache`) | server | registration or read-ahead ~ released at the watermark, or the event leaves | managed memory: released past the high watermark | ledger (`release_cache`) |
 //! | unlocated registrations | serial → slot (`unlocated`) | ledger | durable registration ~ its write lands | registrations in flight | ledger (`wrote`) |
@@ -581,7 +580,7 @@ impl State {
         let before = self.effects.records.len();
         match call {
             Call::Register { event, .. } => self.register(session, role, &credential, event),
-            Call::Delete { id, result, tag, key, .. } => self.delete(session, &credential, id, &result, tag, key),
+            Call::Delete { id, result, key, .. } => self.delete(session, &credential, id, &result, key),
             Call::Join { req, channel, types, lease_ms, dispatch } => self.join(session, &credential, req, &channel, types, lease_ms, dispatch),
             Call::Window { channel, count, bytes } => self.window(session, &channel, count, bytes),
             Call::Complete { id, token, follow_ups, spooled, .. } => self.complete(session, &credential, id, token, follow_ups, spooled),

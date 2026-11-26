@@ -213,11 +213,10 @@ impl Encoder {
     fn call(&mut self, call: &Call) {
         match call {
             Call::Register { seq, event } => self.event(REGISTER, |out, _| put_varint(out, seq.unwrap_or(0)), event, Layout::Request),
-            Call::Delete { seq, id, result, tag, key } => self.plain(DELETE, |out, dictionary| {
+            Call::Delete { seq, id, result, key } => self.plain(DELETE, |out, dictionary| {
                 put_varint(out, *seq);
                 out.put_slice(&id.0);
                 put_name(out, dictionary, result);
-                out.put_slice(&tag.0);
                 put_key(out, *key);
             }),
             Call::Join { req, channel, types, lease_ms, dispatch } => self.plain(JOIN, |out, dictionary| {

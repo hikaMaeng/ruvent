@@ -66,17 +66,16 @@ async fn deletion_removes_only_a_waiting_event_and_always_announces_its_outcome(
     let (_, sent) = producer.register(Envelope::dispatch("feed", "x", Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
     let (_, second) = producer.register(work()).await.unwrap();
     assert_ne!(second, claimed);
+    // The outcome names the deleted id in its payload: the envelope carries no flow id.
     for (target, announced) in [(claimed, DELETE_FAILED), (sent, DELETE_FAILED)] {
-        let tag = EventId::new_v7();
-        producer.delete(target, "results".into(), tag, None).await.unwrap();
+        producer.delete(target, "results".into(), None).await.unwrap();
         let Incoming::Delivery(outcome) = next(&mut inbox).await else { panic!("no outcome event") };
-        assert_eq!((&*outcome.event_type, outcome.correlation, outcome.kind), (announced, Some(tag), ruvent::Kind::Dispatch));
+        assert_eq!((&*outcome.event_type, &outcome.payload[..16], outcome.kind), (announced, &target.0[..], ruvent::Kind::Dispatch));
     }
     let _ = waiting;
-    let tag = EventId::new_v7();
-    producer.delete(second, "results".into(), tag, None).await.unwrap();
+    producer.delete(second, "results".into(), None).await.unwrap();
     let Incoming::Delivery(outcome) = next(&mut inbox).await else { panic!("no outcome event") };
-    assert_eq!((&*outcome.event_type, outcome.correlation), (DELETED, Some(tag)));
+    assert_eq!((&*outcome.event_type, &outcome.payload[..]), (DELETED, &second.0[..]));
 }
 
 /// > 2. 착수마킹(이벤트 자체에 상태를 직접 변경):가져간 워커정보를 비롯한 착수정보 기록. 착수시에 타임아웃이 일어날 시간을 워커가 마킹함

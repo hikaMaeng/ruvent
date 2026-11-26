@@ -1,6 +1,6 @@
 # ruvent-server
 
-이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v2(`ruvent-protocol`) TCP 수신부를 둔다.
+이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v3(`ruvent-protocol`) TCP 수신부를 둔다.
 모든 접속은 `Hello`에서 서비스 자격 토큰과 역할(생산·작업·관찰, 계획 2.2)을 밝히고, 그 뒤로는 그 역할의
 호출만 그 자격으로 보낸다. 자격이 할 수 있는 일은 엔진의 권한표(`grants`)가 정한다.
 
@@ -38,7 +38,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 채널 설정 키: `isolate_after`(격리 문턱, `0` = 격리 안 함, 기본 5), `isolated_keep_ms`(격리 보존, 7일),
 `isolate_expired`(만료를 지우지 않고 격리), `max_backlog`(`{ "count", "bytes" }`, 넘으면 그 뿌리 정지),
 `serialize_group`(같은 `group`을 한 번에 하나만 배정), `volatile`(저널에 쓰지 않음). 사용자 규칙 뒤에
-기본 규칙 둘이 붙는다: `reply.*`는 휘발이고 격리하지 않으며, `isolated.*`는 다시 격리하지 않는다.
+기본 규칙 하나가 붙는다: `isolated.*`는 다시 격리하지 않는다. 기본으로 휘발인 채널은 없다(계획 v4.8에서 `reply.*` 규칙을 지웠다).
 
 메서드 이름: `register_claimable`, `register_dispatch`, `claim`, `complete`, `delete`, `subscribe`, `unsubscribe`,
 `operate`(`Stats`, `Drain`). 채널 패턴: 정확한 이름, `*`로 끝나는 접두사, 또는 `*`.
@@ -61,7 +61,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
   상대가 닫지 않으면 `close_ms`에 닫는다. 연결이 닫힐 때 쓰기를 끝내지 못한 `Assign`의 표지를 엔진에 넘겨
   곧바로 대기로 되돌린다(실패 횟수 그대로).
 * 모든 소켓에 TCP keepalive를 건다. 리눅스는 `TCP_USER_TIMEOUT`도 건다. 앱 타이머는 없다.
-* v1 클라이언트의 hello는 첫 바이트로 알아보고 v1 형식의 `Bye`로 거절한다. 다른 v2 버전은 `Bye{version}`.
+* v1 클라이언트의 hello는 첫 바이트로 알아보고 v1 형식의 `Bye`로 거절한다. v3가 아닌 다른 버전(v2 포함)은 `Bye{version}`.
 
 ## 내리는 순서 (`serve`, 계획 2.8, B22)
 
@@ -89,7 +89,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 | `src/connection/socket.rs` | keepalive(`socket2`) |
 | `src/lib.rs` | `run`: 세그먼트 로그 복구, 엔진 시작, 수신, 종료·장애 전파 |
 | `src/main.rs` | 바이너리 |
-| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v2 연결 |
+| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v3 연결 |
 
 타이머는 둘이다: hello 기한(`handshake.rs`)과 닫기 기한(`close.rs`). 정적 시험의 `TIMERS`에 선언돼 있다.
 

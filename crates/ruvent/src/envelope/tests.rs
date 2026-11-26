@@ -72,13 +72,12 @@ fn an_assigned_event_has_these_exact_bytes() {
 
 #[test]
 fn a_dispatch_delivery_has_these_exact_bytes() {
-    let event = Envelope::dispatch("c", "t", Bytes::from_static(b"x")).with_id(EventId([0x22; 16])).with_correlation(EventId([0x33; 16]));
+    let event = Envelope::dispatch("c", "t", Bytes::from_static(b"x")).with_id(EventId([0x22; 16]));
     let (bytes, _) = roundtrip(&event, Layout::Delivery).unwrap();
     let mut expected = vec![0x22; 16];
     expected.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
-    expected.extend_from_slice(&(codec::KIND | codec::CORRELATION).to_le_bytes());
+    expected.extend_from_slice(&codec::KIND.to_le_bytes());
     expected.extend_from_slice(&[0, 0]);
-    expected.extend_from_slice(&[0x33; 16]);
     expected.extend_from_slice(&[1, 0, 0, 0, b'x']);
     assert_eq!(bytes, expected);
 }
@@ -126,11 +125,13 @@ fn raw(flags: u16, failures: u16, tail: &[u8]) -> Vec<u8> {
 fn the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers() {
     let payload = [0u8, 0, 0, 0];
     assert_eq!(decode_raw(raw(1 << 1, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved, "bit 1 was 'claimed' and is reserved now");
+    assert_eq!(decode_raw(raw(1 << 2, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved, "bit 2 was 'reply' (format 3) and is reserved now");
+    assert_eq!(decode_raw(raw(1 << 3, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved, "bit 3 was 'correlation' (format 3) and is reserved now");
     assert_eq!(decode_raw(raw(1 << 9, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved);
     assert_eq!(decode_raw(raw(1 << 15, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved);
     assert_eq!(decode_raw(raw(0, 1, &payload), Layout::Request).unwrap_err(), Malformed::Forbidden("failures"));
     assert_eq!(decode_raw(raw(codec::KIND, 1, &payload), Layout::Delivery).unwrap_err(), Malformed::Forbidden("failures"));
-    assert_eq!(decode_raw(raw(codec::REPLY, 0, &[0; 8]), Layout::Notice).unwrap_err(), Malformed::Forbidden("optional field"));
+    assert_eq!(decode_raw(raw(codec::PRINCIPAL, 0, &[0; 8]), Layout::Notice).unwrap_err(), Malformed::Forbidden("optional field"));
     assert_eq!(decode_raw(raw(0, 0, &[0, 0, 0, 0, 9]), Layout::Request).unwrap_err(), Malformed::Trailing);
     assert_eq!(decode_raw(raw(0, 0, &[5, 0, 0, 0, 1]), Layout::Request).unwrap_err(), Malformed::Short);
     let mut unknown = raw(0, 0, &payload);
@@ -180,19 +181,17 @@ fn name() -> impl Strategy<Value = Name> {
 fn envelope() -> impl Strategy<Value = Envelope> {
     (
         (any::<[u8; 16]>(), name(), name(), any::<bool>(), any::<u16>(), any::<(u32, u64)>()),
-        (proptest::option::of(name()), proptest::option::of(any::<[u8; 16]>()), proptest::option::of(name()), proptest::option::of(name())),
+        (proptest::option::of(name()), proptest::option::of(name())),
         (proptest::option::of(any::<u64>()), proptest::option::of(any::<u64>()), proptest::option::of(any::<[u8; 16]>())),
         proptest::collection::vec(any::<u8>(), 0..64),
     )
-        .prop_map(|((id, channel, event_type, dispatch, failures, key), (reply, correlation, principal, delegate), (not_before, expires, group), payload)| Envelope {
+        .prop_map(|((id, channel, event_type, dispatch, failures, key), (principal, delegate), (not_before, expires, group), payload)| Envelope {
             id: EventId(id),
             channel,
             event_type,
             kind: if dispatch { Kind::Dispatch } else { Kind::Claimable },
             failures,
             key: Some(WorkKey { generation: key.0, arrival: key.1 }),
-            reply,
-            correlation: correlation.map(EventId),
             principal,
             delegate,
             not_before,

@@ -126,22 +126,22 @@ pub struct Sent {
     pub id: EventId,
 }
 
-/// The servers a send may go to besides the usual constraints (a request's
-/// reply-channel joins, 2.8).
+/// The servers a send may go to besides the usual constraints (a delete goes
+/// to the one server that holds the event).
 pub(crate) type Gate = watch::Receiver<BTreeSet<Server>>;
 
 /// One numbered production call, kept until acknowledged.
 #[derive(Clone)]
 enum Op {
     Register(Envelope),
-    Delete { id: EventId, result: Name, tag: EventId, key: Option<WorkKey> },
+    Delete { id: EventId, result: Name, key: Option<WorkKey> },
 }
 
 impl Op {
     fn call(&self, seq: u64) -> Call {
         match self {
             Op::Register(event) => Call::Register { seq: Some(seq), event: event.clone() },
-            Op::Delete { id, result, tag, key } => Call::Delete { seq, id: *id, result: result.clone(), tag: *tag, key: *key },
+            Op::Delete { id, result, key } => Call::Delete { seq, id: *id, result: result.clone(), key: *key },
         }
     }
 
@@ -274,11 +274,11 @@ impl Producer {
     }
 
     /// Deletes a waiting event on `server` (an explicit cancel, 7장); the
-    /// outcome is a dispatch event on `result` with correlation `tag`.
-    pub async fn delete(&self, server: &Server, id: EventId, result: Name, tag: EventId, key: Option<WorkKey>) -> Result<(), ProducerError> {
+    /// outcome is a dispatch event on `result` whose payload names the deleted id.
+    pub async fn delete(&self, server: &Server, id: EventId, result: Name, key: Option<WorkKey>) -> Result<(), ProducerError> {
         let only: BTreeSet<Server> = [server.clone()].into();
         let (_, gate) = watch::channel(only);
-        self.place(Op::Delete { id, result, tag, key }, Some(gate), None, false).await.map(|_| ())
+        self.place(Op::Delete { id, result, key }, Some(gate), None, false).await.map(|_| ())
     }
 
     /// Waits until every line's buffer is empty: everything sent so far is committed.
@@ -319,15 +319,9 @@ impl Producer {
         self.shared.state.lock().refused
     }
 
-    /// The retry budget (shared with a requester built on this producer).
+    /// The retry budget of [`Producer::retry`].
     pub fn budget(&self) -> &RetryBudget {
         &self.shared.budget
-    }
-
-    /// A request: only servers in `gate` (joined to the reply channel) may take it.
-    pub(crate) async fn send_gated(&self, event: Envelope, gate: Gate) -> Result<Sent, ProducerError> {
-        self.shared.budget.earn();
-        self.place(Op::Register(prepare(event)), Some(gate), None, false).await.map(|(sent, _)| sent)
     }
 
     /// A send from inside a handler: `blocked` is set while it waits for a
@@ -335,13 +329,6 @@ impl Producer {
     pub(crate) async fn send_marked(&self, event: Envelope, blocked: &AtomicBool) -> Result<Sent, ProducerError> {
         self.shared.budget.earn();
         self.place(Op::Register(prepare(event)), None, Some(blocked), false).await.map(|(sent, _)| sent)
-    }
-
-    pub(crate) async fn retry_gated(&self, event: Envelope, gate: Gate) -> Result<Sent, ProducerError> {
-        if !self.shared.budget.spend() {
-            return Err(ProducerError::BudgetSpent);
-        }
-        self.place(Op::Register(prepare(event)), Some(gate), None, false).await.map(|(sent, _)| sent)
     }
 
     async fn wait(&self, done: Option<oneshot::Receiver<()>>) -> Result<(), ProducerError> {

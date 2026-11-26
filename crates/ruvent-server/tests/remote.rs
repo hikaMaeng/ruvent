@@ -385,7 +385,15 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
     let volatile_body = Bytes::from(vec![9u8; 32]);
     {
         let memory = MemoryConfig { limit: Some(10_000), slot_bytes: 100, early_pause: 1.0, ..MemoryConfig::default() };
-        let engine = durable(&path, EngineConfig { memory, ..EngineConfig::default() }).await;
+        let engine = durable(&path, {
+            let mut config = EngineConfig { memory, ..EngineConfig::default() };
+            config
+                .channels
+                .rules
+                .insert(0, ruvent::ChannelRule { pattern: ruvent::Pattern("scratch.*".into()), settings: ruvent::ChannelSettings { volatile: true, ..ruvent::ChannelSettings::default() } });
+            config
+        })
+        .await;
         let server = server(&engine).await;
         let (producer, _) = dial(&server, Hello::producer("x")).await;
         let (worker, mut work) = dial(&server, Hello::worker("x")).await;
@@ -394,10 +402,10 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
         worker.window("work".into(), 1, 0).await.unwrap();
         let assigned = assignment(&mut work).await;
         for _ in 0..11 {
-            producer.register_committed(Envelope::claimable("reply.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
+            producer.register_committed(Envelope::claimable("scratch.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
         }
-        assert!(engine.body_to_disk("next", durable_body.len() as u64) && engine.body_to_disk("reply.y", volatile_body.len() as u64), "{:?}", engine.pressure());
-        let follow_ups = vec![Envelope::claimable("next", "do", durable_body.clone()), Envelope::claimable("reply.y", "do", volatile_body.clone())];
+        assert!(engine.body_to_disk("next", durable_body.len() as u64) && engine.body_to_disk("scratch.y", volatile_body.len() as u64), "{:?}", engine.pressure());
+        let follow_ups = vec![Envelope::claimable("next", "do", durable_body.clone()), Envelope::claimable("scratch.y", "do", volatile_body.clone())];
         let seq = worker.complete(assigned.event.id, assigned.token, follow_ups).await.unwrap();
         worker.committed(seq).await.unwrap();
         assert_eq!(stats(&server).await.counters.spilled_bytes, volatile_body.len() as u64, "the volatile body went to disk");
@@ -618,7 +626,8 @@ async fn version_1_and_other_versions_are_refused() {
     let mut encoder = Encoder::new(DICTIONARY);
     encoder.push(&Message::Hello { version: VERSION, features: 0, token: TOKEN.into(), hello: Hello::producer("x") }).unwrap();
     let mut bytes = encoder.take().concat();
-    bytes[7] = 3;
+    // Version 2 (an envelope with `reply` and `correlation`) is another version now.
+    bytes[7] = 2;
     let stream = TcpStream::connect(&server.address).await.unwrap();
     let (read, mut write) = stream.into_split();
     write.write_all(&bytes).await.unwrap();

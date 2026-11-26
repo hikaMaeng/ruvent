@@ -50,7 +50,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 ```text
  고정 머리 28   id 16 · channel 4 · type 4 · flags 2 · failures 2
  작업 키        generation 4 · arrival varint                       (착수용, 서버가 보내거나 기록할 때)
- 선택 필드      reply 4 · correlation 16 · principal 4 · delegate 4 · not_before varint · expires varint · group 16
+ 선택 필드      principal 4 · delegate 4 · not_before varint · expires varint · group 16
  payload        길이 4 + 바이트
 ```
 
@@ -68,7 +68,9 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 * 접속마다: 프로토콜의 방향별 사전. 상한을 넘으면 초기화 레코드를 쓴다.
 * 파일마다: 저널 파일·스냅샷 파일이 각자 이름을 정의하므로 파일 하나만으로 해독된다.
 
-## 저널 형식 3 ([crates/ruvent/src/journal](../crates/ruvent/src/journal/mod.rs))
+엔벨롭에는 서버가 그 값으로 행동하는 필드만 있다(계획 v4.8). 요청–응답의 "어느 요청의 답인가"는 채널이 정한다: 요청마다 응답 채널 하나를 묻는 쪽이 구독하고, 그 이름은 요청의 payload에 든다. 서버는 채널로만 나눈다.
+
+## 저널 형식 4 ([crates/ruvent/src/journal](../crates/ruvent/src/journal/mod.rs))
 
 레코드 집합(`Record`)과 세그먼트 컨테이너(`SegmentLog`)로 나뉜다. 바이트 배치와 태그 표는
 `journal/codec.rs`(세그먼트)와 `journal/checkpoint/mod.rs`(체크포인트)의 doc comment에 있다.
@@ -77,7 +79,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 <dir>/lock               로그를 연 엔진 하나만
 <dir>/0000000001.seg     세그먼트. 열(lane)은 셋이고 번호는 하나로 이어진다
 <dir>/checkpoint.ckpt    마지막 완전한 체크포인트(rename으로 바뀐다)
-세그먼트 머리: "rvseg\0" 0x03 lane · 번호 u32 · 첫 일련번호 u64
+세그먼트 머리: "rvseg\0" 0x04 lane · 번호 u32 · 첫 일련번호 u64
 로그 프레임: [len u32][crc u32][kind][uptime u64][commit v][first v][next v][count v][item…]
 ```
 
@@ -102,7 +104,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 * **복구는 스트리밍이다.** 체크포인트를 읽고 시작 세그먼트부터 꼬리를 프레임 단위로 읽는다. 본문은 CRC만
   계산하고 건너뛰므로 복구 메모리는 메타 크기다. 마지막 세그먼트의 찢어진 꼬리만 열 때 잘라 내고, 중간
   손상과 일련번호 사슬 끊김은 멈추고 보고한다.
-* **옛 형식은 옮기지 않는다.** 경로가 파일이면(형식 2 이하, 형식 3의 단일 파일) 거부하고 그대로 둔다.
+* **옛 형식은 옮기지 않는다.** 경로가 파일이면(형식 2 이하, 형식 3의 단일 파일) 거부하고 그대로 둔다. 형식 3의 세그먼트(엔벨롭에 `reply`·`correlation`이 있던 것)도 거부한다.
 * **읽기 경로.** 캐시에 없는 본문은 blocking 읽기가 가져와 엔진 inbox로 돌려준다. 그동안 그 연결의 뒤 송신은
   기다리고 세그먼트는 pin된다. 콜드 머리를 보낸 줄은 다음 본문을 미리 읽는다(`read_ahead`).
 * **흘려 읽기(B15 포함).** 작업 연결의 후속 본문은 `Engine::body_to_disk`가 예라고 하면 `Spool`로 본문 열에
@@ -137,6 +139,6 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
   구성원에게 나눠 보낸다. 구성원이 붙을 때마다 관찰자에 구독을 한 번 더 내고, 관찰자가 붙인 ticket 이상인 그 서버의
   확인(`Observed::Subscribed`) 이후의 발송만 그 구성원에게 보낸다. 엔벨롭은 허브가 `Arc`로 나눈다. 허브는 구독
   장부(`fanout/channels`, 순수 상태), 허브 태스크(`fanout/task.rs`), 핸들(`fanout/mod.rs`의 `Fanout`·`Member`)로
-  나뉜다. 클라이언트 쪽 프로토콜, 인증, 등록(SDK 생산자), 요청–응답(SDK 요청자), 기한, 역압, 준비 상태의 노출은
-  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v2 하나만
+  나뉜다. 클라이언트 쪽 프로토콜, 인증, 등록(SDK 생산자), 요청–응답(요청별 응답 채널), 기한, 역압, 준비 상태의 노출은
+  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v3 하나만
   말하고, 프록시와 워커 서버만 그것으로 붙는다.

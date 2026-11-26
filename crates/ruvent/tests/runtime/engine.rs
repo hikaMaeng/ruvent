@@ -28,7 +28,7 @@ async fn the_operations_work_through_the_in_process_client() {
     observer.subscribe(Target::Channel("out".into()), None).await.unwrap();
     worker.window("work".into(), 0, 0).await.unwrap();
     let (_, doomed) = producer.register(work("work")).await.unwrap();
-    let deleted = producer.delete(doomed, "out".into(), EventId::new_v7(), None).await.unwrap();
+    let deleted = producer.delete(doomed, "out".into(), None).await.unwrap();
     producer.committed(deleted).await.unwrap();
     assert!(matches!(next_event(&mut watched).await, Some(Incoming::Delivery(event)) if &*event.event_type == DELETED));
     let stats = observer.stats().await.unwrap();

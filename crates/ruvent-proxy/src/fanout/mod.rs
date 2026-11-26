@@ -23,9 +23,11 @@
 //!
 //! **What is not here.** Who a member is, what it may subscribe to, which
 //! protocol it speaks, what it publishes and how a request is answered are
-//! the program's. It authorizes before [`Member::subscribe`], registers
-//! through its own [`ruvent_client::producer::Producer`] and asks through its
-//! own [`ruvent_client::requester::Requester`], each configured by itself.
+//! the program's. It authorizes before [`Member::subscribe`] and registers
+//! through its own [`ruvent_client::producer::Producer`]. A request–response
+//! is one member: it subscribes the request's own answer channel, registers
+//! the request naming that channel in its payload, writes what arrives, and
+//! drops the member when the program's end condition is met.
 
 mod channels;
 mod task;

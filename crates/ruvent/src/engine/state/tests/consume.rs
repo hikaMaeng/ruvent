@@ -219,17 +219,6 @@ fn the_fifth_counted_failure_isolates_and_releases_without_failure_never_do() {
     assert_eq!(h.slot(id(2)).unwrap().channel.as_str(), "isolated.work");
 }
 
-#[test]
-fn reply_channels_are_never_isolated() {
-    let mut h = H::volatile().cast();
-    h.join(W1, "reply.me", 1);
-    let mut current = assigned(&h.produce(P, work("reply.me").with_id(id(1))), W1).remove(0);
-    for _ in 0..8 {
-        current = assigned(&h.call(W1, Call::Release { id: id(1), token: current.token, delay_ms: 0, failed: true }), W1).remove(0);
-    }
-    assert_eq!(h.slot(id(1)).unwrap().channel.as_str(), "reply.me");
-}
-
 /// B26: on a `serialize_group` channel one event of a group is out at a time.
 #[test]
 fn serialize_group_assigns_one_event_of_a_group_at_a_time() {

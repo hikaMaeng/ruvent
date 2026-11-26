@@ -1,4 +1,9 @@
-//! The event server's binary wire protocol, version 2 (plan 2.2, 2.11).
+//! The event server's binary wire protocol, version 3 (plan 2.2, 2.11).
+//!
+//! Version 3 differs from 2 in two places only: the envelope has no
+//! `correlation` (flag bit 3 is reserved and refused) and `Delete` carries no
+//! tag (its outcome names the deleted id in its payload). A version-2 peer is
+//! refused at `Hello`, not translated.
 //!
 //! ## Records
 //!
@@ -18,7 +23,7 @@
 //! decoder gathers them and hands over one message when the last one arrived.
 //!
 //! Inside a head: numbers (sequence numbers, keys, lengths, counts, times)
-//! are unsigned LEB128 varints; ids, nonces, correlations and groups are 16
+//! are unsigned LEB128 varints; ids, nonces and groups are 16
 //! octets; booleans are one byte, 0 or 1; text is `[varint length][UTF-8]`;
 //! a name (channel, type, credential) is a varint number from the sender's
 //! dictionary ([`dictionary`]). An event's head is `ruvent::envelope::codec`'s
@@ -35,7 +40,7 @@
 //! | `0x08` | `NameDef` | both | number, name (text) | — |
 //! | `0x09` | `DictReset` | both | — | — |
 //! | `0x10` | `Register` | → server | seq (0: none, a work connection's dispatch), event head (request layout) | payload |
-//! | `0x11` | `Delete` | → server | seq, id 16, result name, tag 16, key? | — |
+//! | `0x11` | `Delete` | → server | seq, id 16, result name, key? | — |
 //! | `0x12` | `Join` | → server | req, channel, type count, types, lease ms, dispatch u8 | — |
 //! | `0x13` | `Window` | → server | channel, count, bytes | — |
 //! | `0x14` | `Complete` | → server | seq, id 16, token, follow-up count | — |
@@ -121,7 +126,7 @@ pub use io::{sniff_v1, Parts, RawRecord, RecordReader, HEADER};
 pub use records::{validate, Body, Decoder, Encoder, Message, Side};
 
 /// The only protocol version this build speaks.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Default bound on each direction's name dictionary (S18).
 pub const DICTIONARY: usize = 4096;
 /// Default bound on one record's body (B13).

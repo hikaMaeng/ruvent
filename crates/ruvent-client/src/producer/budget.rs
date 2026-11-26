@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Parts of one retry the balance is kept in.
 const UNIT: u64 = 1_000_000;
 
-/// | key | the handle (producer or requester) |
+/// | key | the producer handle |
 /// | --- | --- |
 /// | scope | one process |
 /// | lifetime | the handle's |

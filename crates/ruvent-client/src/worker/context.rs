@@ -28,8 +28,6 @@ pub struct Context {
     key: RunKey,
     messages: mpsc::Sender<Message>,
     producer: Option<Producer>,
-    /// B10: how long a result waits for its requester.
-    result_keep: Duration,
     /// Set while a send waits for a paused channel (B23).
     blocked: Arc<AtomicBool>,
     /// Follow-ups, registered by the completion if the handler succeeds.
@@ -44,8 +42,8 @@ pub struct Context {
 }
 
 impl Context {
-    pub(crate) fn new(event: Envelope, token: ClaimToken, key: RunKey, messages: mpsc::Sender<Message>, producer: Option<Producer>, result_keep: Duration) -> Self {
-        Context { event: Arc::new(event), token, key, messages, producer, result_keep, blocked: Arc::default(), follow_ups: Arc::default() }
+    pub(crate) fn new(event: Envelope, token: ClaimToken, key: RunKey, messages: mpsc::Sender<Message>, producer: Option<Producer>) -> Self {
+        Context { event: Arc::new(event), token, key, messages, producer, blocked: Arc::default(), follow_ups: Arc::default() }
     }
 
     /// The assigned envelope, work key and failure count included.
@@ -92,23 +90,11 @@ impl Context {
         &self.key.server
     }
 
-    pub fn correlation(&self) -> Option<EventId> {
-        self.event.correlation
-    }
-
-    pub fn reply_channel(&self) -> Option<&Name> {
-        self.event.reply.as_ref()
-    }
-
     /// Queues a follow-up, registered with the completion in one step. It
-    /// gets a fresh UUIDv7 if it has none and this event's correlation if it
-    /// has none. Returns its id.
+    /// gets a fresh UUIDv7 if it has none. Returns its id.
     pub fn emit(&self, mut event: Envelope) -> EventId {
         if event.id.is_nil() {
             event.id = EventId::new_v7();
-        }
-        if event.correlation.is_none() {
-            event.correlation = self.event.correlation;
         }
         let id = event.id;
         self.follow_ups.lock().push(event);
@@ -123,32 +109,14 @@ impl Context {
         self.emit(Envelope::dispatch(channel, event_type, payload))
     }
 
-    /// The request's result (2.8): a claimable follow-up on its reply
-    /// channel, with its correlation and the result keep (B10) as `expires`.
-    /// `None` when the event asked for no reply.
-    pub fn reply(&self, payload: impl Into<Bytes>) -> Option<EventId> {
-        let channel = self.event.reply.clone()?;
-        let mut result = Envelope::claimable(channel, self.event.event_type.clone(), payload).with_expires(self.result_keep);
-        result.correlation = Some(self.event.correlation.unwrap_or(self.event.id));
-        Some(self.emit(result))
-    }
-
     /// A dispatch event sent now, while running, on this run's work
     /// connection (2.2 "실행 중 방출"): it reaches the ledger before this
-    /// run's completion, so a requester sees it before the result.
+    /// run's completion, so whoever subscribes its channel sees it before any
+    /// follow-up of the completion (one connection keeps the order).
     pub async fn emit_now(&self, event: Envelope) -> Result<(), EmitError> {
         let (done, answer) = oneshot::channel();
         self.messages.send(Message::Emit { key: self.key.clone(), event, done }).await.map_err(|_| EmitError::Closed)?;
         answer.await.map_err(|_| EmitError::Closed)?
-    }
-
-    /// A stream fragment to the requester (2.8): a dispatch event on the
-    /// reply channel with the request's correlation, sent now.
-    pub async fn fragment(&self, payload: impl Into<Bytes>) -> Result<(), EmitError> {
-        let Some(channel) = self.event.reply.clone() else { return Ok(()) };
-        let mut fragment = Envelope::dispatch(channel, self.event.event_type.clone(), payload);
-        fragment.correlation = Some(self.event.correlation.unwrap_or(self.event.id));
-        self.emit_now(fragment).await
     }
 
     /// Registers `event` through the worker's producer (another lineage, not

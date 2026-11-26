@@ -22,11 +22,11 @@ fn a_retransmitted_sequence_is_dropped_and_a_gap_closes_the_connection() {
 #[test]
 fn committed_waits_for_the_disk_for_durable_work_and_not_for_volatile() {
     let mut h = H::durable(false).cast();
-    let volatile = h.produce(P, work("reply.x").with_id(id(1)));
+    let volatile = h.produce(P, work("scratch.x").with_id(id(1)));
     assert_eq!(committed(&volatile, P), [1], "a volatile registration commits when applied");
     let durable = h.produce(P, work("work").with_id(id(2)));
     assert!(committed(&durable, P).is_empty(), "a durable one waits for its batch");
-    let after = h.produce(P, work("reply.x").with_id(id(3)));
+    let after = h.produce(P, work("scratch.x").with_id(id(3)));
     assert!(committed(&after, P).is_empty(), "cumulative: a volatile one behind a durable one waits too");
     let landed = h.land();
     assert_eq!(committed(&landed, P), [3], "the landing confirms everything up to the last applied");

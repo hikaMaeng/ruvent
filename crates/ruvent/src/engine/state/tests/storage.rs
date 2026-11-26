@@ -72,7 +72,7 @@ fn a_fuzzy_checkpoint_misses_no_change_made_during_its_walk() {
     // Not seen yet (ids 7 and 8): claimed explicitly, deleted.
     h.call(W2, Call::Claim { req: 1, id: id(7), lease_ms: 30_000 });
     let seq = h.next_seq(P);
-    h.call(P, Call::Delete { seq, id: id(8), result: "out".into(), tag: id(99), key: None });
+    h.call(P, Call::Delete { seq, id: id(8), result: "out".into(), key: None });
     let mut more = 30;
     while let Some(part) = h.s.scan_slice() {
         parts_into(&mut items, part);
@@ -187,7 +187,7 @@ fn streamed_follow_ups_point_at_their_body_and_a_volatile_one_is_journaled_nowhe
     let mut h = H::durable(false).cast();
     h.join(W1, "work", 1);
     let parent = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
-    let follow_ups = vec![Envelope::claimable("next", "do", Bytes::new()).with_id(id(2)), Envelope::claimable("reply.r", "do", Bytes::new()).with_id(id(3))];
+    let follow_ups = vec![Envelope::claimable("next", "do", Bytes::new()).with_id(id(2)), Envelope::claimable("scratch.r", "do", Bytes::new()).with_id(id(3))];
     let seq = h.next_seq(W1);
     let effects = h.call(W1, Call::Complete { seq, id: parent.event.id, token: parent.token, follow_ups, spooled: vec![(0, durable_body.clone()), (1, volatile_body.clone())] });
     let registered: Vec<(String, Option<Location>)> =

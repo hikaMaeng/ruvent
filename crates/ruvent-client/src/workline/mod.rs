@@ -1,4 +1,4 @@
-//! One work connection as its owner (the worker or the requester actor) sees
+//! One work connection as its owner (the worker) sees
 //! it: the live link, the joins sent on it, and the unacknowledged buffer of
 //! its completions (2.3: a work connection numbers its completions under its
 //! own producer id).

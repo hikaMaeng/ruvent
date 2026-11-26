@@ -20,7 +20,7 @@ fn key(arrival: u64) -> WorkKey {
 }
 
 fn registration(arrival: u64, channel: &str) -> Record {
-    let mut event = Envelope::claimable(channel, "do", Bytes::from(vec![arrival as u8; 3 + arrival as usize])).with_id(EventId::new_v7()).with_reply("replies");
+    let mut event = Envelope::claimable(channel, "do", Bytes::from(vec![arrival as u8; 3 + arrival as usize])).with_id(EventId::new_v7()).with_delegate("user-1");
     event.key = Some(key(arrival));
     event.principal = Some("svc".into());
     Record::Register { event, root: Name::new(channel), at: None }
@@ -135,7 +135,8 @@ fn a_second_engine_cannot_open_a_log_in_use() {
 }
 
 /// A single-file journal (format 2 or older, or format 3's single file) and a
-/// segment of another format are refused and left as they were (B12).
+/// segment of another format — format 3's included — are refused and left as
+/// they were (B12).
 #[test]
 fn a_single_file_or_older_journal_is_refused_and_left_byte_for_byte() {
     let path = scratch();
@@ -149,12 +150,15 @@ fn a_single_file_or_older_journal_is_refused_and_left_byte_for_byte() {
     }
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir_all(&path).unwrap();
-    let mut foreign = b"rvseg\0\x02".to_vec();
-    foreign.extend_from_slice(&[1; 40]);
     let segment = path.join("0000000001.seg");
-    std::fs::write(&segment, &foreign).unwrap();
-    assert_eq!(SegmentLog::open(&path).err().map(|error| error.kind()), Some(io::ErrorKind::InvalidData));
-    assert_eq!(std::fs::read(&segment).unwrap(), foreign);
+    for version in [2u8, 3] {
+        let mut foreign = b"rvseg\0".to_vec();
+        foreign.push(version);
+        foreign.extend_from_slice(&[1; 40]);
+        std::fs::write(&segment, &foreign).unwrap();
+        assert_eq!(SegmentLog::open(&path).err().map(|error| error.kind()), Some(io::ErrorKind::InvalidData), "format {version}");
+        assert_eq!(std::fs::read(&segment).unwrap(), foreign);
+    }
 }
 
 #[test]

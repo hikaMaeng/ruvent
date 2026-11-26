@@ -20,7 +20,8 @@
 //! segment, so the writer never has to learn an old segment's dictionary.
 //!
 //! A path that is a file — the single-file container of format 3, or a format
-//! 2 or older journal — is refused and left as it was. Nothing is migrated (B12).
+//! 2 or older journal — is refused and left as it was, and so is a segment of
+//! format 3 (whose envelopes still carried `correlation`). Nothing is migrated (B12).
 
 use super::bodies::SegmentBodies;
 use super::checkpoint::CheckpointFile;
@@ -95,7 +96,7 @@ fn list(dir: &Path) -> io::Result<Vec<Found>> {
         match parse_segment_header(&head) {
             Some((lane, written, first)) if written == number => found.push(Found { number, lane, first, bytes }),
             None if (head.len() as u64) < SEGMENT_HEADER && magic_prefix(&head) => short.push((number, path)),
-            _ => return Err(invalid(format!("{}: not a ruvent segment of format 3 (format 2 and older are refused, not migrated); it was left untouched", path.display()))),
+            _ => return Err(invalid(format!("{}: not a ruvent segment of format 4 (format 3 and older are refused, not migrated); it was left untouched", path.display()))),
         }
     }
     let highest = found.iter().map(|segment| segment.number).max().unwrap_or(0);
@@ -207,7 +208,7 @@ impl Writer {
     }
 }
 
-/// The segment container of format 3.
+/// The segment container (format 4; format 3 had the same container, with `correlation` in the envelope).
 ///
 /// Three things keep one write from damaging another, and none is a clock:
 /// the lock file; the serial chain (every frame starts where the previous one

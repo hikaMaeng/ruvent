@@ -81,8 +81,6 @@ impl State {
             key,
             event_type: self.names.adopt(&event.event_type),
             root: self.names.adopt(root),
-            reply: event.reply.map(|name| self.names.adopt(&name)),
-            correlation: event.correlation,
             principal: event.principal.map(|name| self.names.adopt(&name)),
             delegate: event.delegate.map(|name| self.names.adopt(&name)),
             group: event.group,

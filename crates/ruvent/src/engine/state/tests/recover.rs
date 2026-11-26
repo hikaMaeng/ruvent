@@ -77,13 +77,13 @@ fn the_producer_table_survives_a_restart_and_resume_is_the_last_journaled_sequen
 #[test]
 fn volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says() {
     let mut h = H::durable(false).cast();
-    h.produce(P, work("reply.x").with_id(id(1)));
+    h.produce(P, work("scratch.x").with_id(id(1)));
     assert!(!h.records.iter().any(|record| matches!(record, Record::Register { .. })), "a volatile registration is not journaled");
     h.join(W1, "work", 2);
-    h.join(W2, "reply.y", 2);
+    h.join(W2, "scratch.y", 2);
     let parent = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
-    h.complete(W1, &parent, vec![work("reply.y").with_id(id(3))]);
-    let volatile_parent = assigned(&h.produce(P, work("reply.y").with_id(id(4))), W2).remove(0);
+    h.complete(W1, &parent, vec![work("scratch.y").with_id(id(3))]);
+    let volatile_parent = assigned(&h.produce(P, work("scratch.y").with_id(id(4))), W2).remove(0);
     h.complete(W2, &volatile_parent, vec![work("work").with_id(id(5))]);
     let after = restarted(h.records.clone(), 0);
     let held = |id| after.slot(id).is_some();
@@ -106,7 +106,7 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
         }
         if step % 5 == 0 {
             let seq = h.next_seq(P);
-            h.call(P, Call::Delete { seq, id: id(step / 2 + 1), result: "out".into(), tag: id(99), key: None });
+            h.call(P, Call::Delete { seq, id: id(step / 2 + 1), result: "out".into(), key: None });
         }
         if step % 7 == 0 {
             if let Some(token) = h.slot(id(step + 1)).and_then(|slot| slot.attempt()).map(|attempt| attempt.token) {

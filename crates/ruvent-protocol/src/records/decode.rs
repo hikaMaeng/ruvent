@@ -232,8 +232,7 @@ impl Decoder {
                 let seq = reader.varint()?;
                 let id = reader.id()?;
                 let result = name(reader, &self.dictionary)?;
-                let tag = reader.id()?;
-                Message::Call(Call::Delete { seq, id, result, tag, key: key(reader)? })
+                Message::Call(Call::Delete { seq, id, result, key: key(reader)? })
             }
             JOIN => {
                 let req = req(reader)?;

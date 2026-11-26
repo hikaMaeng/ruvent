@@ -78,13 +78,11 @@ pub struct WorkerConfig {
     pub unacked_bytes: u64,
     /// How long running handlers may finish after a shutdown began.
     pub shutdown_grace: Duration,
-    /// B10: how long a result ([`Context::reply`]) waits for its requester.
-    pub result_keep: Duration,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
-        WorkerConfig { credential: String::new(), reconnect: Reconnect::default(), unacked_bytes: 64 << 20, shutdown_grace: Duration::from_secs(30), result_keep: Duration::from_secs(60) }
+        WorkerConfig { credential: String::new(), reconnect: Reconnect::default(), unacked_bytes: 64 << 20, shutdown_grace: Duration::from_secs(30) }
     }
 }
 
@@ -486,7 +484,7 @@ impl Actor {
         let now = Instant::now();
         let left = Duration::from_millis(until);
         let key = RunKey { server, token };
-        let context = Context::new(event, token, key.clone(), self.messages.clone(), self.producer.clone(), self.config.result_keep);
+        let context = Context::new(event, token, key.clone(), self.messages.clone(), self.producer.clone());
         let abort = run::spawn(handler, context, service.run_limit, service.retry_delay, key.clone(), self.messages.clone());
         self.shared.counters.runs.fetch_add(1, Ordering::Relaxed);
         self.runs.insert(key, Running { service: index, id, lease, extend_at: extend::due(now, left, lease), lease_end: now + left, abort: AbortGuard(abort) });

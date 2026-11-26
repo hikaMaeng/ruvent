@@ -170,12 +170,11 @@ pub enum Call {
         seq: Option<u64>,
         event: Envelope,
     },
-    /// Production. The outcome is a dispatch event on `result` with correlation `tag`.
+    /// Production. The outcome is a dispatch event on `result` whose payload names the deleted id.
     Delete {
         seq: u64,
         id: EventId,
         result: Name,
-        tag: EventId,
         key: Option<WorkKey>,
     },
     /// Work. `types` empty means every type on the channel. With `dispatch`,

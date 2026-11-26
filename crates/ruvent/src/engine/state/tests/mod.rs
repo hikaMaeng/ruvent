@@ -42,8 +42,12 @@ pub struct H {
 
 /// A configuration with a memory limit far from every test's size, so no
 /// pause happens unless the test asks for one.
+/// The tests' engine: memory unbounded, and `scratch.*` a volatile channel
+/// family (no default rule makes any channel volatile).
 pub fn config() -> EngineConfig {
-    EngineConfig { memory: MemoryConfig { limit: Some(1 << 40), ..MemoryConfig::default() }, ..EngineConfig::default() }
+    let mut config = EngineConfig { memory: MemoryConfig { limit: Some(1 << 40), ..MemoryConfig::default() }, ..EngineConfig::default() };
+    config.channels.rules.insert(0, ChannelRule { pattern: Pattern("scratch.*".into()), settings: ChannelSettings { volatile: true, ..ChannelSettings::default() } });
+    config
 }
 
 pub fn strict() -> EngineConfig {

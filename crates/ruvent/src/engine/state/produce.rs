@@ -46,7 +46,7 @@ impl State {
         let mut event = event;
         event.channel = self.names.adopt(&event.channel);
         event.event_type = self.names.adopt(&event.event_type);
-        for name in [&mut event.reply, &mut event.delegate].into_iter().flatten() {
+        for name in [&mut event.delegate].into_iter().flatten() {
             *name = self.names.adopt(name);
         }
         event.principal = Some(credential.clone());
@@ -106,8 +106,6 @@ impl State {
             key,
             event_type: event.event_type,
             root: root.clone(),
-            reply: event.reply,
-            correlation: event.correlation,
             principal: event.principal,
             delegate: event.delegate,
             group: event.group,
@@ -171,7 +169,7 @@ impl State {
 
     /// `Delete`: a waiting (or delayed, or held) event goes; the outcome is a
     /// dispatch event on `result` either way.
-    pub(super) fn delete(&mut self, session: SessionId, credential: &Name, id: EventId, result: &Name, tag: EventId, key: Option<WorkKey>) {
+    pub(super) fn delete(&mut self, session: SessionId, credential: &Name, id: EventId, result: &Name, key: Option<WorkKey>) {
         let result = self.names.adopt(result);
         let found = self.slots.by_id(&id);
         let channel = found.and_then(|index| self.slots.get(index)).map(|slot| slot.channel.clone());
@@ -194,7 +192,7 @@ impl State {
             }
         }
         let event_type = self.names.intern(if failure.is_none() { DELETED } else { DELETE_FAILED });
-        let notice = Envelope { id: self.fresh_id(), principal: Some(credential.clone()), correlation: Some(tag), ..Envelope::dispatch(result, event_type, delete_payload(id, failure)) };
+        let notice = Envelope { id: self.fresh_id(), principal: Some(credential.clone()), ..Envelope::dispatch(result, event_type, delete_payload(id, failure)) };
         self.deliver(notice, gate);
     }
 }

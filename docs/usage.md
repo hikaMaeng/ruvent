@@ -45,7 +45,7 @@ cargo run --release -p ruvent-server -- crates/ruvent-server/server.example.json
   "journal": "data/journal",
   "durability": "strict",
   "credentials": [
-    { "name": "workers", "token": "…", "methods": ["register_claimable", "register_dispatch", "claim", "complete"], "channels": ["orders.*", "reply.*"] },
+    { "name": "workers", "token": "…", "methods": ["register_claimable", "register_dispatch", "claim", "complete"], "channels": ["orders.*", "answer.*"] },
     { "name": "ops", "token": "…", "methods": ["operate"] }
   ],
   "memory": { "limit": 8589934592 },
@@ -77,7 +77,7 @@ Ctrl-C로 정상 종료한다: drain(생산 연결에 최종 확인과 `Bye{drai
 use ruvent::Envelope;
 use ruvent_client::link::Tcp;
 use ruvent_client::producer::{Producer, ProducerConfig};
-use ruvent_client::requester::{Part, Requester, RequesterConfig};
+use ruvent_client::observer::{Observed, Observer, ObserverConfig};
 use ruvent_client::servers::Servers;
 use std::sync::Arc;
 
@@ -89,28 +89,26 @@ let producer = Producer::start(tcp.clone(), &servers, ProducerConfig::default())
 producer.send(Envelope::claimable("orders", "create", payload)).await?;
 producer.flush().await?;                      // 지금까지 보낸 것이 모두 커밋될 때까지
 
-// 요청자: 인스턴스마다 응답 채널 `reply.<id>` 하나. 결과는 착수용 이벤트라 재접속·재기동에도 잃지 않는다.
-let requester = Requester::start(tcp.clone(), &servers, RequesterConfig::default());
-let response = requester.request(Envelope::claimable("orders", "price", body)).await?;
-// response.fragments(스트림 조각) → response.result 순서. response.fragments_lost: 그사이 연결이 바뀌었다
-
-// 요청자는 기한을 두지 않는다. 무엇을 잴지는 호출자가 정한다. 예: 조각 사이 유휴 30초
-let mut stream = requester.stream(Envelope::claimable("chat", "complete", body).with_expires(Duration::from_secs(60))).await?;
-while let Ok(next) = tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
-    match next? {
-        Some(Part::Fragment(piece)) => { /* 클라이언트로. 느리면 stream.backlog()를 보고 호출자가 끊는다 */ }
-        Some(Part::Result(result)) => { /* 끝 */ }
-        None => break,
-    }
+// 요청–응답: SDK 헬퍼가 없다. 요청마다 응답 채널 하나를 구독하고, 그 이름을 payload에 넣어 등록한다.
+// 서버가 채널로 나누므로 받는 쪽은 분배하지 않는다. 기한·재전송·끝 조건은 묻는 쪽이 정한다.
+let (observer, mut inbox) = Observer::start(tcp.clone(), &servers, ObserverConfig::default());
+let answer = format!("answer.{}", ruvent::EventId::new_v7());
+observer.subscribe(ruvent::Target::Channel(answer.as_str().into())).await?;
+producer.send(Envelope::claimable("chat", "complete", my_payload(&answer, body))).await?;
+while let Ok(Some(Observed::Delivery { event, .. })) = tokio::time::timeout(Duration::from_secs(30), inbox.recv()).await {
+    // 이 채널로 오는 것은 모두 이 요청의 것. 끝 조건(예: 타입 "end")을 보고 구독을 푼다.
 }
-// 같은 id 재전송: stream.resend().await? (서버에 원본이 살아 있으면 삼킨다)
+observer.unsubscribe(ruvent::Target::Channel(answer.as_str().into())).await?;
 ```
 
-워커 핸들러에서 결과는 `cx.reply(payload)`(응답 채널의 후속, `expires` 60초), 조각은 `cx.fragment(payload).await`
-(작업 연결로 바로 방출)로 낸다. 관찰자(`observer::Observer`)는 구독을 연결마다 다시 내고 발송 엔벨롭을 그대로
+요청이 많은 프록시는 관찰자 대신 `ruvent-proxy`의 팬아웃을 쓴다. 요청 하나가 구성원 하나다(아래 "프록시").
+
+워커 핸들러는 요청의 payload에서 응답 채널을 읽고, 조각은 `cx.emit_now(Envelope::dispatch(채널, 타입, 조각)).await`
+(작업 연결로 바로 방출), 결과는 `cx.emit_dispatch(채널, 타입, 결과)`(완료와 한 스텝)로 낸다. 한 작업 연결이 순서를 지킨다.
+결과도 발송이라 그 순간 구독자가 없으면 사라진다. 결과를 지킬지는 워커와 프로젝트가 정한다(계획 2.8). 관찰자(`observer::Observer`)는 구독을 연결마다 다시 내고 발송 엔벨롭을 그대로
 넘긴다. 끊긴 동안의 발송은 `Observed::Gap`으로 알린다. 서버의 구독 확인은 `Observed::Subscribed { server, target, ticket }`로
 스트림에 들어온다. ticket은 관찰자가 처리한 `subscribe` 호출의 순번이고, k번째 호출은 그 서버에서 ticket ≥ k인 첫 확인부터
-효력이 있다(그 뒤의 발송은 구독이 선 뒤에 보내진 것). 요청자의 응답 채널 참여 변화는 `Requester::watch_joined()`로 기다린다.
+효력이 있다(그 뒤의 발송은 구독이 선 뒤에 보내진 것).
 
 | `Bye` 사유 | SDK |
 | --- | --- |
@@ -125,7 +123,8 @@ while let Ok(next) = tokio::time::timeout(Duration::from_secs(30), stream.next()
 
 프록시는 프로젝트가 만든다. `ruvent-proxy`는 골조만 준다. 서버별 상향 관찰 연결과, 대상마다 상위 구독 하나를
 구성원에게 나누는 팬아웃이다. 클라이언트 쪽 프로토콜(WebSocket, HTTP, WebRTC 등), 인증, 구독 권한 검사, 등록,
-요청–응답, 기한, 역압, `/health`는 프로젝트가 만든다. 등록과 요청–응답은 SDK의 생산자·요청자를 자기 설정으로 쓴다.
+요청–응답, 기한, 역압, `/health`는 프로젝트가 만든다. 등록은 SDK의 생산자를 자기 설정으로 쓰고, 요청–응답은 요청마다
+구성원 하나가 그 요청의 응답 채널을 구독하는 것으로 한다.
 
 ```rust,ignore
 use ruvent_proxy::{Fanout, FanoutConfig, Target, Upstream};

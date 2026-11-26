@@ -73,8 +73,7 @@ fn id(byte: u8) -> EventId {
 }
 
 fn assigned(byte: u8, payload: &'static [u8]) -> Envelope {
-    let mut event =
-        Envelope::claimable("orders", "create", Bytes::from_static(payload)).with_id(id(byte)).with_reply("reply.r").with_correlation(id(7)).with_not_before(std::time::Duration::from_millis(9));
+    let mut event = Envelope::claimable("orders", "create", Bytes::from_static(payload)).with_id(id(byte)).with_delegate("user-r").with_not_before(std::time::Duration::from_millis(9));
     event.key = Some(WorkKey { generation: 2, arrival: 300 });
     event.failures = 3;
     event.principal = Some("svc".into());
@@ -89,8 +88,8 @@ fn every_call() -> Vec<Call> {
             event: Envelope::claimable("orders", "create", Bytes::from_static(b"payload")).with_id(id(1)).with_expires(std::time::Duration::from_secs(5)).with_group([5; 16]),
         },
         Call::Register { seq: None, event: Envelope::dispatch("feed", "chunk", Bytes::from(vec![7u8; 5000])) },
-        Call::Delete { seq: 2, id: id(1), result: "results".into(), tag: id(2), key: Some(WorkKey { generation: 1, arrival: 9 }) },
-        Call::Delete { seq: 3, id: id(1), result: "results".into(), tag: id(2), key: None },
+        Call::Delete { seq: 2, id: id(1), result: "results".into(), key: Some(WorkKey { generation: 1, arrival: 9 }) },
+        Call::Delete { seq: 3, id: id(1), result: "results".into(), key: None },
         Call::Join { req: 1, channel: "orders".into(), types: vec!["create".into(), "cancel".into()], lease_ms: 30_000, dispatch: true },
         Call::Window { channel: "orders".into(), count: 16, bytes: 1 << 20 },
         Call::Complete {
@@ -235,11 +234,11 @@ fn an_assignment_carries_the_lease_left_at_the_moment_it_is_written() {
 }
 
 fn arbitrary_event() -> impl Strategy<Value = Envelope> {
-    ("[a-d]{1,3}", "[a-d]{1,2}", proptest::collection::vec(any::<u8>(), 0..600), any::<bool>(), any::<[u8; 16]>(), any::<bool>()).prop_map(|(channel, kind, payload, dispatch, raw, reply)| {
+    ("[a-d]{1,3}", "[a-d]{1,2}", proptest::collection::vec(any::<u8>(), 0..600), any::<bool>(), any::<[u8; 16]>(), any::<bool>()).prop_map(|(channel, kind, payload, dispatch, raw, delegate)| {
         let mut event = if dispatch { Envelope::dispatch(channel.as_str(), kind.as_str(), payload) } else { Envelope::claimable(channel.as_str(), kind.as_str(), payload) };
         event.id = EventId(raw);
-        if reply {
-            event = event.with_reply(format!("reply.{kind}"));
+        if delegate {
+            event = event.with_delegate(format!("user.{kind}"));
         }
         event
     })

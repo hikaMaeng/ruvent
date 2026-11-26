@@ -53,8 +53,8 @@ pub trait Methods: Send + Sync + 'static {
     /// Work: emits a dispatch event (sequence number 0). Returns the sequence
     /// number and the id.
     async fn register(&self, event: Envelope) -> Result<(u64, EventId), Refusal>;
-    /// Production: deletes a waiting event. The outcome is a dispatch event on `result` with correlation `tag`.
-    async fn delete(&self, id: EventId, result: Name, tag: EventId, key: Option<WorkKey>) -> Result<u64, Refusal>;
+    /// Production: deletes a waiting event. The outcome is a dispatch event on `result` whose payload names the deleted id.
+    async fn delete(&self, id: EventId, result: Name, key: Option<WorkKey>) -> Result<u64, Refusal>;
     /// Waits until the cumulative `Committed` reaches `seq`.
     async fn committed(&self, seq: u64) -> Result<(), Refusal>;
     /// Work: joins a channel for `types` (empty: all) with this lease length.
@@ -323,8 +323,8 @@ impl Methods for Client {
         Ok((seq, id))
     }
 
-    async fn delete(&self, id: EventId, result: Name, tag: EventId, key: Option<WorkKey>) -> Result<u64, Refusal> {
-        self.numbered(|seq| Call::Delete { seq, id, result, tag, key }).await
+    async fn delete(&self, id: EventId, result: Name, key: Option<WorkKey>) -> Result<u64, Refusal> {
+        self.numbered(|seq| Call::Delete { seq, id, result, key }).await
     }
 
     async fn committed(&self, seq: u64) -> Result<(), Refusal> {

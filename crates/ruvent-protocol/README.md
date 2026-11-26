@@ -1,6 +1,6 @@
 # ruvent-protocol
 
-이벤트 서버와 접속자 사이의 이진 와이어 형식, wire v2(계획 2.2, 2.11)다. 서버([`ruvent-server`](../ruvent-server/README.md))와
+이벤트 서버와 접속자 사이의 이진 와이어 형식, wire v3(계획 2.2, 2.11)다. v2와는 엔벨롭에 `reply`·`correlation`이 없고 `Delete`에 `tag`가 없는 것만 다르며, v2 상대는 `Hello`에서 거절한다. 서버([`ruvent-server`](../ruvent-server/README.md))와
 원격 연결([`ruvent-client`](../ruvent-client/README.md)의 `remote`)이 함께 쓴다. 이벤트의 머리는
 `ruvent::envelope::codec`의 레이아웃에서 본문 블록을 뺀 것이다(`encode_head`).
 

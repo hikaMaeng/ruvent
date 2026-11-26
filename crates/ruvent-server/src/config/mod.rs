@@ -150,7 +150,7 @@ pub struct ChannelsJson {
     #[serde(default)]
     pub default: ChannelJson,
     /// Rules by pattern; the first match decides. Checked before the built-in
-    /// rules (`reply.*` volatile and never isolated, `isolated.*` never isolated).
+    /// rule (`isolated.*` never isolated).
     #[serde(default)]
     pub rules: Vec<ChannelRuleJson>,
 }

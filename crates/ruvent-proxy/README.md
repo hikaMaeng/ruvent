@@ -7,7 +7,7 @@
 
 ## 범위
 
-이벤트 서버는 프로토콜 하나만 말한다. TCP 위의 ruvent wire(v2)다. 프록시와 워커 서버는 SDK(`ruvent-client`)로 그 프로토콜만 써서 붙는다. 클라이언트는 이벤트 서버에 직접 붙지 않는다.
+이벤트 서버는 프로토콜 하나만 말한다. TCP 위의 ruvent wire(v3)다. 프록시와 워커 서버는 SDK(`ruvent-client`)로 그 프로토콜만 써서 붙는다. 클라이언트는 이벤트 서버에 직접 붙지 않는다.
 
 그 밖은 전부 프록시 프로그램의 것이다. 이 크레이트는 어느 것도 정하지 않는다.
 
@@ -16,8 +16,8 @@
 | 클라이언트 쪽 프로토콜(WebSocket, HTTP, WebRTC, …) | 프로그램 자신의 서버 |
 | 클라이언트가 누구이고 무엇을 구독·등록할 수 있는지 | 프로그램의 검사 → [`Member::subscribe`] |
 | 등록 | 프로그램 자신의 `ruvent_client::producer::Producer` |
-| 요청–응답, 기한, 재전송 | 프로그램 자신의 `ruvent_client::requester::Requester`. 요청자는 기한을 두지 않는다. 무엇을 잴지는 호출자가 정한다 |
-| 느린 클라이언트에 대한 역압 | 프로그램. 요청자는 조각을 버리지 않고 `Stream::backlog`로 밀린 수를 보여 준다 |
+| 요청–응답 | 요청 하나가 구성원 하나다. 요청마다 응답 채널(이름은 프로그램이 정한다, 예: UUID)을 [`Member::subscribe`]로 구독하고, 그 채널 이름을 payload에 넣어 프로그램 자신의 `Producer`로 등록하고, 오는 것을 클라이언트에 쓴다. 끝 조건(종결 이벤트, 시간)을 보고 구성원을 버리면 구독이 풀린다. 기한·재전송도 프로그램이 정한다 |
+| 느린 클라이언트에 대한 역압 | 골조는 `member_buffer`까지 찬 구성원을 떼어 낸다(스트림이 끝난다). 그것을 클라이언트에게 어떻게 알릴지는 프로그램이 정한다 |
 | 준비 상태를 어떻게 내보일지(`/health`, 지표) | 프로그램. 이 크레이트는 [`Health`] 값만 준다 |
 
 ## 사용
@@ -80,7 +80,7 @@ while let Some(event) = events.recv().await {
 | --- | --- |
 | `src/**/tests.rs` | 구독 장부, 준비 상태 계산 |
 | `tests/fanout.rs` | 같은 프로세스의 엔진(SDK `Local`): 집약, 효력 시점, 재접속과 재구독, 목록에 더한 서버, 느린 구성원, 원 엔벨롭 공유, 정지와 상향 해제 |
-| `tests/acceptance.rs` | 실제 `ruvent-server`에 TCP로 붙인 인수: 효력 시점 불변식, 접두사 구독, 서버 2대, 상향 상실과 준비 상태 |
+| `tests/acceptance.rs` | 실제 `ruvent-server`에 TCP로 붙인 인수: 효력 시점 불변식, 접두사 구독, 서버 2대, 상향 상실과 준비 상태, 요청별 응답 채널(실제 워커, 요청 2건 동시) |
 
 [`Member::subscribe`]: src/fanout/mod.rs
 [`Health`]: src/health/mod.rs

@@ -7,7 +7,7 @@
 | --- | --- |
 | `names` | 공유 이름 핸들 `Name`, 서버 사전 `Names`(쓸어내기로 크기 상한), 채널 패턴 `Pattern` |
 | `envelope` | 단일 엔벨롭 `Envelope`(u16 flags, `not_before`·`expires`·`group`, 실패 횟수)과 `EventId`·`WorkKey`(u64 도착 순번)·`ClaimToken`(u64)·`Digest`. `envelope::codec`이 바이트 배치, 가변 길이 정수, 레코드 종류별 규칙(`Layout`)을 정한다 |
-| `journal` | 형식 3 레코드 집합 `Record`, 쓰기 묶음 `Batch`(누적 가동 시각·커밋 번호·레코드 일련번호), `Journal` 계약과 곁의 부품(`Checkpoints`, `Chores`, `Bodies`, `Spool`), 세그먼트 컨테이너 `SegmentLog`(단일 파일과 형식 2 이하는 거부), 스트리밍 복구 `Recovered`/`Source`/`Replay`, `Volatile` |
+| `journal` | 형식 4 레코드 집합 `Record`, 쓰기 묶음 `Batch`(누적 가동 시각·커밋 번호·레코드 일련번호), `Journal` 계약과 곁의 부품(`Checkpoints`, `Chores`, `Bodies`, `Spool`), 세그먼트 컨테이너 `SegmentLog`(단일 파일과 형식 2 이하는 거부), 스트리밍 복구 `Recovered`/`Source`/`Replay`, `Volatile` |
 | `snapshot` | 운영 스냅샷 수집기와 파일 형식(`snapshot::read`) |
 | `engine` | 단일 작성자 엔진 태스크(`Engine`), 장부(`engine::state`), 설정(`EngineConfig`과 8장 값), 연산 값(`Call`, `Outbound`, `Hello`, `Assignment`, `Stats`, 코드 표 `ByeReason`·`FaultKind`·`Refusal`) |
 | `methods` | 연산 계약 `Methods`, 그 유일한 구현 `Client`, 응답 분배 `Demux`, 인프로세스 연결 `connect` |
@@ -44,7 +44,7 @@ if let Some(Incoming::Assign(assignment)) = inbox.recv().await {
 
 세그먼트 로그: `let (journal, recovered) = SegmentLog::open_with(dir, config.storage.segment_bytes)?; Engine::start(config, journal, recovered).await?`.
 복구는 체크포인트와 꼬리를 디스크에서 흘려 읽고(본문은 읽지 않는다), 새 세대가 디스크에 기록된 뒤에 `start`가 돌아온다.
-정상 종료(`shutdown`)는 멈춘 장부의 체크포인트를 마지막으로 쓴다. 저장의 구조는 [docs/architecture.md](../../docs/architecture.md)의 "저널 형식 3".
+정상 종료(`shutdown`)는 멈춘 장부의 체크포인트를 마지막으로 쓴다. 저장의 구조는 [docs/architecture.md](../../docs/architecture.md)의 "저널 형식 4".
 
 ## 설정 (`EngineConfig`, 계획 8장)
 
@@ -58,7 +58,7 @@ if let Some(Incoming::Assign(assignment)) = inbox.recv().await {
 | `memory` | 물리 메모리 50% · 예약 10% · 고수위 80% · 해제 7/8 · 조기 정지 1/8 · 순증 256 · 메타 180 B · 깊이 목표 1억 | S5·S19·S22 |
 | `pause_allowance` | 1 MiB | S14 |
 | `stats_top` | 16 | B24 |
-| `channels` | `isolate_after` 5, 격리 보존 7일, `serialize_group` 꺼짐, `reply.*` 휘발·격리 없음, `isolated.*` 격리 없음 | B6·B9·B17·B26·휘발 채널. 패턴별로 덮는다 |
+| `channels` | `isolate_after` 5, 격리 보존 7일, `serialize_group` 꺼짐, `isolated.*` 격리 없음(기본 휘발 채널 없음) | B6·B9·B17·B26·휘발 채널. 패턴별로 덮는다 |
 | `storage` | 세그먼트 64 MiB · 이주 10% · 조각 4,096 · 꼬리 8배 · 꼬리 상한 8 GiB · 디스크 예약 4세그먼트/10% · 용량 없음 · 미리 읽기 16 · 동시 읽기 64 · 조각 대기 2 | S3·S4·S6·S17. `disk_capacity`를 주어야 디스크 예산·고수위·이주 계기가 선다 |
 | `batch_max`, `inbox`, `outbound`, `backlog_page` | 2048, 65,536, 65,536, 1024 | 엔진 묶음, 연산함, 연결 송신 버퍼(개수), backlog 한 쪽 |
 | `grants` | `None`(모두 허용) | 서비스 자격별 메서드(`Operate` 포함)·채널·위임 권한 |

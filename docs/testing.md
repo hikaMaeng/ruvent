@@ -11,7 +11,7 @@ cargo xtask mutants           # 코어 핵심 파일의 변이 테스트 (cargo-
 cargo run --release -p ruvent --example bench   # 측정
 ```
 
-마지막 실행 기록: [reports/test-2026-11-26-skeleton.txt](reports/test-2026-11-26-skeleton.txt) (v4.7: 프록시 골조, 요청자 정책 제거, `draining` 상한 제거 뒤).
+마지막 실행 기록: [reports/test-2026-11-26-answer-channels.txt](reports/test-2026-11-26-answer-channels.txt) (v4.8: 요청별 응답 채널, 요청자 제거, 엔벨롭에서 `reply`·`correlation` 제거, wire v3·저널 형식 4. 관문 11개 ok, 257 통과·0 실패). 그 전: [reports/test-2026-11-26-skeleton.txt](reports/test-2026-11-26-skeleton.txt) (v4.7).
 그 전: [reports/test-2026-11-25-overhaul.txt](reports/test-2026-11-25-overhaul.txt) (개편 계획 v4.6 구현 뒤),
 [reports/test-2026-11-23-proxy-review.txt](reports/test-2026-11-23-proxy-review.txt) (프록시 리뷰 지적 반영과 구조 분리 뒤).
 그 전 기록: [reports/test-2026-11-23-proxy.txt](reports/test-2026-11-23-proxy.txt) (프록시를 라이브러리 하나로 합친 뒤),
@@ -31,7 +31,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | acceptance | `-p ruvent --test acceptance` | 사용자 원문 인수 |
 | protocol | `-p ruvent-protocol` | 와이어 형식 |
 | server | `-p ruvent-server` | 실제 TCP 서버 |
-| client SDK | `-p ruvent-client` | 서버 목록, 재접속, 생산자, 워커 창 규칙, 요청자 |
+| client SDK | `-p ruvent-client` | 서버 목록, 재접속, 생산자, 워커 창 규칙 |
 | proxy | `-p ruvent-proxy` | 프록시 골조: 구독 장부와 health 단위, 팬아웃(SDK `Local`), 실제 이벤트 서버(서버 2대, 상향 상실, 접두사)에 붙인 인수 |
 
 ## 수준
@@ -51,7 +51,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 결정 | 테스트 |
 | --- | --- |
 | 코어 모듈은 아래로만 의존한다(`names` ← `envelope` ← `journal`·`snapshot` ← `engine` ← `methods`). 로그(`journal`)와 엔진(`engine`)의 하위 모듈은 하위 계층 표가 정한 것만 부른다 | `modules_depend_only_downward`, `every_module_is_in_the_layer_table_and_no_layer_is_stale`, `the_parts_of_the_log_and_the_engine_name_only_the_parts_they_may` |
-| 어느 라이브러리도 폴링하지 않고, 타이머는 선언된 곳뿐이다(스냅샷 단위 나이, 엔진의 기한 휠, 핸드셰이크 기한, 닫기 기한, SDK의 재접속 백오프·자동 연장·종료 유예·실행 한도. 요청자와 프록시 골조는 타이머가 없다) | `nothing_polls_and_every_timer_is_declared` |
+| 어느 라이브러리도 폴링하지 않고, 타이머는 선언된 곳뿐이다(스냅샷 단위 나이, 엔진의 기한 휠, 핸드셰이크 기한, 닫기 기한, SDK의 재접속 백오프·자동 연장·종료 유예·실행 한도. 프록시 골조는 타이머가 없다) | `nothing_polls_and_every_timer_is_declared` |
 | 영속 로그는 기록 태스크 한 곳에서만, 한 번에 한 비행만 쓴다. 체크포인트 작성기와 잡일(이주·삭제)도 각각 한 곳이다 | `the_journal_is_written_from_one_place` |
 | 엔진 상태의 소유자는 엔진 태스크 하나다 | `the_engine_state_has_one_owner` |
 | 라이브러리에 `unsafe`·터미널 출력·`todo!`가 없다 | `no_library_has_unsafe_or_writes_to_the_terminal` |
@@ -81,7 +81,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | lease는 배정 시점부터, 회수 때 창을 닫는다, 회수 전 완료는 수락(2.4) | `a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window`, `a_late_completion_before_the_reclaim_is_accepted_and_after_it_is_dropped` |
 | 연결이 닫히면: 못 쓴 배정은 즉시 대기로, 다 쓴 배정은 재접속 유예로(2.4, S20, M8-2) | `a_closed_connection_returns_unwritten_assignments_at_once_and_pulls_written_ones_to_the_grace`, `a_closing_connection_gives_back_unwritten_assignments_at_once` |
 | `Extend`는 참여를 옮긴다, 재기동은 착수를 그대로 둔다(2.4, M8-6) | `extend_moves_the_attempt_to_the_extending_connections_join`, `a_restart_restores_claims_with_token_lease_and_credential_and_counts_no_failure`, `a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_workers_completion` |
-| `Release{지연, 실패}`와 격리(이벤트 탓만 센다, 응답 채널 제외)(2.4, B6, M8-12) | `release_keeps_or_raises_the_failure_count_and_a_delay_hides_the_event`, `the_fifth_counted_failure_isolates_and_releases_without_failure_never_do`, `reply_channels_are_never_isolated` |
+| `Release{지연, 실패}`와 격리(이벤트 탓만 센다)(2.4, B6, M8-12) | `release_keeps_or_raises_the_failure_count_and_a_delay_hides_the_event`, `the_fifth_counted_failure_isolates_and_releases_without_failure_never_do` |
 | `not_before`·`expires`(깨우지 않는 수거, 재기동 뒤 남은 시간)(2.4, B9, M8-11) | `not_before_hides_an_event_until_its_time_and_the_wheel_wakes_for_it`, `an_expired_event_is_never_assigned_and_is_purged_without_any_consumer`, `an_expired_event_is_isolated_instead_where_the_channel_says_so`, `a_restart_keeps_the_remaining_time_of_not_before_and_expires` |
 | `serialize_group`(B26) | `serialize_group_assigns_one_event_of_a_group_at_a_time` |
 | 명시 착수 | `an_explicit_claim_takes_a_waiting_event_and_refuses_claimed_delayed_or_missing_ones`, `a_claim_carries_the_attempt_and_the_time_out_the_worker_chose_and_completion_removes_it` |
@@ -90,7 +90,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 메모리 회계, 고수위, 뿌리 채널 정지와 해제, 통보와 읽기 정지, 조기 정지, `max_backlog`, 순증 줄, 상한(2.6) | `the_biggest_root_is_paused_at_the_high_watermark_and_resumed_below_seven_eighths`, `a_paused_root_tells_its_producers_once_and_stops_reading_past_the_allowance`, `a_paused_root_is_not_assigned_from_net_growth_lanes_and_chain_ends_still_are`, `a_root_that_never_drained_is_paused_at_an_eighth_of_the_budget`, `max_backlog_pauses_a_root_regardless_of_the_watermark`, `follow_ups_and_isolated_events_count_to_the_root_channel`, `past_the_limit_net_growth_lanes_are_not_assigned`, `a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_channel_to_hold` |
 | 발송은 등록 순간의 구독자에게, 접두사는 `.` 경계, 발송 포함 참여(2.4, 2.8, 4장) | `dispatch_reaches_exactly_the_subscribers_at_the_moment_it_is_registered`, `a_prefix_subscription_matches_at_dot_boundaries_unlike_a_grant_pattern`, `a_dispatch_join_receives_the_channels_dispatch_events`, `subscriptions_take_effect_in_processing_order_within_a_batch`, `a_dispatch_event_goes_to_whoever_is_connected_at_that_moment_and_is_gone` |
 | 한 접속이 멈춰도 다른 접속은 진행 | `a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on`, `a_slow_member_is_detached_and_nobody_else_is` |
-| 프록시 골조: 모든 서버에 서버별 상향, 조용히 끊긴 상향은 준비 상태에 정상으로 남지 않음, 구성원 구독의 효력 시점, 접두사 구독(4장, M8-8 준비 상태) | `a_fanout_on_two_servers_hands_members_what_either_dispatches`, `an_upstream_that_goes_away_shows_in_health`, `the_subscription_rule_holds_through_a_real_event_server`, `a_prefix_subscription_takes_every_channel_below_it_through_a_real_event_server` |
+| 프록시 골조: 모든 서버에 서버별 상향, 조용히 끊긴 상향은 준비 상태에 정상으로 남지 않음, 구성원 구독의 효력 시점, 접두사 구독(4장, M8-8 준비 상태) | `a_fanout_on_two_servers_hands_members_what_either_dispatches`, `an_upstream_that_goes_away_shows_in_health`, `the_subscription_rule_holds_through_a_real_event_server`, `a_prefix_subscription_takes_every_channel_below_it_through_a_real_event_server`, `each_request_is_answered_on_its_own_channel_in_order` |
 | 삭제는 대기 중일 때만, 결과 통지는 정확히 한 건 | `deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_with_one_notice`, `deletion_removes_only_a_waiting_event_and_always_announces_its_outcome` |
 | `Stats` 상위 K, `Drain`(2.8, B24, M8-5) | `stats_report_totals_top_channels_idle_lanes_and_roots`, `drain_sends_new_producers_away_and_closes_open_ones_after_a_final_committed`, `drain_gives_every_producer_a_final_committed_before_bye` |
 | 재기동·저널: 휘발 채널 결과표, 체크포인트 재생 동치, 정상 종료 체크포인트(꼬리 없음), 누적 가동 시각 | `volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says`, `a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced`, `a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clock_carries_on`, `unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash`, `a_failed_write_stops_the_engine_and_releases_nothing_it_carried` |
@@ -111,7 +111,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 레코드 종류별 규칙 | `layouts_refuse_what_they_must_not_carry`, `timing_and_group_are_claimable_only`, `the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers`, `every_envelope_round_trips_through_every_layout_that_accepts_it`, `arbitrary_bytes_never_panic_the_decoder` |
 | 실패 횟수 포화, id | `failures_saturate_at_65535`, `ids_are_uuids_and_nil_means_unassigned` |
 | 이름표 | `equal_texts_share_one_handle`, `one_off_names_do_not_grow_the_dictionary_without_bound`, `a_name_held_elsewhere_survives_a_sweep` |
-| 저널 형식 3(레코드 집합, 세그먼트 컨테이너, 체크포인트 파일, 스트리밍 복구) | `every_record_kind_survives_a_reopen_and_payloads_stay_on_disk`, `a_claim_removed_in_the_same_frame_is_not_written_and_keeps_its_serial`, `a_second_engine_cannot_open_a_log_in_use`, `a_single_file_or_older_journal_is_refused_and_left_byte_for_byte`, `a_torn_last_frame_is_cut_and_everything_before_it_recovered`, `damage_in_the_middle_of_the_log_stops_recovery_instead_of_cutting_it`, `a_completion_frame_cut_at_any_byte_recovers_all_or_nothing`, `segments_roll_at_their_size_and_each_defines_its_own_names`, `recovery_reads_the_checkpoint_and_the_tail_from_its_start`, `an_unfinished_checkpoint_is_ignored_and_the_previous_one_read`, `a_damaged_checkpoint_stops_recovery` |
+| 저널 형식 4(레코드 집합, 세그먼트 컨테이너, 체크포인트 파일, 스트리밍 복구) | `every_record_kind_survives_a_reopen_and_payloads_stay_on_disk`, `a_claim_removed_in_the_same_frame_is_not_written_and_keeps_its_serial`, `a_second_engine_cannot_open_a_log_in_use`, `a_single_file_or_older_journal_is_refused_and_left_byte_for_byte`, `a_torn_last_frame_is_cut_and_everything_before_it_recovered`, `damage_in_the_middle_of_the_log_stops_recovery_instead_of_cutting_it`, `a_completion_frame_cut_at_any_byte_recovers_all_or_nothing`, `segments_roll_at_their_size_and_each_defines_its_own_names`, `recovery_reads_the_checkpoint_and_the_tail_from_its_start`, `an_unfinished_checkpoint_is_ignored_and_the_previous_one_read`, `a_damaged_checkpoint_stops_recovery` |
 | 운영 스냅샷 | `a_snapshot_file_holds_both_kinds_and_reads_back`, `the_configuration_picks_channels_and_types`, `chosen_channels_are_collected_into_snapshot_files` |
 | 구독·대기분 | `the_backlog_comes_in_pages_in_work_key_order`, `the_subscription_marker_precedes_the_answer` |
 | 엔진 태스크 | `the_operations_work_through_the_in_process_client`, `after_shutdown_calls_fail_as_closed` |
@@ -139,7 +139,7 @@ cargo run --release -p ruvent --example bench   # 측정
 
 ## 프로토콜 (`crates/ruvent-protocol/src/tests.rs`)
 
-wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프레임 없음.
+wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프레임 없음.
 
 | 영역 | 테스트 |
 | --- | --- |
@@ -156,7 +156,7 @@ wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 
 ## 서버 (`crates/ruvent-server/`)
 
-`tests/remote.rs`는 실제 TCP다. 클라이언트가 보내지 않을 것(재전송, 빈자리, 읽지 않는 소켓, v1)은 원시 wire v2 연결로 보낸다.
+`tests/remote.rs`는 실제 TCP다. 클라이언트가 보내지 않을 것(재전송, 빈자리, 읽지 않는 소켓, v1)은 원시 wire v3 연결로 보낸다.
 
 | 영역 | 테스트 |
 | --- | --- |
@@ -182,8 +182,8 @@ wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 
 ## 클라이언트 SDK (`crates/ruvent-client/`)
 
-단위(`src/**/tests.rs`, `src/**` 안의 `mod tests`: 순수 상태, 네트워크 없음) → 통합(`tests/producer.rs`·`tests/worker.rs`·
-`tests/requester.rs`: 프로세스 안 엔진(`link::Local`)과 실제 `ruvent-server`(TCP), 연결을 끊는 TCP 중계기) 순이다.
+단위(`src/**/tests.rs`, `src/**` 안의 `mod tests`: 순수 상태, 네트워크 없음) → 통합(`tests/producer.rs`·`tests/worker.rs`:
+프로세스 안 엔진(`link::Local`)과 실제 `ruvent-server`(TCP), 연결을 끊는 TCP 중계기) 순이다.
 
 ### 단위
 
@@ -223,16 +223,6 @@ wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 종료 절차: 창 0 → 유예 → 반환(실패 아님) | `shutdown_closes_the_windows_and_gives_back_what_outlives_the_grace` |
 | 실행 중 방출은 완료보다 먼저(2.2) | `a_dispatch_emitted_while_running_comes_before_the_completions_follow_up` |
 
-### 요청자 (`tests/requester.rs`)
-
-| 영역 | 테스트 |
-| --- | --- |
-| 조각 → 결과 순서(2.8, TCP) | `a_request_gets_its_fragments_then_its_result_over_tcp` |
-| 요청 중 서버 재시작: 결과 유실 0, 재실행 0, 결과 뒤 조각 0, 조각 유실 표시(M8-9) | `a_restart_during_a_request_loses_no_result_and_runs_nothing_twice` |
-| 요청자 재접속에도 결과는 한 번 온다(2.9) | `a_requester_that_reconnects_still_gets_its_result_once` |
-| 요청자는 기한을 두지 않음: 호출자가 바깥에서 기다림을 끊고, 같은 id 재전송은 대기자 하나·재실행 0 | `the_caller_bounds_the_wait_and_a_resend_keeps_one_waiter` |
-| 조각은 버리지 않음: 늦게 읽는 호출자도 전부 순서대로, 밀린 수는 `backlog` | `fragments_are_kept_for_a_caller_that_reads_late` |
-
 ## 프록시 (`crates/ruvent-proxy/`)
 
 프록시 크레이트는 골조다(4장): 서버별 상향과 구독 규칙만 있고, 클라이언트 쪽 프로토콜·인증·설정 파일·요청–응답·기한·역압은
@@ -269,6 +259,7 @@ wire v2(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 4장 "접두사 구독 … 프록시는 사용자 채널 묶음을 접두사 하나로 구독할 수 있다" | `a_prefix_subscription_takes_every_channel_below_it_through_a_real_event_server` |
 | 4장 "상향 연결은 서버마다 역할별로 하나다 … 모든 서버에 붙도록" (서버 2대, 양쪽 발송) | `a_fanout_on_two_servers_hands_members_what_either_dispatches` |
 | 4장 "조용히 끊긴 상향 연결이 `/health`에 정상으로 남지 않게 한다" (서버 하나 상실) | `an_upstream_that_goes_away_shows_in_health` |
+| 4장 "요청–응답은 구성원 하나다. 요청마다 응답 채널을 구독하고 … 오는 것을 클라이언트에 쓴다" (요청 2건 동시, 실제 워커) | `each_request_is_answered_on_its_own_channel_in_order` |
 
 FIN 없는 조용한 끊김(M8-8)은 프로세스 안에서 만들 수 없다. 사용자 공간의 중계는 커널이 keepalive에 답하므로 끊김으로
 보이지 않는다. 그 감지는 SDK가 모든 상향 소켓에 거는 커널 keepalive(S13)의 몫이고, 인수 테스트는 서버가 연결을 끝내는

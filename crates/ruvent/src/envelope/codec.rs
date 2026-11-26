@@ -1,7 +1,7 @@
 //! The envelope's byte layout. One body codec, used by the wire and the journal.
 //!
-//! Fixed-width numbers are little-endian; `id`, `correlation` and `group` are
-//! 16 octets. The work key's arrival and the two times are unsigned LEB128
+//! Fixed-width numbers are little-endian; `id` and `group` are 16
+//! octets. The work key's arrival and the two times are unsigned LEB128
 //! varints ([`put_varint`]). Names travel as numbers from a dictionary the
 //! surrounding stream defines first; this module only asks for the number of
 //! a name and the name of a number. A decoder knows every length from the
@@ -13,8 +13,8 @@
 //! | --- | --- |
 //! | 0 | kind: set means dispatch |
 //! | 1 | reserved (was "claimed" in format 2) |
-//! | 2 | `reply` present |
-//! | 3 | `correlation` present |
+//! | 2 | reserved (was `reply` in format 3) |
+//! | 3 | reserved (was `correlation` in format 3) |
 //! | 4 | `principal` present |
 //! | 5 | `delegate` present |
 //! | 6 | `not_before` present |
@@ -28,14 +28,12 @@ use bytes::{BufMut, Bytes};
 use std::fmt;
 
 pub const KIND: u16 = 1 << 0;
-pub const REPLY: u16 = 1 << 2;
-pub const CORRELATION: u16 = 1 << 3;
 pub const PRINCIPAL: u16 = 1 << 4;
 pub const DELEGATE: u16 = 1 << 5;
 pub const NOT_BEFORE: u16 = 1 << 6;
 pub const EXPIRES: u16 = 1 << 7;
 pub const GROUP: u16 = 1 << 8;
-const OPTIONAL: u16 = REPLY | CORRELATION | PRINCIPAL | DELEGATE | NOT_BEFORE | EXPIRES | GROUP;
+const OPTIONAL: u16 = PRINCIPAL | DELEGATE | NOT_BEFORE | EXPIRES | GROUP;
 /// Bits no layout may set.
 pub const RESERVED: u16 = !(KIND | OPTIONAL);
 /// Fields that only mean something on a claimable event.
@@ -172,7 +170,7 @@ pub fn size(envelope: &Envelope, layout: Layout) -> usize {
     if layout.has_key() {
         size += 4 + varint_len(envelope.key.map_or(0, |key| key.arrival));
     }
-    for (bit, width) in [(REPLY, 4), (CORRELATION, 16), (PRINCIPAL, 4), (DELEGATE, 4), (GROUP, 16)] {
+    for (bit, width) in [(PRINCIPAL, 4), (DELEGATE, 4), (GROUP, 16)] {
         if flags & bit != 0 {
             size += width;
         }
@@ -245,12 +243,6 @@ fn encode_parts(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Nam
         let key = envelope.key.ok_or(Malformed::Missing("work key"))?;
         out.put_u32_le(key.generation);
         put_varint(out, key.arrival);
-    }
-    if flags & REPLY != 0 {
-        out.put_u32_le(number(envelope.reply.as_ref().unwrap_or(&envelope.channel)));
-    }
-    if flags & CORRELATION != 0 {
-        out.put_slice(&envelope.correlation.unwrap_or_default().0);
     }
     if flags & PRINCIPAL != 0 {
         out.put_u32_le(number(envelope.principal.as_ref().unwrap_or(&envelope.channel)));
@@ -378,8 +370,6 @@ fn decode_parts(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> O
     let failures = reader.u16()?;
     layout.check(flags, failures)?;
     let key = if layout.has_key() { Some(WorkKey { generation: reader.u32()?, arrival: reader.varint()? }) } else { None };
-    let reply = if flags & REPLY != 0 { Some(lookup(reader.u32()?)?) } else { None };
-    let correlation = if flags & CORRELATION != 0 { Some(reader.id()?) } else { None };
     let principal = if flags & PRINCIPAL != 0 { Some(lookup(reader.u32()?)?) } else { None };
     let delegate = if flags & DELEGATE != 0 { Some(lookup(reader.u32()?)?) } else { None };
     let not_before = if flags & NOT_BEFORE != 0 { Some(reader.varint()?) } else { None };
@@ -392,5 +382,5 @@ fn decode_parts(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> O
         Bytes::new()
     };
     let kind = if flags & KIND != 0 { Kind::Dispatch } else { Kind::Claimable };
-    Ok(Envelope { id, channel, event_type, kind, failures, key, reply, correlation, principal, delegate, not_before, expires, group, payload })
+    Ok(Envelope { id, channel, event_type, kind, failures, key, principal, delegate, not_before, expires, group, payload })
 }

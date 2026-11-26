@@ -197,8 +197,8 @@ fn workspace_library() -> Vec<Source> {
 /// | `ruvent-server/connection/handshake.rs` `time::timeout(` | how long a new connection has to say hello |
 /// | `ruvent-server/connection/close.rs` `time::timeout(` | the deadline of a staged close after `Bye` (2.2, S20) |
 ///
-/// The requester and the proxy declare none: a request's deadline, and any
-/// other wait a proxy bounds, is the program's (4장).
+/// The proxy declares none: a request's deadline, and any other wait a
+/// proxy bounds, is the program's (4장).
 const TIMERS: &[(&str, &str, usize)] = &[
     ("ruvent/snapshot/mod.rs", "time::timeout(", 1),
     ("ruvent/engine/mod.rs", "time::sleep(", 1),

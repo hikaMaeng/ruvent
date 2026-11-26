@@ -65,15 +65,12 @@ impl ChannelConfig {
 }
 
 impl Default for ChannelConfig {
-    /// Reply channels (`reply.*`) are volatile and never isolated (B10, 2.4);
-    /// isolation channels are not isolated again.
+    /// Isolation channels are not isolated again. No other channel has a
+    /// rule of its own: a request's answer channel is the project's name.
     fn default() -> Self {
         Self {
             default: ChannelSettings::default(),
-            rules: vec![
-                ChannelRule { pattern: Pattern("reply.*".into()), settings: ChannelSettings { isolate_after: None, volatile: true, ..ChannelSettings::default() } },
-                ChannelRule { pattern: Pattern("isolated.*".into()), settings: ChannelSettings { isolate_after: None, ..ChannelSettings::default() } },
-            ],
+            rules: vec![ChannelRule { pattern: Pattern("isolated.*".into()), settings: ChannelSettings { isolate_after: None, ..ChannelSettings::default() } }],
             isolation_prefix: "isolated.".into(),
         }
     }

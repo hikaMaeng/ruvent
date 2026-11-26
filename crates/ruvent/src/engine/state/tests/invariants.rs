@@ -35,7 +35,7 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
-const CHANNELS: [&str; 3] = ["a", "b", "reply.c"];
+const CHANNELS: [&str; 3] = ["a", "b", "scratch.c"];
 
 fn check(state: &State) -> Result<(), TestCaseError> {
     let mut in_lanes = 0usize;
@@ -155,7 +155,7 @@ proptest! {
                 Step::Delete(at) => {
                     if let Some(id) = ids.get(at as usize).copied() {
                         let seq = h.next_seq(P);
-                        h.call(P, Call::Delete { seq, id, result: "out".into(), tag: id, key: None });
+                        h.call(P, Call::Delete { seq, id, result: "out".into(), key: None });
                     }
                 }
                 Step::Claim(at) => {

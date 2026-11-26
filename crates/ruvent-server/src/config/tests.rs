@@ -18,8 +18,10 @@ fn the_example_configuration_parses_into_grants_and_every_section() {
     assert!(engine.channels.settings("jobs.render").serialize_group);
     assert!(engine.channels.settings("proxy.x").volatile);
     assert_eq!(engine.channels.settings("orders.create").isolate_after, Some(5));
-    // The built-in rules stay: reply channels are volatile and never isolated.
-    assert!(engine.channels.settings("reply.r").volatile && engine.channels.settings("reply.r").isolate_after.is_none());
+    // The built-in rule stays: isolation channels are not isolated again. No
+    // channel is volatile unless the file says so (there is no reply-channel rule).
+    assert!(engine.channels.settings("isolated.jobs").isolate_after.is_none());
+    assert!(!engine.channels.settings("reply.r").volatile);
     let options = config.options();
     assert_eq!((options.unsent, options.close, options.keepalive.retries), (256 << 20, Duration::from_secs(5), 3));
 }
