@@ -1,9 +1,9 @@
 //! Durability. Not a method: the engine writes it, nobody calls it.
 //!
 //! The journal exists so that a restart can carry on: it holds the claimable
-//! events on durable channels still waiting, delayed or claimed, the producer
+//! events of durable types still waiting, delayed or claimed, the producer
 //! sequence table, the generation and the uptime clock. Dispatch events and
-//! events on volatile channels are never written.
+//! events of volatile types are never written.
 //!
 //! ## Format 3: a record set and a container
 //!
@@ -12,13 +12,13 @@
 //!
 //! | record | means |
 //! | --- | --- |
-//! | `Register` | this registration exists, with this envelope (failures, times and group included) and this root channel; its payload inline, or at a location written earlier (a streamed body) |
+//! | `Register` | this registration exists, with this envelope (failures, times and group included) and this root type; its payload inline, or at a location written earlier (a streamed body) |
 //! | `Body` | a payload written inline with no registration; skipped unless something points at it |
 //! | `Claim` | this registration is claimed under this token, lease length and credential |
 //! | `Remove` | this registration is gone: completed, deleted or expired |
 //! | `Reclaim` | its lease ran out: waiting again with this failure count |
 //! | `Release` | the worker gave it back: this failure count, visible again at this uptime (or now) |
-//! | `Isolate` | it moved to this isolation channel with this failure count and this expiry |
+//! | `Isolate` | it is isolated in place (B6) with this failure count and this expiry |
 //! | `Relocate` | its payload now lives at this location (the long-lived lane) |
 //! | `ProducerDef` | producer number ↔ producer id |
 //! | `Producer` | this producer's last applied sequence number |
@@ -130,11 +130,11 @@ pub struct Written {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     /// A registration. `event` has its work key, the absolute `not_before` and
-    /// `expires`, and its failure count; `root` is its root channel. With `at`
+    /// `expires`, and its failure count; `root` is its root type. With `at`
     /// the payload was written earlier (streamed) and `event.payload` is empty.
     Register {
         event: Envelope,
-        root: Name,
+        root: u16,
         at: Option<Location>,
     },
     /// A payload with no registration around it.
@@ -160,7 +160,6 @@ pub enum Record {
     },
     Isolate {
         key: WorkKey,
-        channel: Name,
         failures: u16,
         expires: Option<u64>,
     },
@@ -210,9 +209,9 @@ pub enum Standing {
 /// the serial of its last change (2.5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    /// Head, work key, current channel, failures, times; the payload empty.
+    /// Head, work key, channel, failures, times, the isolated bit; the payload empty.
     pub event: Envelope,
-    pub root: Name,
+    pub root: u16,
     /// `None` while its registration was not yet on disk when the checkpoint
     /// started: the registration is then in the replayed tail, which supplies it.
     pub at: Option<Location>,

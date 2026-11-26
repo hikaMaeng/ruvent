@@ -97,7 +97,7 @@ impl Reading {
     /// from the channel and the memory in use.
     fn to_disk(&self, raw: &RawRecord) -> Result<bool, ReadEnd> {
         let event = self.decoder.follow_up(raw).map_err(ReadEnd::Protocol)?;
-        Ok(self.engine.body_to_disk(event.channel.as_str(), u64::from(raw.body_len)))
+        Ok(self.engine.body_to_disk(event.event_type, u64::from(raw.body_len)))
     }
 
     /// Streams the next `len` body bytes from the socket into the spool, a

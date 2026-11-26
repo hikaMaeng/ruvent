@@ -4,31 +4,21 @@
 //! waiting, delayed, claimed, oldest_ms, memory_used, memory_budget, memory_limit,
 //! depth_capacity, depth_target, disk_used, disk_budget, disk_limit, segments, draining u8,
 //! counters (15 varints, declaration order),
-//! channel count, (channel, waiting, oldest_ms)…,
-//! idle lane count, (channel, type, waiting)…,
-//! root count, (root, events, bytes, disk, paused u8)…
+//! type count, (type u16, waiting, oldest_ms)…,
+//! idle lane count, (channel 16, type u16, waiting)…,
+//! root count, (root type u16, events, bytes, disk, paused u8)…
 //! ```
 //!
 //! Each list is cut at [`LIST`] entries so the head stays within `u16`.
 
-use super::fields::{boolean, name, put_bool, put_name, put_varint};
-use crate::dictionary::{Incoming, Outgoing};
+use super::fields::{boolean, put_bool, put_varint};
 use crate::error::ProtocolError;
 use bytes::BufMut;
 use ruvent::envelope::codec::Reader;
-use ruvent::{ChannelStat, Counters, IdleLane, Name, RootStat, Stats};
+use ruvent::{Channel, Counters, IdleLane, RootStat, Stats, TypeStat};
 
 /// Most entries of each top-K list on the wire.
 pub(crate) const LIST: usize = 256;
-
-pub(crate) fn names<'a>(stats: &'a Stats, names: &mut Vec<&'a Name>) {
-    names.extend(stats.channels.iter().take(LIST).map(|entry| &entry.channel));
-    for lane in stats.idle_lanes.iter().take(LIST) {
-        names.push(&lane.channel);
-        names.push(&lane.event_type);
-    }
-    names.extend(stats.roots.iter().take(LIST).map(|entry| &entry.root));
-}
 
 fn counters(counters: &Counters) -> [u64; 15] {
     [
@@ -50,7 +40,7 @@ fn counters(counters: &Counters) -> [u64; 15] {
     ]
 }
 
-pub(crate) fn encode(stats: &Stats, dictionary: &Outgoing, out: &mut impl BufMut) {
+pub(crate) fn encode(stats: &Stats, out: &mut impl BufMut) {
     for value in [
         stats.waiting,
         stats.delayed,
@@ -72,24 +62,24 @@ pub(crate) fn encode(stats: &Stats, dictionary: &Outgoing, out: &mut impl BufMut
     for value in counters(&stats.counters) {
         put_varint(out, value);
     }
-    let channels = &stats.channels[..stats.channels.len().min(LIST)];
-    put_varint(out, channels.len() as u64);
-    for entry in channels {
-        put_name(out, dictionary, &entry.channel);
+    let types = &stats.types[..stats.types.len().min(LIST)];
+    put_varint(out, types.len() as u64);
+    for entry in types {
+        out.put_u16_le(entry.event_type);
         put_varint(out, entry.waiting);
         put_varint(out, entry.oldest_ms);
     }
     let lanes = &stats.idle_lanes[..stats.idle_lanes.len().min(LIST)];
     put_varint(out, lanes.len() as u64);
     for lane in lanes {
-        put_name(out, dictionary, &lane.channel);
-        put_name(out, dictionary, &lane.event_type);
+        out.put_slice(&lane.channel.0);
+        out.put_u16_le(lane.event_type);
         put_varint(out, lane.waiting);
     }
     let roots = &stats.roots[..stats.roots.len().min(LIST)];
     put_varint(out, roots.len() as u64);
     for entry in roots {
-        put_name(out, dictionary, &entry.root);
+        out.put_u16_le(entry.root);
         put_varint(out, entry.events);
         put_varint(out, entry.bytes);
         put_varint(out, entry.disk);
@@ -105,7 +95,7 @@ fn count(reader: &mut Reader<'_>) -> Result<usize, ProtocolError> {
     Ok(count as usize)
 }
 
-pub(crate) fn decode(reader: &mut Reader<'_>, dictionary: &Incoming) -> Result<Stats, ProtocolError> {
+pub(crate) fn decode(reader: &mut Reader<'_>) -> Result<Stats, ProtocolError> {
     let mut totals = [0u64; 13];
     for value in &mut totals {
         *value = reader.varint()?;
@@ -132,17 +122,17 @@ pub(crate) fn decode(reader: &mut Reader<'_>, dictionary: &Incoming) -> Result<S
         segments_removed: c[13],
         checkpoints: c[14],
     };
-    let mut channels = Vec::new();
+    let mut types = Vec::new();
     for _ in 0..count(reader)? {
-        channels.push(ChannelStat { channel: name(reader, dictionary)?, waiting: reader.varint()?, oldest_ms: reader.varint()? });
+        types.push(TypeStat { event_type: reader.u16()?, waiting: reader.varint()?, oldest_ms: reader.varint()? });
     }
     let mut idle_lanes = Vec::new();
     for _ in 0..count(reader)? {
-        idle_lanes.push(IdleLane { channel: name(reader, dictionary)?, event_type: name(reader, dictionary)?, waiting: reader.varint()? });
+        idle_lanes.push(IdleLane { channel: Channel(reader.bytes16()?), event_type: reader.u16()?, waiting: reader.varint()? });
     }
     let mut roots = Vec::new();
     for _ in 0..count(reader)? {
-        roots.push(RootStat { root: name(reader, dictionary)?, events: reader.varint()?, bytes: reader.varint()?, disk: reader.varint()?, paused: boolean(reader)? });
+        roots.push(RootStat { root: reader.u16()?, events: reader.varint()?, bytes: reader.varint()?, disk: reader.varint()?, paused: boolean(reader)? });
     }
     let [waiting, delayed, claimed, oldest_ms, memory_used, memory_budget, memory_limit, depth_capacity, depth_target, disk_used, disk_budget, disk_limit, segments] = totals;
     Ok(Stats {
@@ -161,7 +151,7 @@ pub(crate) fn decode(reader: &mut Reader<'_>, dictionary: &Incoming) -> Result<S
         segments,
         draining,
         counters,
-        channels,
+        types,
         idle_lanes,
         roots,
     })

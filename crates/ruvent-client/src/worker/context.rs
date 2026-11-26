@@ -4,7 +4,7 @@
 use super::{Message, RunKey};
 use crate::producer::{Producer, ProducerError, Sent};
 use parking_lot::Mutex;
-use ruvent::{Bytes, ClaimToken, Envelope, EventId, Name, WorkKey};
+use ruvent::{Bytes, Channel, ClaimToken, Envelope, EventId, WorkKey};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,12 +55,12 @@ impl Context {
         self.event.id
     }
 
-    pub fn channel(&self) -> &Name {
-        &self.event.channel
+    pub fn channel(&self) -> Channel {
+        self.event.channel
     }
 
-    pub fn event_type(&self) -> &Name {
-        &self.event.event_type
+    pub fn event_type(&self) -> u16 {
+        self.event.event_type
     }
 
     pub fn payload(&self) -> &Bytes {
@@ -101,11 +101,11 @@ impl Context {
         id
     }
 
-    pub fn emit_claimable(&self, channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> EventId {
+    pub fn emit_claimable(&self, channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> EventId {
         self.emit(Envelope::claimable(channel, event_type, payload))
     }
 
-    pub fn emit_dispatch(&self, channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> EventId {
+    pub fn emit_dispatch(&self, channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> EventId {
         self.emit(Envelope::dispatch(channel, event_type, payload))
     }
 

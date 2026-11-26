@@ -32,7 +32,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | protocol | `-p ruvent-protocol` | 와이어 형식 |
 | server | `-p ruvent-server` | 실제 TCP 서버 |
 | client SDK | `-p ruvent-client` | 서버 목록, 재접속, 생산자, 워커 창 규칙 |
-| proxy | `-p ruvent-proxy` | 프록시 골조: 구독 장부와 health 단위, 팬아웃(SDK `Local`), 실제 이벤트 서버(서버 2대, 상향 상실, 접두사)에 붙인 인수 |
+| proxy | `-p ruvent-proxy` | 프록시 골조: 구독 장부와 health 단위, 팬아웃(SDK `Local`), 실제 이벤트 서버(서버 2대, 상향 상실, UUIDv7이 아닌 채널)에 붙인 인수 |
 
 ## 수준
 
@@ -76,43 +76,54 @@ cargo run --release -p ruvent --example bench   # 측정
 | 누적 확인: 연산별 기준, 커밋 완료와 묶음 끝이 계기, N건(S2), 끌 수 있다(2.3, B2) | `committed_waits_for_the_disk_for_durable_work_and_not_for_volatile`, `committed_goes_out_once_every_n_while_later_work_still_waits`, `a_volatile_broadcast_producer_can_turn_acknowledgements_off`, `registrations_are_not_answered_one_by_one_but_acknowledged_cumulatively`, `welcome_resumes_at_the_last_applied_sequence_after_it_is_committed` |
 | 인스턴스 nonce와 `superseded`(2.3, M8-7) | `the_same_process_reconnecting_replaces_quietly_and_another_instance_supersedes`, `a_second_instance_under_one_producer_id_supersedes_the_first_and_both_are_told` |
 | 다이제스트로 중복·충돌(2.3) | `a_duplicate_id_with_the_same_content_is_dropped_and_other_content_is_a_conflict_told_once`, `a_follow_up_with_an_active_id_is_skipped_when_identical_and_refuses_the_completion_when_not`, `an_active_id_is_not_registered_twice_ids_are_uuidv7_and_a_departed_id_may_return` |
-| 오류 통보는 (연결, 종류)마다 첫 1회, 권한은 앞에서(2.7) | `malformed_requests_invalid_ids_and_forbidden_channels_are_faults`, `declared_channels_are_checked_before_welcome`, `a_call_the_role_does_not_send_is_refused`, `a_join_is_refused_without_the_claim_grant`, `a_completion_under_another_credential_is_a_fault`, `stats_and_drain_need_the_operator_grant` |
+| 오류 통보는 (연결, 종류)마다 첫 1회, 권한은 앞에서(2.7) | `malformed_requests_invalid_ids_and_forbidden_types_are_faults`, `declared_types_are_checked_before_welcome`, `a_call_the_role_does_not_send_is_refused`, `a_join_is_refused_for_a_type_outside_the_claim_grant`, `a_completion_under_another_credential_is_a_fault`, `stats_and_drain_need_the_operator_grant` |
 | 창은 절댓값, 등록순 순환, `more`·`Pending`, 바이트 진행 규칙(2.4) | `a_window_receives_assignments_round_robin_in_join_order`, `a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window`, `a_window_of_zero_refuses_and_a_join_holding_nothing_takes_one_event_over_its_byte_bound`, `types_are_lanes_and_an_unsupported_type_does_not_block_the_rest` |
 | lease는 배정 시점부터, 회수 때 창을 닫는다, 회수 전 완료는 수락(2.4) | `a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window`, `a_late_completion_before_the_reclaim_is_accepted_and_after_it_is_dropped` |
 | 연결이 닫히면: 못 쓴 배정은 즉시 대기로, 다 쓴 배정은 재접속 유예로(2.4, S20, M8-2) | `a_closed_connection_returns_unwritten_assignments_at_once_and_pulls_written_ones_to_the_grace`, `a_closing_connection_gives_back_unwritten_assignments_at_once` |
 | `Extend`는 참여를 옮긴다, 재기동은 착수를 그대로 둔다(2.4, M8-6) | `extend_moves_the_attempt_to_the_extending_connections_join`, `a_restart_restores_claims_with_token_lease_and_credential_and_counts_no_failure`, `a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_workers_completion` |
 | `Release{지연, 실패}`와 격리(이벤트 탓만 센다)(2.4, B6, M8-12) | `release_keeps_or_raises_the_failure_count_and_a_delay_hides_the_event`, `the_fifth_counted_failure_isolates_and_releases_without_failure_never_do` |
-| `not_before`·`expires`(깨우지 않는 수거, 재기동 뒤 남은 시간)(2.4, B9, M8-11) | `not_before_hides_an_event_until_its_time_and_the_wheel_wakes_for_it`, `an_expired_event_is_never_assigned_and_is_purged_without_any_consumer`, `an_expired_event_is_isolated_instead_where_the_channel_says_so`, `a_restart_keeps_the_remaining_time_of_not_before_and_expires` |
+| `not_before`·`expires`(깨우지 않는 수거, 재기동 뒤 남은 시간)(2.4, B9, M8-11) | `not_before_hides_an_event_until_its_time_and_the_wheel_wakes_for_it`, `an_expired_event_is_never_assigned_and_is_purged_without_any_consumer`, `an_expired_event_is_isolated_instead_where_its_type_says_so`, `a_restart_keeps_the_remaining_time_of_not_before_and_expires` |
 | `serialize_group`(B26) | `serialize_group_assigns_one_event_of_a_group_at_a_time` |
 | 명시 착수 | `an_explicit_claim_takes_a_waiting_event_and_refuses_claimed_delayed_or_missing_ones`, `a_claim_carries_the_attempt_and_the_time_out_the_worker_chose_and_completion_removes_it` |
 | 완료와 후속은 한 스텝, 후속은 부모의 뿌리(0.3, 2.1) | `a_completion_registers_its_follow_ups_in_the_same_step_under_the_parents_root`, `a_completion_with_more_follow_ups_than_allowed_is_refused`, `a_failure_is_a_completion_and_what_follows_is_new_events_the_worker_chose` |
 | Strict 커밋 가시성: 배정·통지·backlog·명시 착수(2.7, M8-3) | `under_strict_nothing_uncommitted_is_assigned_noticed_backlogged_or_claimed`, `under_strict_nothing_uncommitted_is_visible_while_the_disk_is_held`, `under_scheduled_visibility_does_not_wait_for_the_disk`, `under_strict_one_connection_receives_in_processing_order`, `a_claim_does_not_wait_for_the_disk_even_under_strict` |
-| 메모리 회계, 고수위, 뿌리 채널 정지와 해제, 통보와 읽기 정지, 조기 정지, `max_backlog`, 순증 줄, 상한(2.6) | `the_biggest_root_is_paused_at_the_high_watermark_and_resumed_below_seven_eighths`, `a_paused_root_tells_its_producers_once_and_stops_reading_past_the_allowance`, `a_paused_root_is_not_assigned_from_net_growth_lanes_and_chain_ends_still_are`, `a_root_that_never_drained_is_paused_at_an_eighth_of_the_budget`, `max_backlog_pauses_a_root_regardless_of_the_watermark`, `follow_ups_and_isolated_events_count_to_the_root_channel`, `past_the_limit_net_growth_lanes_are_not_assigned`, `a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_channel_to_hold` |
-| 발송은 등록 순간의 구독자에게, 접두사는 `.` 경계, 발송 포함 참여(2.4, 2.8, 4장) | `dispatch_reaches_exactly_the_subscribers_at_the_moment_it_is_registered`, `a_prefix_subscription_matches_at_dot_boundaries_unlike_a_grant_pattern`, `a_dispatch_join_receives_the_channels_dispatch_events`, `subscriptions_take_effect_in_processing_order_within_a_batch`, `a_dispatch_event_goes_to_whoever_is_connected_at_that_moment_and_is_gone` |
+| 메모리 회계, 고수위, 뿌리 타입 정지와 해제, 통보와 읽기 정지, 조기 정지, `max_backlog`, 순증 줄, 상한(2.6) | `the_biggest_root_is_paused_at_the_high_watermark_and_resumed_below_seven_eighths`, `a_paused_root_tells_its_producers_once_and_stops_reading_past_the_allowance`, `a_paused_root_is_not_assigned_from_net_growth_lanes_and_chain_ends_still_are`, `a_root_that_never_drained_is_paused_at_an_eighth_of_the_budget`, `max_backlog_pauses_a_root_regardless_of_the_watermark`, `follow_ups_and_isolated_events_count_to_the_root_type`, `past_the_limit_net_growth_lanes_are_not_assigned`, `a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_type_to_hold` |
+| 발송은 등록 순간의 구독자에게, 채널은 UUIDv7만, 발송 포함 참여(2.4, 2.8, 4장, 9.14) | `dispatch_reaches_exactly_the_subscribers_at_the_moment_it_is_registered`, `a_channel_that_is_not_a_uuidv7_is_refused_everywhere`, `a_dispatch_join_receives_the_channels_dispatch_events`, `subscriptions_take_effect_in_processing_order_within_a_batch`, `a_dispatch_event_goes_to_whoever_is_connected_at_that_moment_and_is_gone` |
 | 한 접속이 멈춰도 다른 접속은 진행 | `a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on`, `a_slow_member_is_detached_and_nobody_else_is` |
-| 프록시 골조: 모든 서버에 서버별 상향, 조용히 끊긴 상향은 준비 상태에 정상으로 남지 않음, 구성원 구독의 효력 시점, 접두사 구독(4장, M8-8 준비 상태) | `a_fanout_on_two_servers_hands_members_what_either_dispatches`, `an_upstream_that_goes_away_shows_in_health`, `the_subscription_rule_holds_through_a_real_event_server`, `a_prefix_subscription_takes_every_channel_below_it_through_a_real_event_server`, `each_request_is_answered_on_its_own_channel_in_order` |
+| 프록시 골조: 모든 서버에 서버별 상향, 조용히 끊긴 상향은 준비 상태에 정상으로 남지 않음, 구성원 구독의 효력 시점, UUIDv7이 아닌 채널의 거절(4장, 9.14, M8-8 준비 상태) | `a_fanout_on_two_servers_hands_members_what_either_dispatches`, `an_upstream_that_goes_away_shows_in_health`, `the_subscription_rule_holds_through_a_real_event_server`, `a_channel_that_is_not_a_uuid_v7_is_refused_through_a_real_event_server`, `each_request_is_answered_on_its_own_channel_in_order` |
 | 삭제는 대기 중일 때만, 결과 통지는 정확히 한 건 | `deleting_a_waiting_event_succeeds_once_and_a_claimed_or_missing_one_fails_with_one_notice`, `deletion_removes_only_a_waiting_event_and_always_announces_its_outcome` |
-| `Stats` 상위 K, `Drain`(2.8, B24, M8-5) | `stats_report_totals_top_channels_idle_lanes_and_roots`, `drain_sends_new_producers_away_and_closes_open_ones_after_a_final_committed`, `drain_gives_every_producer_a_final_committed_before_bye` |
-| 재기동·저널: 휘발 채널 결과표, 체크포인트 재생 동치, 정상 종료 체크포인트(꼬리 없음), 누적 가동 시각 | `volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says`, `a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced`, `a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clock_carries_on`, `unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash`, `a_failed_write_stops_the_engine_and_releases_nothing_it_carried` |
+| `Stats` 상위 K, `Drain`(2.8, B24, M8-5) | `stats_report_totals_top_types_idle_lanes_and_root_types`, `drain_sends_new_producers_away_and_closes_open_ones_after_a_final_committed`, `drain_gives_every_producer_a_final_committed_before_bye` |
+| 재기동·저널: 휘발 채널 결과표, 체크포인트 재생 동치, 정상 종료 체크포인트(꼬리 없음), 누적 가동 시각 | `volatile_types_write_nothing_and_mixed_lineages_restart_as_the_table_says`, `a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced`, `a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clock_carries_on`, `unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash`, `a_failed_write_stops_the_engine_and_releases_nothing_it_carried` |
 | 퍼지 체크포인트: 훑기 도중의 변경이 재생에서 빠지지 않음, 꼬리의 등록이 위치를 채움, 계기(S4)(2.5, B25) | `a_fuzzy_checkpoint_misses_no_change_made_during_its_walk`, `a_tail_registration_gives_a_checkpoint_entry_its_payload_location`, `a_checkpoint_starts_when_the_tail_passes_one_segment_or_eight_times_the_last` |
 | 세그먼트 수명: 제거가 디스크에 닿고 체크포인트가 뒤에서 시작해야 지운다, 체크포인트가 빈 세그먼트를 놓아 준다(2.5) | `a_segment_goes_once_its_removals_land_and_the_checkpoint_starts_after_it`, `checkpoints_let_empty_segments_go_and_the_log_restarts_from_what_is_left` |
 | 이주: 붙잡힌 죽은 바이트가 예산 비율(S3)을 넘으면 가장 성긴 세그먼트, `Relocate`가 디스크에 닿은 뒤 놓음(2.5) | `pinned_dead_bytes_relocate_the_sparsest_segment_and_free_it_once_on_disk`, `relocation_copies_payloads_to_the_long_lane_and_removal_deletes_whole_segments` |
 | 본문 캐시와 읽기 경로: 고수위에서 놓기만, 콜드 본문은 읽어서 보냄, 줄 머리 미리 읽기, 복구는 메타만(2.5, M3) | `cached_payloads_are_released_at_the_watermark_and_go_out_through_a_read`, `recovery_holds_metadata_only_and_payloads_come_back_through_reads` |
-| `Body` 흘려 읽기: 영속 후속은 본문 위치를 가리킴, 예약분을 넘긴 휘발 후속은 저널에 없고 재기동 때 버림, 디스크로 받을지의 판단(2.6 4·5번, B15) | `streamed_follow_ups_point_at_their_body_and_a_volatile_one_is_journaled_nowhere`, `streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a_restart`, `body_to_disk_says_yes_at_the_watermark_and_for_a_volatile_channel_only_past_the_reserve`, `a_streamed_body_reads_back_and_its_segment_waits_for_it` |
+| `Body` 흘려 읽기: 영속 후속은 본문 위치를 가리킴, 예약분을 넘긴 휘발 후속은 저널에 없고 재기동 때 버림, 디스크로 받을지의 판단(2.6 4·5번, B15) | `streamed_follow_ups_point_at_their_body_and_a_volatile_one_is_journaled_nowhere`, `streamed_follow_up_bodies_go_out_from_disk_and_a_durable_one_survives_a_restart`, `body_to_disk_says_yes_at_the_watermark_and_for_a_volatile_type_only_past_the_reserve`, `a_streamed_body_reads_back_and_its_segment_waits_for_it` |
 | 디스크 회계와 디스크 고수위(S6): 디스크 몫이 가장 큰 뿌리 정지 | `the_disk_watermark_pauses_the_root_with_the_biggest_disk_share` |
 | M8-4: 이주·삭제·콜드 읽기·체크포인트 훑기가 겹치고 훑는 도중에 죽어도 잃는 것이 없다 | `relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothing` |
 | 장부 정합성(속성): 한 이벤트는 한 자리, 줄·참여·회계·group 계수의 합이 맞다 | `random_operations_keep_the_ledgers_bookkeeping_consistent` |
+
+## 타입 라우팅과 UUIDv7 채널 (계획 9.14, v4.9)
+
+| 요구 | 테스트 |
+| --- | --- |
+| 채널은 UUIDv7만: 등록·참여·구독·삭제 결과 채널 | `a_channel_is_valid_only_as_a_uuidv7`, `a_channel_that_is_not_a_uuidv7_is_refused_everywhere`, `a_join_without_a_valid_selection_is_malformed` |
+| 워커는 채널, 타입, 또는 둘로 참여한다. 참여의 이름은 `req`, 겹침과 이름 충돌은 거절 | `a_typed_worker_takes_one_type_from_fresh_channels_and_answers_on_each`, `an_isolated_join_and_a_plain_join_do_not_overlap`, `a_join_name_in_use_is_refused_for_another_selection_and_leaves_nothing_behind` |
+| 권한은 타입으로: 참여·등록·구독이 넘기는 것 | `a_join_is_refused_for_a_type_outside_the_claim_grant`, `readers_get_only_the_types_their_credential_is_granted`, `grants_are_by_type_and_a_subscription_hands_over_only_the_credentials_types`, `registering_the_servers_own_type_is_malformed` |
+| 격리는 제자리: 격리 비트, 격리 참여만, 통지, 재기동 | `an_isolated_event_waits_in_place_for_isolated_joins_only`, `an_isolated_event_comes_back_isolated_from_the_records_and_from_a_checkpoint`, `an_isolated_event_stays_on_its_channel_and_only_an_isolated_join_takes_it_across_a_restart` |
+| 타입 집합과 그 글 형식 | `ranges_merge_and_membership_follows_them`, `every_and_no_type`, `the_text_form` |
+| 엔벨롭 38 B와 격리 비트, 사전에 채널·타입 없음, 접두사 기능 비트 예약 | `the_isolated_bit_travels_in_notices_assignments_and_the_journal`, `a_38_byte_head_with_the_isolated_bit_decodes`, `a_request_with_the_isolated_bit_is_refused`, `the_dictionary_carries_no_channel_and_no_type`, `the_prefix_feature_bit_is_reserved` |
 
 ## 코어 단위 (`crates/ruvent/src/**/tests.rs`, `src/engine/state/tests/`)
 
 | 영역 | 테스트 |
 | --- | --- |
-| 엔벨롭 크기·바이트(u16 flags, 가변 길이 정수) | `the_head_is_28_bytes_and_the_key_adds_four_plus_a_varint`, `an_assigned_event_has_these_exact_bytes`, `a_dispatch_delivery_has_these_exact_bytes`, `varints_round_trip_and_refuse_overlong_encodings` |
+| 엔벨롭 크기·바이트(u16 flags, 가변 길이 정수) | `the_head_is_38_bytes_and_the_key_adds_four_plus_a_varint`, `an_assigned_event_has_these_exact_bytes`, `a_dispatch_delivery_has_these_exact_bytes`, `varints_round_trip_and_refuse_overlong_encodings` |
 | 레코드 종류별 규칙 | `layouts_refuse_what_they_must_not_carry`, `timing_and_group_are_claimable_only`, `the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers`, `every_envelope_round_trips_through_every_layout_that_accepts_it`, `arbitrary_bytes_never_panic_the_decoder` |
 | 실패 횟수 포화, id | `failures_saturate_at_65535`, `ids_are_uuids_and_nil_means_unassigned` |
 | 이름표 | `equal_texts_share_one_handle`, `one_off_names_do_not_grow_the_dictionary_without_bound`, `a_name_held_elsewhere_survives_a_sweep` |
 | 저널 형식 4(레코드 집합, 세그먼트 컨테이너, 체크포인트 파일, 스트리밍 복구) | `every_record_kind_survives_a_reopen_and_payloads_stay_on_disk`, `a_claim_removed_in_the_same_frame_is_not_written_and_keeps_its_serial`, `a_second_engine_cannot_open_a_log_in_use`, `a_single_file_or_older_journal_is_refused_and_left_byte_for_byte`, `a_torn_last_frame_is_cut_and_everything_before_it_recovered`, `damage_in_the_middle_of_the_log_stops_recovery_instead_of_cutting_it`, `a_completion_frame_cut_at_any_byte_recovers_all_or_nothing`, `segments_roll_at_their_size_and_each_defines_its_own_names`, `recovery_reads_the_checkpoint_and_the_tail_from_its_start`, `an_unfinished_checkpoint_is_ignored_and_the_previous_one_read`, `a_damaged_checkpoint_stops_recovery` |
-| 운영 스냅샷 | `a_snapshot_file_holds_both_kinds_and_reads_back`, `the_configuration_picks_channels_and_types`, `chosen_channels_are_collected_into_snapshot_files` |
+| 운영 스냅샷 | `a_snapshot_file_holds_both_kinds_and_reads_back`, `the_configuration_picks_types_on_every_channel`, `chosen_types_are_collected_into_snapshot_files` |
 | 구독·대기분 | `the_backlog_comes_in_pages_in_work_key_order`, `the_subscription_marker_precedes_the_answer` |
 | 엔진 태스크 | `the_operations_work_through_the_in_process_client`, `after_shutdown_calls_fail_as_closed` |
 
@@ -135,7 +146,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 구현 태도·고가용성(착수는 디스크를 기다리지 않음) | `a_claim_does_not_wait_for_the_disk_even_under_strict` |
 | 0.2 (들어차고 신속하게 비워진다) | `an_open_window_takes_work_as_it_arrives_without_a_request_per_event` |
 | 9.5 (수신완료 반송 없음) | `registrations_are_not_answered_one_by_one_but_acknowledged_cumulatively` |
-| 9.5 (거절은 안 보낸다) | `a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_channel_to_hold` |
+| 9.5 (거절은 안 보낸다) | `a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_type_to_hold` |
 
 ## 프로토콜 (`crates/ruvent-protocol/src/tests.rs`)
 
@@ -143,7 +154,7 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 
 | 영역 | 테스트 |
 | --- | --- |
-| 고정 바이트 | `a_hello_record_has_these_exact_bytes`, `a_register_carries_its_payload_as_the_body_after_the_names_it_uses` |
+| 고정 바이트 | `a_hello_record_has_these_exact_bytes`, `a_register_carries_its_channel_inline_and_its_payload_as_the_body_with_no_names` |
 | 왕복(2.11의 모든 레코드, 속성 시험) | `every_call_and_every_server_message_round_trips`, `calls_round_trip_through_small_dictionaries`, `an_engine_welcome_is_sent_with_this_version_and_the_encoders_features` |
 | `Complete` 뒤 `FollowUp` 잇기 | `a_completion_is_handed_over_only_when_its_last_follow_up_arrived` |
 | `Assign`의 남은 lease(쓰기 시작 순간) | `an_assignment_carries_the_lease_left_at_the_moment_it_is_written` |
@@ -163,7 +174,7 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 설정(8장 값 전부, 기본값) | `the_example_configuration_parses_into_grants_and_every_section`, `a_minimal_configuration_takes_every_default`, `bad_configurations_are_refused_with_a_reason` |
 | 미송신 대기열: 누적 확인 접기, `Fault` 첫 1회, 바이트 상한(S7), 미송신 `Assign` 반환 | `a_newer_committed_replaces_the_queued_one`, `a_fault_is_told_once_per_kind_on_one_connection`, `an_observer_past_its_byte_bound_is_slow_and_bytes_count_until_written`, `dropping_assignments_returns_their_tokens_and_keeps_the_rest_in_order` |
 | 역할별 흐름(2.2) | `each_role_does_its_own_work_over_tcp` |
-| 자격·권한(2.7) | `a_wrong_token_and_a_forbidden_channel_are_refused_with_their_reason` |
+| 자격·권한(2.7) | `a_wrong_token_and_a_forbidden_type_are_refused_with_their_reason` |
 | 재전송 무시, 누적 확인(2.3) | `a_retransmission_is_dropped_quietly`, `acknowledgements_are_cumulative_not_one_per_registration` |
 | 순번 빈자리 → `Fault` + `Bye{protocol}` | `a_sequence_gap_is_told_once_and_closes_the_connection` |
 | nonce 같음·다름(`superseded`, M8-7) | `the_same_nonce_reconnects_quietly_and_another_nonce_supersedes` |
@@ -205,7 +216,7 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 누적 확인으로 버퍼가 빈다(S8, B2, TCP) | `cumulative_acknowledgements_empty_the_unacknowledged_buffer_over_tcp` |
 | 재접속 뒤 `resume`에서 잇고 중복 0(2.3, TCP 중계기 양쪽 끊기) | `a_reconnection_resumes_after_welcome_resume_with_no_duplicates` |
 | 서버 재기동: 저널 있음은 재개, 없음은 다시 번호 매기기 | `a_restart_with_the_journal_resumes_and_one_without_it_renumbers` |
-| `Paused`는 그 채널만 쥐고 `Resumed`에 푼다(2.6) | `a_paused_channel_holds_only_its_own_sends` |
+| `Paused`는 그 채널만 쥐고 `Resumed`에 푼다(2.6) | `a_paused_type_holds_only_its_own_sends` |
 | 같은 id 두 인스턴스: `superseded`, 되풀이 없음(M8-7) | `a_superseded_producer_stops_and_the_other_goes_on_without_flapping` |
 | 같은 nonce의 비대칭 재접속 3회 멈춤 0(M8-7) | `the_same_nonce_reconnects_three_times_through_a_one_sided_cut_without_stalling` |
 | `Bye` 사유표: 토큰 거절은 다시 붙지 않고 오류로 | `a_refused_token_ends_the_producer_with_its_reason` |
@@ -237,9 +248,9 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 구독 장부: 가입, ticket, 효력과 답 | `a_join_waits_for_its_own_confirmation_and_its_answer`, `the_answer_and_the_confirmation_settle_in_either_order`, `every_join_issues_its_own_subscribe`, `an_earlier_confirmation_does_not_activate_a_later_joiner`, `joining_twice_is_answered_at_once_without_a_call`, `a_second_join_while_waiting_waits_with_the_first` |
 | 구독 장부: 서버별 효력과 재접속 | `a_user_is_in_effect_per_server`, `a_reconnection_resets_a_server_until_it_confirms_again`, `a_join_with_no_server_connected_waits_for_the_first_confirmation` |
 | 구독 장부: 요청하지 않은 확인·답 | `confirmations_and_answers_nobody_asked_for_are_ignored` |
-| 구독 장부: 탈퇴와 `0→1→0→1` | `only_the_last_user_leaving_unsubscribes`, `leaving_before_the_confirmation_answers_the_waiting_join`, `resubscribing_waits_for_the_second_subscribes_confirmation`, `leaving_all_leaves_every_target_and_unknown_ones_do_nothing` |
+| 구독 장부: 탈퇴와 `0→1→0→1` | `only_the_last_user_leaving_unsubscribes`, `leaving_before_the_confirmation_answers_the_waiting_join`, `resubscribing_waits_for_the_second_subscribes_confirmation`, `leaving_all_leaves_every_channel_and_unknown_ones_do_nothing` |
 | 구독 장부: 거절 | `a_refusal_fails_the_join_it_answers` |
-| 구독 장부: 접두사 | `a_prefix_takes_every_channel_below_it_at_a_dot`, `a_user_on_a_channel_and_its_prefix_is_in_the_audience_once` |
+| 구독 장부: 채널마다 따로 | `a_member_hears_only_its_own_channel` |
 | 준비 상태 계산 | `ready_needs_every_listed_server_observed`, `an_empty_list_is_not_ready_and_unlisted_servers_do_not_count` |
 
 ### 팬아웃 (`tests/fanout.rs`)
@@ -256,7 +267,7 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 판정하는 원문 | 테스트 |
 | --- | --- |
 | 4장 "신규 join은 자기 구독 표지를 기다리고, 이미 활성인 같은 사용자의 재호출은 즉시 성공한다" | `the_subscription_rule_holds_through_a_real_event_server` |
-| 4장 "접두사 구독 … 프록시는 사용자 채널 묶음을 접두사 하나로 구독할 수 있다" | `a_prefix_subscription_takes_every_channel_below_it_through_a_real_event_server` |
+| 9.14 "난 채널이 특수한 이름이나 식별자를 갖길 원하지 않고 uuid7에 근접한 일관된 형식만 받아주길 원해" | `a_channel_that_is_not_a_uuid_v7_is_refused_through_a_real_event_server` |
 | 4장 "상향 연결은 서버마다 역할별로 하나다 … 모든 서버에 붙도록" (서버 2대, 양쪽 발송) | `a_fanout_on_two_servers_hands_members_what_either_dispatches` |
 | 4장 "조용히 끊긴 상향 연결이 `/health`에 정상으로 남지 않게 한다" (서버 하나 상실) | `an_upstream_that_goes_away_shows_in_health` |
 | 4장 "요청–응답은 구성원 하나다. 요청마다 응답 채널을 구독하고 … 오는 것을 클라이언트에 쓴다" (요청 2건 동시, 실제 워커) | `each_request_is_answered_on_its_own_channel_in_order` |

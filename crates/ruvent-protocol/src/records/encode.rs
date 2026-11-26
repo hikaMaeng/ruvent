@@ -1,6 +1,6 @@
 //! Messages → records, for one direction of one connection.
 
-use super::fields::{close, cut, open, put_bool, put_key, put_name, put_target, put_text, put_token, put_varint, DETAIL};
+use super::fields::{close, cut, open, put_bool, put_channel, put_key, put_text, put_token, put_varint, DETAIL};
 use super::*;
 use crate::dictionary::Outgoing;
 use crate::error::ProtocolError;
@@ -186,9 +186,9 @@ impl Encoder {
                 if let Some(linger) = hello.linger_ms {
                     put_varint(out, linger);
                 }
-                put_varint(out, hello.channels.len() as u64);
-                for channel in &hello.channels {
-                    put_text(out, channel.as_str());
+                put_varint(out, hello.types.len() as u64);
+                for kind in &hello.types {
+                    out.put_u16_le(*kind);
                 }
             }),
             Message::Welcome { version, features, welcome } => self.welcome(*version, *features, welcome),
@@ -213,24 +213,28 @@ impl Encoder {
     fn call(&mut self, call: &Call) {
         match call {
             Call::Register { seq, event } => self.event(REGISTER, |out, _| put_varint(out, seq.unwrap_or(0)), event, Layout::Request),
-            Call::Delete { seq, id, result, key } => self.plain(DELETE, |out, dictionary| {
+            Call::Delete { seq, id, result, key } => self.plain(DELETE, |out, _| {
                 put_varint(out, *seq);
                 out.put_slice(&id.0);
-                put_name(out, dictionary, result);
+                put_channel(out, result);
                 put_key(out, *key);
             }),
-            Call::Join { req, channel, types, lease_ms, dispatch } => self.plain(JOIN, |out, dictionary| {
+            Call::Join { req, channel, types, isolated, lease_ms, dispatch } => self.plain(JOIN, |out, _| {
                 put_varint(out, u64::from(*req));
-                put_name(out, dictionary, channel);
-                put_varint(out, types.len() as u64);
-                for name in types {
-                    put_name(out, dictionary, name);
+                put_bool(out, channel.is_some());
+                if let Some(channel) = channel {
+                    put_channel(out, channel);
                 }
+                put_varint(out, types.len() as u64);
+                for kind in types {
+                    out.put_u16_le(*kind);
+                }
+                put_bool(out, *isolated);
                 put_varint(out, *lease_ms);
                 put_bool(out, *dispatch);
             }),
-            Call::Window { channel, count, bytes } => self.plain(WINDOW, |out, dictionary| {
-                put_name(out, dictionary, channel);
+            Call::Window { join, count, bytes } => self.plain(WINDOW, |out, _| {
+                put_varint(out, u64::from(*join));
                 put_varint(out, u64::from(*count));
                 put_varint(out, *bytes);
             }),
@@ -260,14 +264,14 @@ impl Encoder {
                 out.put_slice(&id.0);
                 put_varint(out, *lease_ms);
             }),
-            Call::Subscribe { req, target, after } => self.plain(SUBSCRIBE, |out, dictionary| {
+            Call::Subscribe { req, channel, after } => self.plain(SUBSCRIBE, |out, _| {
                 put_varint(out, u64::from(*req));
-                put_target(out, dictionary, target);
+                put_channel(out, channel);
                 put_key(out, *after);
             }),
-            Call::Unsubscribe { req, target } => self.plain(UNSUBSCRIBE, |out, dictionary| {
+            Call::Unsubscribe { req, channel } => self.plain(UNSUBSCRIBE, |out, _| {
                 put_varint(out, u64::from(*req));
-                put_target(out, dictionary, target);
+                put_channel(out, channel);
             }),
             Call::Stats { req } => self.plain(STATS, |out, _| put_varint(out, u64::from(*req))),
             Call::Drain { req } => self.plain(DRAIN, |out, _| put_varint(out, u64::from(*req))),
@@ -283,20 +287,20 @@ impl Encoder {
                 put_text(out, cut(detail, DETAIL));
             }),
             Outbound::Committed { seq } => self.plain(COMMITTED, |out, _| put_varint(out, *seq)),
-            Outbound::Paused { channel } => self.plain(PAUSED, |out, dictionary| put_name(out, dictionary, channel)),
-            Outbound::Resumed { channel } => self.plain(RESUMED, |out, dictionary| put_name(out, dictionary, channel)),
+            Outbound::Paused { event_type } => self.plain(PAUSED, |out, _| out.put_u16_le(*event_type)),
+            Outbound::Resumed { event_type } => self.plain(RESUMED, |out, _| out.put_u16_le(*event_type)),
             Outbound::Joined { req } => self.plain(JOINED, |out, _| put_varint(out, u64::from(*req))),
             Outbound::Refused { req, reason } => self.plain(REFUSED, |out, _| {
                 put_varint(out, u64::from(*req));
                 out.put_u8(reason.code());
             }),
-            Outbound::Pending { channel } => self.plain(PENDING, |out, dictionary| put_name(out, dictionary, channel)),
+            Outbound::Pending { join } => self.plain(PENDING, |out, _| put_varint(out, u64::from(*join))),
             Outbound::Assign(assignment) => self.assignment(ASSIGN, None, assignment),
             Outbound::Claimed { req, assignment } => self.assignment(CLAIMED, Some(*req), assignment),
-            Outbound::Subscribed { req, target, backlog, more } => {
-                self.plain(SUBSCRIBED, |out, dictionary| {
+            Outbound::Subscribed { req, channel, backlog, more } => {
+                self.plain(SUBSCRIBED, |out, _| {
                     put_varint(out, u64::from(*req));
-                    put_target(out, dictionary, target);
+                    put_channel(out, channel);
                     put_bool(out, *more);
                     put_varint(out, backlog.len() as u64);
                 });
@@ -307,9 +311,9 @@ impl Encoder {
             Outbound::Unsubscribed { req } => self.plain(UNSUBSCRIBED, |out, _| put_varint(out, u64::from(*req))),
             Outbound::Notice(event) => self.event(NOTICE, |_, _| {}, event, Layout::Notice),
             Outbound::Delivery(event) => self.event(DELIVERY, |_, _| {}, event, Layout::Delivery),
-            Outbound::StatsReply { req, stats } => self.plain(STATS_REPLY, |out, dictionary| {
+            Outbound::StatsReply { req, stats } => self.plain(STATS_REPLY, |out, _| {
                 put_varint(out, u64::from(*req));
-                stats::encode(stats, dictionary, out);
+                stats::encode(stats, out);
             }),
             Outbound::Draining { req } => self.plain(DRAINING, |out, _| put_varint(out, u64::from(*req))),
         }
@@ -336,7 +340,7 @@ pub fn validate(message: &Message, max_body: usize) -> Result<(), ProtocolError>
     }
     match message {
         Message::Hello { token, hello, .. } => {
-            let head = 64 + token.len() + hello.channels.iter().map(|channel| channel.as_str().len() + 3).sum::<usize>();
+            let head = 64 + token.len() + hello.types.len() * 2;
             if token.len() > TEXT || head > HEAD {
                 return Err(ProtocolError::TooLarge(head));
             }
@@ -355,7 +359,7 @@ pub fn validate(message: &Message, max_body: usize) -> Result<(), ProtocolError>
                 check_event(event, Layout::Request, max_body)?;
             }
         }
-        Message::Call(Call::Join { types, .. }) if types.len() > TEXT / 4 => return Err(ProtocolError::TooLarge(types.len())),
+        Message::Call(Call::Join { types, .. }) if types.len() > TEXT / 2 => return Err(ProtocolError::TooLarge(types.len())),
         Message::Outbound(Outbound::Assign(assignment) | Outbound::Claimed { assignment, .. }) => check_event(&assignment.event, Layout::Assigned, max_body)?,
         Message::Outbound(Outbound::Subscribed { backlog, .. }) => {
             for event in backlog {

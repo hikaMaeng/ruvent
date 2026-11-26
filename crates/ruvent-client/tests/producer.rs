@@ -3,7 +3,7 @@
 
 mod support;
 
-use ruvent::{ByeReason, ChannelRule, ChannelSettings, Engine, EngineConfig, Envelope, EventId, Hello, MaxBacklog, Methods, Pattern, Role};
+use ruvent::{ByeReason, Engine, EngineConfig, Envelope, EventId, Hello, MaxBacklog, Methods, Role, TypeRule, TypeSet, TypeSettings};
 use ruvent_client::link::{Connector, Tcp};
 use ruvent_client::producer::{Producer, ProducerConfig, ProducerError};
 use ruvent_client::servers::Servers;
@@ -12,7 +12,11 @@ use std::time::Duration;
 use support::*;
 
 fn job(channel: &str, index: usize) -> Envelope {
-    Envelope::claimable(channel, "do", format!("{index}").into_bytes()).with_id(EventId::new_v7())
+    job_of(channel, 1, index)
+}
+
+fn job_of(channel: &str, event_type: u16, index: usize) -> Envelope {
+    Envelope::claimable(ch(channel), event_type, format!("{index}").into_bytes()).with_id(EventId::new_v7())
 }
 
 /// S8, B2: the buffer holds only what the cumulative `Committed` has not
@@ -89,23 +93,23 @@ async fn a_restart_with_the_journal_resumes_and_one_without_it_renumbers() {
     assert_eq!(producer.refused(), None);
 }
 
-/// 2.6, 2.9: `Paused{channel}` holds that channel's sends to that server;
-/// another channel goes on; `Resumed` lets the held send go.
+/// 2.6, 2.9: `Paused{type}` holds that root type's sends to that server;
+/// another type goes on, on the same channel too (plan 9.15: the channel
+/// says nothing about who floods); `Resumed` lets the held send go.
 #[tokio::test]
-async fn a_paused_channel_holds_only_its_own_sends() {
+async fn a_paused_type_holds_only_its_own_sends() {
+    const SLOW: u16 = 7;
+    const FAST: u16 = 8;
     let mut config = EngineConfig::default();
-    config
-        .channels
-        .rules
-        .insert(0, ChannelRule { pattern: Pattern("slow".into()), settings: ChannelSettings { max_backlog: Some(MaxBacklog { count: 3, bytes: u64::MAX }), ..ChannelSettings::default() } });
+    config.types.rules.insert(0, TypeRule { types: TypeSet::of([SLOW]), settings: TypeSettings { max_backlog: Some(MaxBacklog { count: 3, bytes: u64::MAX }), ..TypeSettings::default() } });
     let (local, servers, engines) = locals(1, config).await;
     let producer = Producer::start(local, &servers, ProducerConfig::default());
-    // Fill `slow` until a send stays waiting.
+    // Fill `SLOW` until a send stays waiting.
     let mut held = None;
     for index in 0..64 {
         let sending = {
             let producer = producer.clone();
-            tokio::spawn(async move { producer.send(job("slow", index)).await })
+            tokio::spawn(async move { producer.send(job_of("work", SLOW, index)).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         if !sending.is_finished() {
@@ -114,15 +118,15 @@ async fn a_paused_channel_holds_only_its_own_sends() {
         }
         sending.await.unwrap().unwrap();
     }
-    let held = held.expect("a send to the paused channel waits");
+    let held = held.expect("a send of the paused type waits");
     for index in 0..20 {
-        tokio::time::timeout(Duration::from_secs(2), producer.send(job("fast", index))).await.expect("another channel goes on").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), producer.send(job_of("work", FAST, index))).await.expect("another type goes on, on the same channel").unwrap();
     }
     assert!(!held.is_finished(), "still held");
-    // Drain `slow`: below 7/8 of its share at the pause it resumes.
+    // Drain `SLOW`: below 7/8 of its share at the pause it resumes.
     let (worker, mut inbox) = ruvent::connect(&engines[0], Hello { role: Role::Work, ..Hello::worker("w") }, 1024).await.unwrap();
-    worker.join("slow".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    worker.window("slow".into(), 100, 0).await.unwrap();
+    let worker_join = worker.join(None, vec![SLOW], false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(worker_join, 100, 0).await.unwrap();
     let drained = tokio::spawn(async move {
         while let Some(incoming) = inbox.recv().await {
             if let ruvent::Incoming::Assign(assignment) = incoming {

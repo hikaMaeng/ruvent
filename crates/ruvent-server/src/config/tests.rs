@@ -7,21 +7,22 @@ fn the_example_configuration_parses_into_grants_and_every_section() {
     let engine = config.engine_config().unwrap();
     assert_eq!(engine.durability, Durability::Strict);
     let grants = engine.grants.as_ref().unwrap();
-    assert!(grants["workers"].allows(Method::Claim, "orders.create"));
-    assert!(!grants["workers"].allows(Method::Delete, "orders.create"));
-    assert!(grants["ops"].allows(Method::Operate, "anything"));
+    assert!(grants["workers"].allows(Method::Claim, 10));
+    assert!(grants["workers"].allows(Method::Claim, 101));
+    assert!(!grants["workers"].allows(Method::Claim, 50), "outside its type set");
+    assert!(!grants["workers"].allows(Method::Delete, 10));
+    assert!(grants["ops"].allows(Method::Operate, 9999), "no types listed: every type");
     assert!(grants["proxy"].delegate);
     assert_eq!(config.credentials().unwrap().credential("proxy-secret-change-me"), Some("proxy"));
     assert_eq!(engine.memory.limit, Some(8 << 30));
     assert_eq!(engine.storage.disk_capacity, Some(100 << 30));
-    assert_eq!(engine.channels.settings("jobs.render").isolate_after, Some(3));
-    assert!(engine.channels.settings("jobs.render").serialize_group);
-    assert!(engine.channels.settings("proxy.x").volatile);
-    assert_eq!(engine.channels.settings("orders.create").isolate_after, Some(5));
-    // The built-in rule stays: isolation channels are not isolated again. No
-    // channel is volatile unless the file says so (there is no reply-channel rule).
-    assert!(engine.channels.settings("isolated.jobs").isolate_after.is_none());
-    assert!(!engine.channels.settings("reply.r").volatile);
+    assert_eq!(engine.types.settings(20).isolate_after, Some(3));
+    assert!(engine.types.settings(29).serialize_group);
+    assert!(engine.types.settings(150).volatile);
+    assert_eq!(engine.types.settings(10).isolate_after, Some(5));
+    // No type is volatile unless the file says so.
+    assert!(!engine.types.settings(10).volatile);
+    assert!(engine.snapshot.as_ref().unwrap().wants(11) && !engine.snapshot.as_ref().unwrap().wants(150));
     let options = config.options();
     assert_eq!((options.unsent, options.close, options.keepalive.retries), (256 << 20, Duration::from_secs(5), 3));
 }
@@ -35,7 +36,7 @@ fn a_minimal_configuration_takes_every_default() {
     assert_eq!((engine.ack_every, engine.max_follow_ups, engine.pause_allowance, engine.stats_top), (defaults.ack_every, defaults.max_follow_ups, defaults.pause_allowance, defaults.stats_top));
     assert_eq!(engine.memory, defaults.memory);
     assert_eq!(engine.storage, defaults.storage);
-    assert_eq!(engine.channels, defaults.channels);
+    assert_eq!(engine.types, defaults.types);
     assert_eq!(engine.producers, defaults.producers);
     let options = config.options();
     let server = ServerOptions::default();
@@ -56,4 +57,8 @@ fn bad_configurations_are_refused_with_a_reason() {
     assert!(refuse(r#"{"listen":"x","memory":{"reserve":2},"credentials":[{"name":"a","token":"t"}]}"#).contains("fraction"));
     assert!(refuse(r#"{"listen":"x","server_id":"nope","credentials":[{"name":"a","token":"t"}]}"#).contains("server_id"));
     assert!(refuse(r#"{"listen":"x","compaction":{},"credentials":[{"name":"a","token":"t"}]}"#).contains("unknown field"));
+    assert!(refuse(r#"{"listen":"x","credentials":[{"name":"a","token":"t","types":["9-3"]}]}"#).contains("type set item"));
+    assert!(refuse(r#"{"listen":"x","types":{"rules":[{"types":["x"],"volatile":true}]},"credentials":[{"name":"a","token":"t"}]}"#).contains("types.rules[0]"));
+    // Channel patterns are gone with channel names.
+    assert!(refuse(r#"{"listen":"x","credentials":[{"name":"a","token":"t","channels":["a.*"]}]}"#).contains("unknown field"));
 }

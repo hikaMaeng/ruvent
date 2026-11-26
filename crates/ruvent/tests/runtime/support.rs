@@ -1,6 +1,6 @@
 //! Journals that can be held, failed or watched, and small helpers.
 
-use ruvent::{async_trait, connect, Batch, Bytes, Client, Engine, Envelope, Hello, Inbox, Incoming, Journal, Written};
+use ruvent::{async_trait, connect, Batch, Bytes, Channel, Client, Engine, EngineConfig, Envelope, Hello, Inbox, Incoming, Journal, TypeRule, TypeSet, TypeSettings, Written};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -59,8 +59,29 @@ pub fn scratch(name: &str) -> PathBuf {
     directory
 }
 
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
+}
+
+/// The tests' volatile type: never journaled (no type is volatile by default).
+pub const VOLATILE: u16 = 90;
+
+/// An engine configuration where [`VOLATILE`] is a volatile type.
+pub fn with_volatile(mut config: EngineConfig) -> EngineConfig {
+    config.types.rules.insert(0, TypeRule { types: TypeSet::of([VOLATILE]), settings: TypeSettings { volatile: true, ..TypeSettings::default() } });
+    config
+}
+
+/// A claimable event of type 1 on the channel labelled `channel`.
 pub fn work(channel: &str) -> Envelope {
-    Envelope::claimable(channel, "do", Bytes::from_static(b"p"))
+    Envelope::claimable(ch(channel), 1, Bytes::from_static(b"p"))
 }
 
 pub async fn producer(engine: &Engine) -> (Client, Inbox) {

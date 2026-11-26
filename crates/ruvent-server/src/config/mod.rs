@@ -6,11 +6,11 @@
 //!   "journal": "data/journal",
 //!   "durability": "strict",
 //!   "credentials": [
-//!     { "name": "workers", "token": "…", "methods": ["claim", "complete", "register_dispatch"], "channels": ["orders.*"] },
+//!     { "name": "workers", "token": "…", "methods": ["claim", "complete", "register_dispatch"], "types": ["10-19", 101] },
 //!     { "name": "ops", "token": "…", "methods": ["operate"] }
 //!   ],
 //!   "memory": { "limit": 8589934592 },
-//!   "channels": { "rules": [ { "pattern": "audit.*", "isolate_after": 3 } ] },
+//!   "types": { "rules": [ { "types": ["30-39"], "isolate_after": 3 } ] },
 //!   "connection": { "keepalive": { "idle_ms": 15000 } }
 //! }
 //! ```
@@ -18,12 +18,14 @@
 //! Everything but `listen` and `credentials` has a default, and every
 //! default is the engine's or the server's own (plan chapter 8). `journal`
 //! absent means nothing is written to disk. A credential without `methods`
-//! may use all eight; without `channels` it may use every channel. The
+//! may use all eight; without `types` it may use every type. A type set is
+//! a list of items: a number, `"A-B"`, or `"*"`. Channels appear nowhere: a
+//! channel is a UUIDv7 the server reads nothing from (plan 9.15). The
 //! sections and their keys are in the crate's README.
 
 use crate::connection::socket::Keepalive;
 use crate::connection::{Credentials, ServerOptions};
-use ruvent::{ChannelConfig, ChannelRule, ChannelSettings, Durability, EngineConfig, EventId, Grant, Grants, MaxBacklog, MemoryConfig, Method, Pattern, ProducerConfig, SnapshotConfig, StorageConfig};
+use ruvent::{Durability, EngineConfig, EventId, Grant, Grants, MaxBacklog, MemoryConfig, Method, ProducerConfig, SnapshotConfig, StorageConfig, TypeConfig, TypeRule, TypeSet, TypeSettings};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -53,7 +55,7 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageJson,
     #[serde(default)]
-    pub channels: ChannelsJson,
+    pub types: TypesJson,
     #[serde(default)]
     pub connection: ConnectionJson,
     #[serde(default)]
@@ -69,9 +71,9 @@ pub struct CredentialConfig {
     /// `complete`, `delete`, `subscribe`, `unsubscribe`, `operate`. Absent: all.
     #[serde(default)]
     pub methods: Option<Vec<String>>,
-    /// Channel patterns: an exact name, a prefix ending in `*`, or `*`. Absent: `["*"]`.
+    /// The types it may use (a type set). Absent: every type.
     #[serde(default)]
-    pub channels: Option<Vec<String>>,
+    pub types: Option<Vec<TypeItem>>,
     /// May register on behalf of an end user.
     #[serde(default)]
     pub delegate: bool,
@@ -140,25 +142,42 @@ pub struct StorageJson {
     pub checkpoint_queue: Option<usize>,
 }
 
-/// B6, B9, B17, B26, volatile channels.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChannelsJson {
-    /// The prefix of an isolation channel. Default `isolated.`.
-    pub isolation_prefix: Option<String>,
-    /// Overrides of the defaults every channel starts from.
-    #[serde(default)]
-    pub default: ChannelJson,
-    /// Rules by pattern; the first match decides. Checked before the built-in
-    /// rule (`isolated.*` never isolated).
-    #[serde(default)]
-    pub rules: Vec<ChannelRuleJson>,
+/// One item of a type set: a number, `"A-B"`, `"N"` or `"*"`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TypeItem {
+    Number(u16),
+    Text(String),
 }
 
-/// One channel's settings; an absent key keeps the default.
+/// A type set from its items.
+fn type_set(what: &str, items: &[TypeItem]) -> Result<TypeSet, String> {
+    let texts: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            TypeItem::Number(number) => number.to_string(),
+            TypeItem::Text(text) => text.clone(),
+        })
+        .collect();
+    TypeSet::parse(&texts).map_err(|error| format!("{what}: {error}"))
+}
+
+/// B6, B9, B17, B26, volatile types.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChannelJson {
+pub struct TypesJson {
+    /// Overrides of the defaults every type starts from.
+    #[serde(default)]
+    pub default: TypeJson,
+    /// Rules by type set; the first that holds a type decides.
+    #[serde(default)]
+    pub rules: Vec<TypeRuleJson>,
+}
+
+/// One type's settings; an absent key keeps the default.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypeJson {
     /// B6: the failure count that isolates. `0`: never.
     pub isolate_after: Option<u16>,
     pub isolated_keep_ms: Option<u64>,
@@ -177,10 +196,10 @@ pub struct MaxBacklogJson {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ChannelRuleJson {
-    pub pattern: String,
+pub struct TypeRuleJson {
+    pub types: Vec<TypeItem>,
     #[serde(flatten)]
-    pub settings: ChannelJson,
+    pub settings: TypeJson,
 }
 
 /// `ServerOptions`.
@@ -220,9 +239,8 @@ pub struct KeepaliveJson {
 #[serde(deny_unknown_fields)]
 pub struct SnapshotJson {
     pub directory: PathBuf,
-    pub channels: Vec<String>,
-    #[serde(default)]
-    pub types: Vec<String>,
+    /// The types to collect, on every channel (a type set). Empty: none.
+    pub types: Vec<TypeItem>,
     #[serde(default)]
     pub max_events: Option<usize>,
     #[serde(default)]
@@ -257,9 +275,9 @@ fn fraction(name: &str, value: Option<f64>, default: f64) -> Result<f64, String>
     Ok(value)
 }
 
-impl ChannelJson {
-    fn apply(&self, base: &ChannelSettings) -> ChannelSettings {
-        ChannelSettings {
+impl TypeJson {
+    fn apply(&self, base: &TypeSettings) -> TypeSettings {
+        TypeSettings {
             isolate_after: self.isolate_after.map_or(base.isolate_after, |count| (count > 0).then_some(count)),
             isolated_keep: ms(self.isolated_keep_ms, base.isolated_keep),
             isolate_expired: self.isolate_expired.unwrap_or(base.isolate_expired),
@@ -304,30 +322,33 @@ impl Config {
                 Some(methods) => methods.iter().map(|name| method(name)).collect::<Result<Vec<_>, _>>()?,
                 None => Method::ALL.to_vec(),
             };
-            let channels = credential.channels.clone().unwrap_or_else(|| vec!["*".into()]).into_iter().map(Pattern).collect();
-            grants.insert(credential.name.clone(), Grant { methods, channels, delegate: credential.delegate });
+            let types = match &credential.types {
+                Some(items) => type_set(&format!("credential {:?} types", credential.name), items)?,
+                None => TypeSet::all(),
+            };
+            grants.insert(credential.name.clone(), Grant { methods, types, delegate: credential.delegate });
         }
         Ok(grants)
     }
 
-    fn channels(&self) -> ChannelConfig {
-        let built_in = ChannelConfig::default();
-        let default = self.channels.default.apply(&built_in.default);
-        let mut rules: Vec<ChannelRule> = self.channels.rules.iter().map(|rule| ChannelRule { pattern: Pattern(rule.pattern.clone()), settings: rule.settings.apply(&default) }).collect();
-        // The built-in rules keep their own meaning on top of the configured default.
-        for rule in built_in.rules {
-            let settings = ChannelSettings { isolate_after: rule.settings.isolate_after, volatile: rule.settings.volatile || default.volatile, ..default.clone() };
-            rules.push(ChannelRule { pattern: rule.pattern, settings });
+    fn types(&self) -> Result<TypeConfig, String> {
+        let default = self.types.default.apply(&TypeConfig::default().default);
+        let mut rules = Vec::with_capacity(self.types.rules.len());
+        for (at, rule) in self.types.rules.iter().enumerate() {
+            rules.push(TypeRule { types: type_set(&format!("types.rules[{at}]"), &rule.types)?, settings: rule.settings.apply(&default) });
         }
-        ChannelConfig { default, rules, isolation_prefix: self.channels.isolation_prefix.clone().unwrap_or(built_in.isolation_prefix) }
+        Ok(TypeConfig { default, rules })
     }
 
     /// The engine configuration this file describes.
     pub fn engine_config(&self) -> Result<EngineConfig, String> {
         let defaults = EngineConfig::default();
-        let snapshot = self.snapshot.as_ref().map(|snapshot| {
-            let mut config = SnapshotConfig::new(snapshot.directory.clone(), snapshot.channels.iter().cloned().map(Pattern).collect());
-            config.types = snapshot.types.clone();
+        let snapshot = match self.snapshot.as_ref() {
+            Some(snapshot) => Some((snapshot, type_set("snapshot.types", &snapshot.types)?)),
+            None => None,
+        };
+        let snapshot = snapshot.map(|(snapshot, types)| {
+            let mut config = SnapshotConfig::new(snapshot.directory.clone(), types);
             if let Some(max_events) = snapshot.max_events {
                 config.max_events = max_events;
             }
@@ -395,7 +416,7 @@ impl Config {
             memory,
             pause_allowance: engine.pause_allowance.unwrap_or(defaults.pause_allowance),
             stats_top: engine.stats_top.unwrap_or(defaults.stats_top),
-            channels: self.channels(),
+            types: self.types()?,
             storage,
         })
     }

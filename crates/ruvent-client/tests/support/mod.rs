@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use ruvent::{Engine, EngineConfig, Envelope, EventId, Hello, Methods, SegmentLog, Stats};
+use ruvent::{Channel, Engine, EngineConfig, Envelope, EventId, Hello, Methods, SegmentLog, Stats};
 use ruvent_client::link::{Local, Tcp};
 use ruvent_client::servers::{Server, Servers};
 use ruvent_server::{serve, Credentials, ServerOptions};
@@ -18,6 +18,17 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 pub const TOKEN: &str = "svc-token";
+
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
+}
 /// Generous: a broken test fails instead of hanging.
 pub const WAIT: Duration = Duration::from_secs(20);
 
@@ -85,7 +96,7 @@ pub async fn stats(engine: &Engine) -> Stats {
 }
 
 /// Registers `count` claimable events on `engine` directly; returns their ids.
-pub async fn preload(engine: &Engine, channel: &str, event_type: &str, count: usize) -> Vec<EventId> {
+pub async fn preload(engine: &Engine, channel: Channel, event_type: u16, count: usize) -> Vec<EventId> {
     let (client, _inbox) = ruvent::connect(engine, Hello::producer("loader"), 16).await.unwrap();
     let mut ids = Vec::new();
     let mut last = 0;

@@ -5,8 +5,8 @@
 //! envelope is what goes in and out.
 //!
 //! ```text
-//!  fixed head, 28 bytes (every event)
-//!  ┌──────────── id 16 ────────────┬─ channel 4 ─┬── type 4 ──┬flags 2┬failures 2┐
+//!  fixed head, 38 bytes (every event)
+//!  ┌──── id 16 ────┬── channel 16 ──┬type 2┬flags 2┬failures 2┐
 //!  work key (claimable, when the server sends or journals it)
 //!  ┌── generation 4 · arrival varint ──┐
 //!  optional fields (only those whose flag bit is set)
@@ -16,6 +16,28 @@
 //!
 //! The byte layout is [`codec`]. Which of these blocks a record carries is
 //! fixed by the record kind, [`codec::Layout`].
+//!
+//! ## Why the type is here
+//!
+//! The envelope holds only what the server acts on. The type is a 16-bit
+//! number the server routes claimable work by: a worker joins a channel, a
+//! set of types, or both (`Call::Join`), so one worker can take one kind of
+//! request from many channels — a channel per request — without knowing the
+//! channels in advance. The server never reads what a type means; projects
+//! number their own (plan 9.14). Dispatch is routed by channel alone.
+//!
+//! The type is also what the server's settings and grants are keyed by:
+//! which credential may register, claim or read an event, whether it is
+//! journaled, when it is isolated, how much of it may wait (plan 9.15).
+//! Type 0 is the server's own: delete outcomes ([`crate::delete_outcome`]).
+//!
+//! ## The channel is an id, not a name
+//!
+//! A channel is a 16-byte UUIDv7 ([`Channel`]): a stream of events, typically
+//! one per request, made by whoever starts the stream. It carries no meaning
+//! the server reads — no hierarchy, no prefix, no pattern — so a fresh channel
+//! per request costs no dictionary entry and no configuration, and leaves
+//! nothing behind once its events are gone. Anything else is refused.
 //!
 //! ## Times
 //!
@@ -77,6 +99,52 @@ impl FromStr for EventId {
     }
 }
 
+/// A channel: a UUIDv7 in RFC 9562 octet order (see the module's "The
+/// channel is an id, not a name"). The server compares it and never reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct Channel(pub [u8; 16]);
+
+impl Channel {
+    /// A fresh channel: a UUIDv7.
+    pub fn new() -> Self {
+        Channel(uuid::Uuid::now_v7().into_bytes())
+    }
+
+    /// Whether the server accepts it: version 7, RFC 9562 variant.
+    pub fn is_valid(&self) -> bool {
+        self.0[6] >> 4 == 7 && self.0[8] >> 6 == 0b10
+    }
+}
+
+impl From<EventId> for Channel {
+    /// The channel with the same 16 bytes: a request's own id as its stream.
+    fn from(id: EventId) -> Self {
+        Channel(id.0)
+    }
+}
+
+impl fmt::Display for Channel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&uuid::Uuid::from_bytes(self.0).hyphenated(), f)
+    }
+}
+
+impl fmt::Debug for Channel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl FromStr for Channel {
+    type Err = uuid::Error;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Ok(Channel(uuid::Uuid::parse_str(text)?.into_bytes()))
+    }
+}
+
+/// The type of the server's own events: delete outcomes. No producer may register it.
+pub const SERVER_TYPE: u16 = 0;
+
 /// The name of one retransmission buffer: a producer (2.3). 16 bytes.
 pub type ProducerId = [u8; 16];
 
@@ -132,15 +200,18 @@ impl Digest {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Envelope {
     pub id: EventId,
-    pub channel: Name,
-    /// The event's type, called `type` in the layout.
-    pub event_type: Name,
+    pub channel: Channel,
+    /// The event's type: a number its project defines, routed by (see the module's "Why the type is here").
+    pub event_type: u16,
     pub kind: Kind,
     /// Failures counted against this event: lease expiries and releases that
     /// said "this event failed". Saturates at 65,535.
     pub failures: u16,
     /// Set by the server on claimable events.
     pub key: Option<WorkKey>,
+    /// Set by the server: the event reached its type's failure threshold and
+    /// waits only for joins that ask for isolated events (B6).
+    pub isolated: bool,
     /// The registering connection's service credential. Set by the server only.
     pub principal: Option<Name>,
     /// The end user a proxy registered this on behalf of.
@@ -159,14 +230,15 @@ fn millis(duration: Duration) -> u64 {
 }
 
 impl Envelope {
-    fn draft(kind: Kind, channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> Self {
+    fn draft(kind: Kind, channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> Self {
         Envelope {
             id: EventId::NIL,
-            channel: channel.into(),
-            event_type: event_type.into(),
+            channel,
+            event_type,
             kind,
             failures: 0,
             key: None,
+            isolated: false,
             principal: None,
             delegate: None,
             not_before: None,
@@ -177,12 +249,12 @@ impl Envelope {
     }
 
     /// A claimable event to register; the server assigns the id unless [`Envelope::with_id`] sets one.
-    pub fn claimable(channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> Self {
+    pub fn claimable(channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> Self {
         Self::draft(Kind::Claimable, channel, event_type, payload)
     }
 
     /// A dispatch event to register.
-    pub fn dispatch(channel: impl Into<Name>, event_type: impl Into<Name>, payload: impl Into<Bytes>) -> Self {
+    pub fn dispatch(channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> Self {
         Self::draft(Kind::Dispatch, channel, event_type, payload)
     }
 
@@ -218,6 +290,7 @@ impl Envelope {
         let mut flags = 0;
         for (present, bit) in [
             (self.kind == Kind::Dispatch, codec::KIND),
+            (self.isolated, codec::ISOLATED),
             (self.principal.is_some(), codec::PRINCIPAL),
             (self.delegate.is_some(), codec::DELEGATE),
             (self.not_before.is_some(), codec::NOT_BEFORE),
@@ -231,10 +304,11 @@ impl Envelope {
         flags
     }
 
-    /// Every name this envelope carries in `layout`, in encoding order.
+    /// Every name this envelope carries in `layout`, in encoding order: the
+    /// credential and the end user, the only names left (the channel is an id).
     pub fn names(&self, layout: codec::Layout) -> impl Iterator<Item = &Name> {
         let optional = layout.has_optional();
-        [Some(&self.channel), Some(&self.event_type)].into_iter().chain([self.principal.as_ref(), self.delegate.as_ref()].into_iter().map(move |name| if optional { name } else { None })).flatten()
+        [self.principal.as_ref(), self.delegate.as_ref()].into_iter().filter(move |_| optional).flatten()
     }
 
     /// The same event as a notice: the head and the work key, nothing else.

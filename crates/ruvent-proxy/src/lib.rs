@@ -1,7 +1,7 @@
 //! The skeleton of a proxy: the event servers' dispatch fan-out (plan 4장).
 //!
 //! A proxy connects to every event server of a list, holds one upstream
-//! subscription per channel (or prefix) per server however many members it
+//! subscription per channel per server however many members it
 //! serves, and hands each event to its members. A server's dispatch cost is
 //! then proportional to the number of proxies, not of users.
 //!
@@ -15,7 +15,7 @@
 //! upstream and the subscription rule.
 //!
 //! ```no_run
-//! use ruvent_proxy::{Fanout, FanoutConfig, Servers, Target, Tcp, Upstream};
+//! use ruvent_proxy::{Channel, Fanout, FanoutConfig, Servers, Tcp, Upstream};
 //! use std::sync::Arc;
 //!
 //! # async fn run() -> Result<(), ruvent_proxy::SubscribeError> {
@@ -23,7 +23,8 @@
 //! let fanout = Fanout::start(FanoutConfig::default(), upstream);
 //! // One per client connection of the program's own protocol:
 //! let (member, mut events) = fanout.attach().await?;
-//! member.subscribe(Target::Channel("chat.room-7".into())).await?; // after the program's own check
+//! let channel = Channel::new(); // the request's own stream, or one the client was told
+//! member.subscribe(channel).await?; // after the program's own check
 //! while let Some(event) = events.recv().await {
 //!     // Write `event` to the client in the program's protocol.
 //!     let _ = event;
@@ -47,5 +48,5 @@ pub mod upstream;
 
 pub use fanout::{Fanout, FanoutConfig, Member, MemberId, SubscribeError};
 pub use health::{Health, ServerHealth};
-pub use ruvent::{Envelope, Target};
+pub use ruvent::{Channel, Envelope};
 pub use upstream::{Connector, Local, Server, ServerList, Servers, Tcp, Upstream};

@@ -5,12 +5,12 @@
 //!
 //! | state | key | scope | lifetime | bound | cleared by |
 //! | --- | --- | --- | --- | --- | --- |
-//! | live link and joins | join request number → channel | one connection | welcome ~ disconnection | joined channels | the owner ([`WorkLine::down`]) |
+//! | live link and joins | join request number ↔ the owner's service index | one connection | welcome ~ disconnection | the services | the owner ([`WorkLine::down`]) |
 //! | completion buffer | (server, seq) | work line | handed over ~ `Committed` | S8 bytes; past it completions are held unnumbered (the server frees no window slot until it has them, so at most the window) | `Committed`, `Welcome.resume` |
 
 use crate::buffer::Unacked;
 use crate::line::Line;
-use ruvent::{Call, ClaimToken, Envelope, EventId, Link, Name, Welcome};
+use ruvent::{Call, ClaimToken, Envelope, EventId, Link, Welcome};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,8 +36,11 @@ impl Completion {
 pub(crate) struct Live {
     pub epoch: u64,
     pub link: Arc<dyn Link>,
-    /// Joins asked and not yet answered: request number → the owner's channel index.
+    /// Joins asked and not yet answered: request number → the owner's service index.
     pub asked: HashMap<u32, usize>,
+    /// Joins in effect: service index → the join's name (its `Join`'s req), and back.
+    pub joins: HashMap<usize, u32>,
+    pub services: HashMap<u32, usize>,
 }
 
 pub(crate) struct WorkLine {
@@ -63,7 +66,7 @@ impl WorkLine {
     pub(crate) async fn up(&mut self, epoch: u64, link: Arc<dyn Link>, welcome: &Welcome) {
         let _ = self.buffer.resume(welcome.resume);
         let resend: Vec<Call> = self.buffer.iter().map(|entry| entry.item.call(entry.seq)).collect();
-        self.live = Some(Live { epoch, link: link.clone(), asked: HashMap::new() });
+        self.live = Some(Live { epoch, link: link.clone(), asked: HashMap::new(), joins: HashMap::new(), services: HashMap::new() });
         for call in resend {
             if link.send(call).await.is_err() {
                 return;
@@ -91,18 +94,39 @@ impl WorkLine {
         }
     }
 
-    /// Joins `channel` for `types`; the answer names `index`.
-    pub(crate) async fn join(&mut self, index: usize, channel: Name, types: Vec<Name>, lease: Duration, dispatch: bool) {
+    /// Joins `channel` (`None`: every channel) for `types`, isolated events
+    /// or the others; the answer names `index`.
+    pub(crate) async fn join(&mut self, index: usize, selection: crate::worker::Selection, lease: Duration, dispatch: bool) {
+        let crate::worker::Selection { channel, types, isolated } = selection;
         let req = self.next_req;
         self.next_req = self.next_req.wrapping_add(1).max(1);
         let Some(live) = &mut self.live else { return };
         live.asked.insert(req, index);
-        let _ = live.link.send(Call::Join { req, channel, types, lease_ms: millis(lease), dispatch }).await;
+        let _ = live.link.send(Call::Join { req, channel, types, isolated, lease_ms: millis(lease), dispatch }).await;
     }
 
-    /// The channel index a `Joined` or `Refused` answers.
-    pub(crate) fn answered(&mut self, req: u32) -> Option<usize> {
-        self.live.as_mut().and_then(|live| live.asked.remove(&req))
+    /// The service index a `Joined` or `Refused` answers. With `joined`, the
+    /// join is in effect under the name `req`.
+    pub(crate) fn answered(&mut self, req: u32, joined: bool) -> Option<usize> {
+        let live = self.live.as_mut()?;
+        let index = live.asked.remove(&req)?;
+        if joined {
+            if let Some(old) = live.joins.insert(index, req) {
+                live.services.remove(&old);
+            }
+            live.services.insert(req, index);
+        }
+        Some(index)
+    }
+
+    /// The name of the service's join on this connection, once it is in effect.
+    pub(crate) fn join_of(&self, index: usize) -> Option<u32> {
+        self.live.as_ref().and_then(|live| live.joins.get(&index).copied())
+    }
+
+    /// The service a join name belongs to.
+    pub(crate) fn service_of(&self, join: u32) -> Option<usize> {
+        self.live.as_ref().and_then(|live| live.services.get(&join).copied())
     }
 
     /// Numbers and sends a completion, or holds it while the buffer is full.

@@ -335,21 +335,21 @@ impl Engine {
     }
 
     /// Whether a work connection should receive a follow-up's body of `len`
-    /// bytes on `channel` to disk instead of memory (2.6, items 4 and 5):
+    /// bytes of `event_type` to disk instead of memory (2.6, items 4 and 5):
     ///
-    /// * a durable channel, once managed memory is at the high watermark;
-    /// * a volatile channel, only once memory past the reserve would be used
+    /// * a durable type, once managed memory is at the high watermark;
+    /// * a volatile type, only once memory past the reserve would be used
     ///   (B15: the event stays volatile, its body on disk until a restart).
     ///
     /// When it says yes, read the body through [`Engine::spool`] and hand the
     /// [`crate::journal::Spooled`] with the completion (`Call::Complete::spooled`).
     /// Always `false` without a spool (no segment log).
-    pub fn body_to_disk(&self, channel: &str, len: u64) -> bool {
+    pub fn body_to_disk(&self, event_type: u16, len: u64) -> bool {
         if self.spool.is_none() {
             return false;
         }
         let pressure = self.gauge.get();
-        let durable = self.journaled && !self.config.channels.settings(channel).volatile;
+        let durable = self.journaled && !self.config.types.settings(event_type).volatile;
         if durable {
             pressure.memory_used.saturating_add(len) >= pressure.memory_high
         } else {

@@ -5,18 +5,19 @@
 //! (`isolate_after`, B6), the single place a failure count is compared.
 //!
 //! Every value of the plan's chapter 8 is a field here with its default, not
-//! a constant (v4.6). Channel-level values are [`ChannelSettings`], which a
-//! channel pattern can override ([`ChannelConfig`]).
+//! a constant (v4.6). Type-level values are [`TypeSettings`], which a type
+//! set can override ([`TypeConfig`]); grants are by type too. A channel is an
+//! id the server reads nothing from (plan 9.15).
 
-mod channels;
 mod limits;
+mod types;
 
-pub use crate::names::Pattern;
 pub use crate::snapshot::SnapshotConfig;
-pub use channels::{ChannelConfig, ChannelRule, ChannelSettings, MaxBacklog};
+pub use crate::types::TypeSet;
 pub use limits::{MemoryConfig, ProducerConfig, StorageConfig};
 use std::collections::HashMap;
 use std::time::Duration;
+pub use types::{MaxBacklog, TypeConfig, TypeRule, TypeSettings};
 
 /// When other connections may see a change relative to the disk.
 ///
@@ -29,7 +30,7 @@ pub enum Durability {
     /// write; producers still hold it, unacknowledged, and send it again.
     #[default]
     Scheduled,
-    /// An event on a durable channel is visible to no other connection —
+    /// A durable event (of a type that is not volatile) is visible to no other connection —
     /// assignment, notice, backlog, explicit claim — before its registration
     /// is on disk (2.7). A completion's dispatch follow-ups and a deletion's
     /// result wait for the completion or deletion to be on disk.
@@ -58,23 +59,32 @@ impl Method {
     pub const ALL: [Method; 8] = [Method::RegisterClaimable, Method::RegisterDispatch, Method::Claim, Method::Complete, Method::Delete, Method::Subscribe, Method::Unsubscribe, Method::Operate];
 }
 
-/// What one service credential may do.
+/// What one service credential may do: its methods, on the events of its
+/// types. Channels do not matter — a channel is an id, and knowing it is what
+/// lets a connection name it. Subscriptions and dispatch joins hand a
+/// connection only the events of its types (and the server's own, type 0).
 #[derive(Clone, Debug)]
 pub struct Grant {
     pub methods: Vec<Method>,
-    pub channels: Vec<Pattern>,
+    pub types: TypeSet,
     /// Whether this credential may register on behalf of an end user (`delegate`).
     pub delegate: bool,
 }
 
 impl Grant {
-    /// Every method on every channel, delegation included.
+    /// Every method on every type, delegation included.
     pub fn all() -> Self {
-        Grant { methods: Method::ALL.to_vec(), channels: vec![Pattern("*".into())], delegate: true }
+        Grant { methods: Method::ALL.to_vec(), types: TypeSet::all(), delegate: true }
     }
 
-    pub fn allows(&self, method: Method, channel: &str) -> bool {
-        self.methods.contains(&method) && self.channels.iter().any(|pattern| pattern.matches(channel))
+    pub fn allows(&self, method: Method, event_type: u16) -> bool {
+        self.methods.contains(&method) && self.types.contains(event_type)
+    }
+
+    /// Whether events of `event_type` may be handed to this credential's
+    /// subscriptions and dispatch joins.
+    pub fn reads(&self, event_type: u16) -> bool {
+        event_type == crate::envelope::SERVER_TYPE || self.types.contains(event_type)
     }
 }
 
@@ -112,13 +122,13 @@ pub struct EngineConfig {
     /// S5, S19, S22: managed memory, watermarks and channel pause.
     pub memory: MemoryConfig,
     /// S14: what a production connection may still send to a paused root
-    /// channel after `Paused` before its reading stops (the record being read
+    /// type after `Paused` before its reading stops (the record being read
     /// at the notice is allowed on top).
     pub pause_allowance: u64,
     /// B24: entries in each top-K list of `Stats`.
     pub stats_top: usize,
-    /// B6, B9, B17, B26 and volatile channels, by channel pattern.
-    pub channels: ChannelConfig,
+    /// B6, B9, B17, B26 and volatile events, by type.
+    pub types: TypeConfig,
     /// S3, S4, S6, S17: segments, checkpoints, disk budget, the read path.
     /// The segment size must match the one the log was opened with.
     pub storage: StorageConfig,
@@ -142,7 +152,7 @@ impl Default for EngineConfig {
             memory: MemoryConfig::default(),
             pause_allowance: 1 << 20,
             stats_top: 16,
-            channels: ChannelConfig::default(),
+            types: TypeConfig::default(),
             storage: StorageConfig::default(),
         }
     }

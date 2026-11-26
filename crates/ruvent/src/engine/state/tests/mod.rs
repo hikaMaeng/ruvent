@@ -12,8 +12,9 @@ mod timing;
 
 use super::slots::{Place, Slot};
 use super::*;
-use crate::engine::config::{ChannelRule, ChannelSettings, Durability, Grant, MemoryConfig, Pattern};
-use crate::engine::ops::{Assignment, ByeReason, FaultKind, Hello, Outbound, Refusal, Role, Target};
+use crate::engine::config::{Durability, Grant, MemoryConfig, TypeRule, TypeSettings};
+use crate::engine::ops::{Assignment, ByeReason, FaultKind, Hello, Outbound, Refusal, Role};
+use crate::types::TypeSet;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -38,15 +39,35 @@ pub struct H {
     pub firsts: HashMap<u32, u64>,
     /// The next sequence number per numbered connection.
     seqs: HashMap<SessionId, u64>,
+    /// The `req` of each (connection, channel label) join made through [`H::join`].
+    joined: HashMap<(SessionId, String), u32>,
 }
 
-/// A configuration with a memory limit far from every test's size, so no
-/// pause happens unless the test asks for one.
-/// The tests' engine: memory unbounded, and `scratch.*` a volatile channel
-/// family (no default rule makes any channel volatile).
+/// The tests' volatile type (a type rule, see [`config`]).
+pub const VOLATILE: u16 = 900;
+
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
+}
+
+/// A type rule over `types` with `settings`.
+pub fn rule(types: impl IntoIterator<Item = u16>, settings: TypeSettings) -> TypeRule {
+    TypeRule { types: TypeSet::of(types), settings }
+}
+
+/// The tests' engine: a memory limit far from every test's size, so no pause
+/// happens unless the test asks for one, and [`VOLATILE`] a volatile type (no
+/// default rule makes any type volatile).
 pub fn config() -> EngineConfig {
     let mut config = EngineConfig { memory: MemoryConfig { limit: Some(1 << 40), ..MemoryConfig::default() }, ..EngineConfig::default() };
-    config.channels.rules.insert(0, ChannelRule { pattern: Pattern("scratch.*".into()), settings: ChannelSettings { volatile: true, ..ChannelSettings::default() } });
+    config.types.rules.insert(0, rule([VOLATILE], TypeSettings { volatile: true, ..TypeSettings::default() }));
     config
 }
 
@@ -55,7 +76,7 @@ pub fn strict() -> EngineConfig {
 }
 
 pub fn hello(role: Role, byte: u8) -> Hello {
-    Hello { role, credential: "svc".into(), producer: (role != Role::Observe).then_some([byte; 16]), nonce: [byte; 16], linger_ms: None, acks: true, channels: Vec::new() }
+    Hello { role, credential: "svc".into(), producer: (role != Role::Observe).then_some([byte; 16]), nonce: [byte; 16], linger_ms: None, acks: true, types: Vec::new() }
 }
 
 pub fn id(byte: u8) -> EventId {
@@ -65,8 +86,14 @@ pub fn id(byte: u8) -> EventId {
     EventId(bytes)
 }
 
+/// A claimable event of type 1 on the channel labelled `channel`.
 pub fn work(channel: &str) -> Envelope {
-    Envelope::claimable(channel, "do", Bytes::from_static(b"p"))
+    Envelope::claimable(ch(channel), 1, Bytes::from_static(b"p"))
+}
+
+/// A claimable event of the volatile type on the channel labelled `channel`.
+pub fn volatile(channel: &str) -> Envelope {
+    Envelope::claimable(ch(channel), VOLATILE, Bytes::from_static(b"p"))
 }
 
 /// What `session` was sent, in order (closes left out).
@@ -113,7 +140,7 @@ impl H {
         let mut s = State::new(&config, Box::new(V7));
         let records = s.recover(Vec::new(), 0, 0, journaled).unwrap();
         let log = records.iter().cloned().map(|record| (0, record)).collect();
-        H { s, now: 0, durable: 1, carrying: 2, records, log, written: 0, firsts: HashMap::new(), seqs: HashMap::new() }
+        H { s, now: 0, durable: 1, carrying: 2, records, log, written: 0, firsts: HashMap::new(), seqs: HashMap::new(), joined: HashMap::new() }
     }
 
     /// No journal: every channel volatile, every operation committed when applied.
@@ -246,11 +273,20 @@ impl H {
         id
     }
 
+    /// Joins the channel labelled `channel` for every type (a fresh `req`
+    /// per connection, from 100) and opens a window of `count`.
     pub fn join(&mut self, session: SessionId, channel: &str, count: u32) -> Effects {
-        let mut effects = self.call(session, Call::Join { req: 1, channel: channel.into(), types: Vec::new(), lease_ms: 30_000, dispatch: false });
-        let more = self.call(session, Call::Window { channel: channel.into(), count, bytes: 0 });
+        let req = 100 + self.joined.keys().filter(|(joiner, _)| *joiner == session).count() as u32;
+        let req = *self.joined.entry((session, channel.to_string())).or_insert(req);
+        let mut effects = self.call(session, Call::Join { req, channel: Some(ch(channel)), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false });
+        let more = self.call(session, Call::Window { join: req, count, bytes: 0 });
         effects.sends.extend(more.sends);
         effects
+    }
+
+    /// The join id [`H::join`] gave `session` on the channel labelled `channel`.
+    pub fn join_id(&self, session: SessionId, channel: &str) -> JoinId {
+        (session, self.joined[&(session, channel.to_string())])
     }
 
     pub fn complete(&mut self, session: SessionId, assignment: &Assignment, follow_ups: Vec<Envelope>) -> Effects {
@@ -264,6 +300,6 @@ impl H {
     }
 
     pub fn waiting(&self, channel: &str) -> usize {
-        self.s.lanes.iter().filter(|(key, _)| key.0.as_str() == channel).map(|(_, lane)| lane.queue.len()).sum()
+        self.s.lanes.iter().filter(|(key, _)| key.0 == ch(channel)).map(|(_, lane)| lane.queue.len()).sum()
     }
 }

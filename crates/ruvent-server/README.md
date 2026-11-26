@@ -1,6 +1,6 @@
 # ruvent-server
 
-이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v3(`ruvent-protocol`) TCP 수신부를 둔다.
+이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v4(`ruvent-protocol`) TCP 수신부를 둔다.
 모든 접속은 `Hello`에서 서비스 자격 토큰과 역할(생산·작업·관찰, 계획 2.2)을 밝히고, 그 뒤로는 그 역할의
 호출만 그 자격으로 보낸다. 자격이 할 수 있는 일은 엔진의 권한표(`grants`)가 정한다.
 
@@ -23,25 +23,27 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 | --- | --- | --- |
 | `listen` | (필수) | `host:port` |
 | `journal` | 없음 = 휘발 | 세그먼트 로그 디렉터리. 단일 파일 저널(형식 2 이하)은 거부하고 그대로 둔다(B12) |
-| `durability` | `"scheduled"` | `"strict"`: 영속 채널 이벤트는 등록이 디스크에 닿기 전에 다른 연결에 보이지 않는다(2.7) |
+| `durability` | `"scheduled"` | `"strict"`: 영속 이벤트는 등록이 디스크에 닿기 전에 다른 연결에 보이지 않는다(2.7) |
 | `server_id` | 기동마다 새로 | `Welcome`의 서버 id(UUID 문자열) |
-| `credentials` | (필수, 1개 이상) | `name`, `token`, `methods`(생략 = 여덟 개 전부), `channels`(패턴, 생략 = `["*"]`), `delegate` |
+| `credentials` | (필수, 1개 이상) | `name`, `token`, `methods`(생략 = 여덟 개 전부), `types`(타입 집합, 생략 = 모든 타입), `delegate` |
 | `engine` | 엔진 기본값 | `batch_max`, `inbox`, `outbound`, `backlog_page`, `ack_every`(S2, 256), `reconnect_grace_ms`(S20, 3000), `max_follow_ups`(S10, 1024), `pause_allowance`(S14, 1 MiB), `stats_top`(B24, 16) |
 | `producers` | B4·S15 | `linger_ms`(1시간), `linger_max_ms`(7일), `max_entries`(100만), `entry_bytes`(64) |
 | `memory` | S5·S19·S22 | `limit`(바이트, 생략 = 물리 메모리의 절반), `reserve`(0.10), `high_watermark`(0.80), `release`(0.875), `early_pause`(0.125), `net_growth_window`(256), `slot_bytes`(180), `depth_target`(1억) |
 | `storage` | S3·S4·S6 | `segment_bytes`(64 MiB), `relocate_at`(0.10), `checkpoint_slice`(4096), `checkpoint_tail_multiple`(8), `checkpoint_tail_cap`(8 GiB), `disk_reserve_segments`(4), `disk_reserve`(0.10), `disk_capacity`(없음), `read_ahead`(16), `max_reads`(64), `checkpoint_queue`(2) |
-| `channels` | B6·B9·B17·B26 | `isolation_prefix`(`isolated.`), `default`(모든 채널의 기본), `rules`(`pattern` + 같은 키들. 먼저 맞는 규칙이 정한다) |
+| `types` | B6·B9·B17·B26·휘발 | `default`(모든 타입의 기본), `rules`(`types`(타입 집합) + 같은 키들. 그 타입을 담은 첫 규칙이 정한다) |
 | `connection` | 서버 기본값 | `dictionary`(S18, 4096), `max_body`(B13, 16 MiB), `inline`(S11, 256), `direct`(S11, 4096), `handshake_ms`(10000), `unsent`(S7, 256 MiB), `close_ms`(S20, 5000), `spool_piece`(256 KiB), `batch`(1024), `keepalive` |
 | `connection.keepalive` | S13 | `idle_ms`(15000), `interval_ms`(5000), `retries`(3), `user_timeout_ms`(30000, 리눅스만) |
-| `snapshot` | 없음 | `{ "directory", "channels", "types", "max_events", "max_age_ms", "buffer" }` 운영 스냅샷 |
+| `snapshot` | 없음 | `{ "directory", "types", "max_events", "max_age_ms", "buffer" }` 운영 스냅샷. `types`는 타입 집합(빈 목록 = 아무것도) |
 
-채널 설정 키: `isolate_after`(격리 문턱, `0` = 격리 안 함, 기본 5), `isolated_keep_ms`(격리 보존, 7일),
-`isolate_expired`(만료를 지우지 않고 격리), `max_backlog`(`{ "count", "bytes" }`, 넘으면 그 뿌리 정지),
-`serialize_group`(같은 `group`을 한 번에 하나만 배정), `volatile`(저널에 쓰지 않음). 사용자 규칙 뒤에
-기본 규칙 하나가 붙는다: `isolated.*`는 다시 격리하지 않는다. 기본으로 휘발인 채널은 없다(계획 v4.8에서 `reply.*` 규칙을 지웠다).
+타입 설정 키: `isolate_after`(격리 문턱, `0` = 격리 안 함, 기본 5), `isolated_keep_ms`(격리 보존, 7일),
+`isolate_expired`(만료를 지우지 않고 격리), `max_backlog`(`{ "count", "bytes" }`, 그 타입이 뿌리인 계보가 넘으면 정지),
+`serialize_group`(한 채널의 같은 `group`을 한 번에 하나만 배정), `volatile`(저널에 쓰지 않음). 기본 규칙은 없다.
+격리는 제자리다: 이벤트는 채널과 타입을 그대로 두고 격리 비트를 켠 채 격리 참여(`isolated`)만 기다린다.
 
+타입 집합: 항목의 목록이고 항목은 수(`7`), 구간 문자열(`"100-199"`), 또는 `"*"`다.
 메서드 이름: `register_claimable`, `register_dispatch`, `claim`, `complete`, `delete`, `subscribe`, `unsubscribe`,
-`operate`(`Stats`, `Drain`). 채널 패턴: 정확한 이름, `*`로 끝나는 접두사, 또는 `*`.
+`operate`(`Stats`, `Drain`). 채널은 설정 어디에도 없다: 채널은 서버가 아무것도 읽지 않는 UUIDv7이고, 아는 쪽이 부른다.
+구독과 발송 참여는 자격의 타입에 든 이벤트만 받는다(서버의 삭제 결과, 타입 0은 늘 받는다).
 
 토큰은 설정 파일에 평문으로 있다. 파일 권한으로 보호하고 저장소에 커밋하지 않는다.
 
@@ -61,7 +63,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
   상대가 닫지 않으면 `close_ms`에 닫는다. 연결이 닫힐 때 쓰기를 끝내지 못한 `Assign`의 표지를 엔진에 넘겨
   곧바로 대기로 되돌린다(실패 횟수 그대로).
 * 모든 소켓에 TCP keepalive를 건다. 리눅스는 `TCP_USER_TIMEOUT`도 건다. 앱 타이머는 없다.
-* v1 클라이언트의 hello는 첫 바이트로 알아보고 v1 형식의 `Bye`로 거절한다. v3가 아닌 다른 버전(v2 포함)은 `Bye{version}`.
+* v1 클라이언트의 hello는 첫 바이트로 알아보고 v1 형식의 `Bye`로 거절한다. v4가 아닌 다른 버전(v2·v3 포함)은 `Bye{version}`.
 
 ## 내리는 순서 (`serve`, 계획 2.8, B22)
 
@@ -89,7 +91,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 | `src/connection/socket.rs` | keepalive(`socket2`) |
 | `src/lib.rs` | `run`: 세그먼트 로그 복구, 엔진 시작, 수신, 종료·장애 전파 |
 | `src/main.rs` | 바이너리 |
-| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v3 연결 |
+| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v4 연결 |
 
 타이머는 둘이다: hello 기한(`handshake.rs`)과 닫기 기한(`close.rs`). 정적 시험의 `TIMERS`에 선언돼 있다.
 

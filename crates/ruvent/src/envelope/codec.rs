@@ -2,9 +2,10 @@
 //!
 //! Fixed-width numbers are little-endian; `id` and `group` are 16
 //! octets. The work key's arrival and the two times are unsigned LEB128
-//! varints ([`put_varint`]). Names travel as numbers from a dictionary the
-//! surrounding stream defines first; this module only asks for the number of
-//! a name and the name of a number. A decoder knows every length from the
+//! varints ([`put_varint`]). The channel is 16 octets. Names (the credential
+//! and the end user) travel as numbers from a dictionary the surrounding
+//! stream defines first; this module only asks for the number of a name and
+//! the name of a number. A decoder knows every length from the
 //! [`Layout`] and the `flags` word alone.
 //!
 //! ## `flags` (u16)
@@ -20,9 +21,10 @@
 //! | 6 | `not_before` present |
 //! | 7 | `expires` present |
 //! | 8 | `group` present |
-//! | 9–15 | reserved, always zero |
+//! | 9 | isolated (claimable; set by the server) |
+//! | 10–15 | reserved, always zero |
 
-use super::{Envelope, EventId, Kind, WorkKey};
+use super::{Channel, Envelope, EventId, Kind, WorkKey};
 use crate::names::Name;
 use bytes::{BufMut, Bytes};
 use std::fmt;
@@ -33,27 +35,29 @@ pub const DELEGATE: u16 = 1 << 5;
 pub const NOT_BEFORE: u16 = 1 << 6;
 pub const EXPIRES: u16 = 1 << 7;
 pub const GROUP: u16 = 1 << 8;
+pub const ISOLATED: u16 = 1 << 9;
 const OPTIONAL: u16 = PRINCIPAL | DELEGATE | NOT_BEFORE | EXPIRES | GROUP;
 /// Bits no layout may set.
-pub const RESERVED: u16 = !(KIND | OPTIONAL);
+pub const RESERVED: u16 = !(KIND | OPTIONAL | ISOLATED);
 /// Fields that only mean something on a claimable event.
-const CLAIMABLE_ONLY: u16 = NOT_BEFORE | EXPIRES | GROUP;
+const CLAIMABLE_ONLY: u16 = NOT_BEFORE | EXPIRES | GROUP | ISOLATED;
 
-/// id 16 + channel 4 + type 4 + flags 2 + failures 2.
-pub const HEAD: usize = 28;
+/// id 16 + channel 16 + type 2 + flags 2 + failures 2. (Format 4 had the
+/// channel and the type as 4-byte name numbers.)
+pub const HEAD: usize = 38;
 
 /// Which fields a record of each kind carries.
 ///
 /// | layout | carries | refused |
 /// | --- | --- | --- |
-/// | `Request` | head, optional, payload | failures ≠ 0, principal |
+/// | `Request` | head, optional, payload | failures ≠ 0, principal, isolated |
 /// | `Notice` | head, work key | any optional field |
 /// | `Assigned` | head, work key, optional, payload | dispatch |
 /// | `Delivery` | head, optional, payload | failures ≠ 0, claimable |
 /// | `Journal` | head, work key, optional, payload | dispatch |
 ///
-/// Every layout refuses the reserved bits, and `not_before`, `expires` and
-/// `group` on a dispatch event.
+/// Every layout refuses the reserved bits, and `not_before`, `expires`,
+/// `group` and isolated on a dispatch event.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// Registration requests and the follow-ups of a completion.
@@ -88,8 +92,8 @@ impl Layout {
     /// The flag bits this layout writes; the rest are cleared on encode.
     fn written(self) -> u16 {
         match self {
-            Layout::Notice => KIND,
-            _ => KIND | OPTIONAL,
+            Layout::Notice => KIND | ISOLATED,
+            _ => KIND | OPTIONAL | ISOLATED,
         }
     }
 
@@ -106,6 +110,7 @@ impl Layout {
         }
         match self {
             Layout::Request if flags & PRINCIPAL != 0 => Err(Malformed::Forbidden("principal")),
+            Layout::Request if flags & ISOLATED != 0 => Err(Malformed::Forbidden("isolated")),
             Layout::Notice if flags & OPTIONAL != 0 => Err(Malformed::Forbidden("optional field")),
             Layout::Delivery if !dispatch => Err(Malformed::Forbidden("claimable")),
             Layout::Assigned | Layout::Journal if dispatch => Err(Malformed::Forbidden("dispatch")),
@@ -235,8 +240,8 @@ fn encode_parts(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Nam
         return Err(Malformed::Forbidden("payload over 4 GiB"));
     }
     out.put_slice(&envelope.id.0);
-    out.put_u32_le(number(&envelope.channel));
-    out.put_u32_le(number(&envelope.event_type));
+    out.put_slice(&envelope.channel.0);
+    out.put_u16_le(envelope.event_type);
     out.put_u16_le(flags);
     out.put_u16_le(failures);
     if layout.has_key() {
@@ -244,11 +249,11 @@ fn encode_parts(envelope: &Envelope, layout: Layout, number: &mut dyn FnMut(&Nam
         out.put_u32_le(key.generation);
         put_varint(out, key.arrival);
     }
-    if flags & PRINCIPAL != 0 {
-        out.put_u32_le(number(envelope.principal.as_ref().unwrap_or(&envelope.channel)));
+    if let (true, Some(principal)) = (flags & PRINCIPAL != 0, &envelope.principal) {
+        out.put_u32_le(number(principal));
     }
-    if flags & DELEGATE != 0 {
-        out.put_u32_le(number(envelope.delegate.as_ref().unwrap_or(&envelope.channel)));
+    if let (true, Some(delegate)) = (flags & DELEGATE != 0, &envelope.delegate) {
+        out.put_u32_le(number(delegate));
     }
     if flags & NOT_BEFORE != 0 {
         put_varint(out, envelope.not_before.unwrap_or_default());
@@ -364,8 +369,8 @@ pub fn decode_head(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -
 fn decode_parts(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> Option<Name>, with_payload: bool) -> Result<Envelope, Malformed> {
     let lookup = |number: u32| name(number).ok_or(Malformed::UnknownName(number));
     let id = reader.id()?;
-    let channel = lookup(reader.u32()?)?;
-    let event_type = lookup(reader.u32()?)?;
+    let channel = Channel(reader.bytes16()?);
+    let event_type = reader.u16()?;
     let flags = reader.u16()?;
     let failures = reader.u16()?;
     layout.check(flags, failures)?;
@@ -382,5 +387,6 @@ fn decode_parts(reader: &mut Reader<'_>, layout: Layout, name: &dyn Fn(u32) -> O
         Bytes::new()
     };
     let kind = if flags & KIND != 0 { Kind::Dispatch } else { Kind::Claimable };
-    Ok(Envelope { id, channel, event_type, kind, failures, key, principal, delegate, not_before, expires, group, payload })
+    let isolated = flags & ISOLATED != 0;
+    Ok(Envelope { id, channel, event_type, kind, failures, key, isolated, principal, delegate, not_before, expires, group, payload })
 }

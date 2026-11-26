@@ -1,14 +1,13 @@
 //! Server selection (2.8, B19): the place a router plugs in.
 //!
-//! The SDK hands a [`Selector`] only the servers it may use — connected, not
-//! draining and, for a request with `reply`, joined to the reply channel —
-//! and keeps the other constraint itself: a registration once sent is sent
+//! The SDK hands a [`Selector`] only the servers it may use — connected and
+//! not draining — and keeps the other constraint itself: a registration once sent is sent
 //! again only to the same server. A selector never sees a retransmission.
 
 use crate::line::backoff::Rng;
 use crate::servers::Server;
 use parking_lot::Mutex;
-use ruvent::{GroupId, Name};
+use ruvent::{Channel, GroupId};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// One server a registration may go to.
@@ -17,15 +16,17 @@ pub struct Candidate {
     pub server: Server,
     /// Bytes sent to it and not yet acknowledged: grows when it slows down.
     pub unacked_bytes: u64,
-    /// The registration's channel is paused there (2.6).
+    /// The registration's type is paused there (2.6).
     pub paused: bool,
 }
 
 /// What is being placed.
 #[derive(Debug)]
 pub struct Choice<'a> {
-    pub channel: &'a Name,
-    /// B26: set for a channel whose events must stay on one server.
+    /// The registration's channel and type; `None` for a deletion.
+    pub channel: Option<Channel>,
+    pub event_type: Option<u16>,
+    /// B26: set for events that must stay on one server.
     pub group: Option<GroupId>,
     /// Sorted by server; never empty.
     pub candidates: &'a [Candidate],
@@ -85,16 +86,16 @@ mod tests {
     #[test]
     fn the_default_selector_prefers_fewer_unacknowledged_bytes_and_avoids_paused_servers() {
         let selector = LeastUnacked::default();
-        let channel = Name::new("c");
+        let channel = Some(Channel::new());
         let two = candidates(&[(500, false), (100, false)]);
-        assert_eq!(selector.select(&Choice { channel: &channel, group: None, candidates: &two }), Some(1));
+        assert_eq!(selector.select(&Choice { channel, event_type: Some(1), group: None, candidates: &two }), Some(1));
         let paused = candidates(&[(500, false), (100, true)]);
-        assert_eq!(selector.select(&Choice { channel: &channel, group: None, candidates: &paused }), Some(0));
+        assert_eq!(selector.select(&Choice { channel, event_type: Some(1), group: None, candidates: &paused }), Some(0));
         let many = candidates(&[(0, false), (900, false), (900, false), (900, false)]);
-        let picks: Vec<usize> = (0..200).filter_map(|_| selector.select(&Choice { channel: &channel, group: None, candidates: &many })).collect();
+        let picks: Vec<usize> = (0..200).filter_map(|_| selector.select(&Choice { channel, event_type: Some(1), group: None, candidates: &many })).collect();
         assert!(picks.iter().filter(|pick| **pick == 0).count() > 50, "the light server wins whenever it is one of the two");
         let group = Some([7; 16]);
-        let first = selector.select(&Choice { channel: &channel, group, candidates: &many });
-        assert!((0..20).all(|_| selector.select(&Choice { channel: &channel, group, candidates: &many }) == first), "a group stays on one server");
+        let first = selector.select(&Choice { channel, event_type: Some(1), group, candidates: &many });
+        assert!((0..20).all(|_| selector.select(&Choice { channel, event_type: Some(1), group, candidates: &many }) == first), "a group stays on one server");
     }
 }

@@ -1,6 +1,6 @@
 //! Records → messages, for one direction of one connection.
 
-use super::fields::{boolean, intern, key, name, target, text, token, varint32};
+use super::fields::{boolean, channel, intern, key, text, token, varint32};
 use super::*;
 use crate::dictionary::Incoming;
 use crate::error::ProtocolError;
@@ -8,19 +8,19 @@ use crate::io::RawRecord;
 use crate::VERSION;
 use bytes::Bytes;
 use ruvent::envelope::codec::{self, Layout, Malformed, Reader};
-use ruvent::{Assignment, ByeReason, ClaimToken, Envelope, EventId, FaultKind, Refusal, Role, Target};
+use ruvent::{Assignment, ByeReason, Channel, ClaimToken, Envelope, EventId, FaultKind, Refusal, Role};
 
 /// Most follow-ups one `Complete`, or notices one `Subscribed`, may announce.
 /// The engine bounds both far lower (S10, `backlog_page`); this only keeps a
 /// count from a broken peer from meaning anything.
 const GATHERED: u64 = 1 << 16;
-/// Most channels a `Hello` may declare.
+/// Most types a `Hello` may declare.
 const DECLARED: u64 = 1 << 12;
 
 /// A message whose records are still arriving.
 enum Gather {
     Complete { seq: u64, id: EventId, token: ClaimToken, left: u64, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)> },
-    Subscribed { req: u32, target: Target, more: bool, left: u64, backlog: Vec<Envelope> },
+    Subscribed { req: u32, channel: Channel, more: bool, left: u64, backlog: Vec<Envelope> },
 }
 
 /// Turns records back into messages.
@@ -192,12 +192,12 @@ impl Decoder {
                 let nonce = reader.bytes16()?;
                 let linger_ms = if presence & 2 != 0 { Some(reader.varint()?) } else { None };
                 let acks = presence & 4 == 0;
-                let mut channels = Vec::new();
+                let mut types = Vec::new();
                 for _ in 0..count(reader, DECLARED)? {
-                    channels.push(Name::from(text(reader)?));
+                    types.push(reader.u16()?);
                 }
                 self.started = true;
-                Message::Hello { version, features, token, hello: Hello { role, credential: Name::new(""), producer, nonce, linger_ms, acks, channels } }
+                Message::Hello { version, features, token, hello: Hello { role, credential: Name::new(""), producer, nonce, linger_ms, acks, types } }
             }
             WELCOME => {
                 let version = varint32(reader)?;
@@ -231,22 +231,23 @@ impl Decoder {
             DELETE => {
                 let seq = reader.varint()?;
                 let id = reader.id()?;
-                let result = name(reader, &self.dictionary)?;
+                let result = channel(reader)?;
                 Message::Call(Call::Delete { seq, id, result, key: key(reader)? })
             }
             JOIN => {
                 let req = req(reader)?;
-                let channel = name(reader, &self.dictionary)?;
+                let channel = if boolean(reader)? { Some(channel(reader)?) } else { None };
                 let mut types = Vec::new();
                 for _ in 0..count(reader, GATHERED)? {
-                    types.push(name(reader, &self.dictionary)?);
+                    types.push(reader.u16()?);
                 }
+                let isolated = boolean(reader)?;
                 let lease_ms = reader.varint()?;
-                Message::Call(Call::Join { req, channel, types, lease_ms, dispatch: boolean(reader)? })
+                Message::Call(Call::Join { req, channel, types, isolated, lease_ms, dispatch: boolean(reader)? })
             }
             WINDOW => {
-                let channel = name(reader, &self.dictionary)?;
-                Message::Call(Call::Window { channel, count: varint32(reader)?, bytes: reader.varint()? })
+                let join = varint32(reader)?;
+                Message::Call(Call::Window { join, count: varint32(reader)?, bytes: reader.varint()? })
             }
             COMPLETE => {
                 let seq = reader.varint()?;
@@ -300,25 +301,25 @@ impl Decoder {
             }
             SUBSCRIBE => {
                 let req = req(reader)?;
-                let target = target(reader, &self.dictionary)?;
-                Message::Call(Call::Subscribe { req, target, after: key(reader)? })
+                let channel = channel(reader)?;
+                Message::Call(Call::Subscribe { req, channel, after: key(reader)? })
             }
             UNSUBSCRIBE => {
                 let req = req(reader)?;
-                Message::Call(Call::Unsubscribe { req, target: target(reader, &self.dictionary)? })
+                Message::Call(Call::Unsubscribe { req, channel: channel(reader)? })
             }
             STATS => Message::Call(Call::Stats { req: req(reader)? }),
             DRAIN => Message::Call(Call::Drain { req: req(reader)? }),
             COMMITTED => Message::Outbound(Outbound::Committed { seq: reader.varint()? }),
-            PAUSED => Message::Outbound(Outbound::Paused { channel: name(reader, &self.dictionary)? }),
-            RESUMED => Message::Outbound(Outbound::Resumed { channel: name(reader, &self.dictionary)? }),
+            PAUSED => Message::Outbound(Outbound::Paused { event_type: reader.u16()? }),
+            RESUMED => Message::Outbound(Outbound::Resumed { event_type: reader.u16()? }),
             JOINED => Message::Outbound(Outbound::Joined { req: req(reader)? }),
             REFUSED => {
                 let req = req(reader)?;
                 let code = reader.u8()?;
                 Message::Outbound(Outbound::Refused { req, reason: Refusal::from_code(code).ok_or(ProtocolError::UnknownCode(code))? })
             }
-            PENDING => Message::Outbound(Outbound::Pending { channel: name(reader, &self.dictionary)? }),
+            PENDING => Message::Outbound(Outbound::Pending { join: varint32(reader)? }),
             ASSIGN => Message::Outbound(Outbound::Assign(self.assignment(reader, record, body)?)),
             CLAIMED => {
                 let req = req(reader)?;
@@ -326,14 +327,14 @@ impl Decoder {
             }
             SUBSCRIBED => {
                 let req = req(reader)?;
-                let target = target(reader, &self.dictionary)?;
+                let channel = channel(reader)?;
                 let more = boolean(reader)?;
                 let left = count(reader, GATHERED)?;
                 if left > 0 {
-                    self.gather = Some(Gather::Subscribed { req, target, more, left, backlog: Vec::new() });
+                    self.gather = Some(Gather::Subscribed { req, channel, more, left, backlog: Vec::new() });
                     return Ok(None);
                 }
-                Message::Outbound(Outbound::Subscribed { req, target, backlog: Vec::new(), more })
+                Message::Outbound(Outbound::Subscribed { req, channel, backlog: Vec::new(), more })
             }
             UNSUBSCRIBED => Message::Outbound(Outbound::Unsubscribed { req: req(reader)? }),
             NOTICE => {
@@ -346,7 +347,7 @@ impl Decoder {
                             return Ok(None);
                         }
                         match self.gather.take() {
-                            Some(Gather::Subscribed { req, target, more, backlog, .. }) => Message::Outbound(Outbound::Subscribed { req, target, backlog, more }),
+                            Some(Gather::Subscribed { req, channel, more, backlog, .. }) => Message::Outbound(Outbound::Subscribed { req, channel, backlog, more }),
                             _ => return Err(ProtocolError::WrongDirection(tag)),
                         }
                     }
@@ -356,7 +357,7 @@ impl Decoder {
             DELIVERY => Message::Outbound(Outbound::Delivery(self.carried(reader, Layout::Delivery, record, body)?)),
             STATS_REPLY => {
                 let req = req(reader)?;
-                Message::Outbound(Outbound::StatsReply { req, stats: Box::new(stats::decode(reader, &self.dictionary)?) })
+                Message::Outbound(Outbound::StatsReply { req, stats: Box::new(stats::decode(reader)?) })
             }
             DRAINING => Message::Outbound(Outbound::Draining { req: req(reader)? }),
             other => return Err(ProtocolError::UnknownTag(other)),

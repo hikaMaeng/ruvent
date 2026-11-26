@@ -1,7 +1,8 @@
 //! Random operation sequences keep the ledger's bookkeeping consistent.
 //!
 //! The invariants are what every other rule relies on: an event is in exactly
-//! one place; a lane holds exactly the waiting events of its (channel, type);
+//! one place; a lane holds exactly the waiting events of its (channel, type,
+//! isolated);
 //! a join's counts are the attempts that name it; the managed bytes and the
 //! root shares are the sum over the events; a group's count is its attempts.
 
@@ -36,6 +37,19 @@ fn step() -> impl Strategy<Value = Step> {
 }
 
 const CHANNELS: [&str; 3] = ["a", "b", "scratch.c"];
+/// The type registered on each of [`CHANNELS`]: type 2 serializes groups
+/// and isolates at two failures, [`VOLATILE`] is never journaled.
+const TYPES: [u16; 3] = [1, 2, VOLATILE];
+/// The `req` of every worker's isolated join (types 1 and 2, every channel).
+const ISOLATED: u32 = 10;
+
+/// Joins every channel (req 1, 2, 3) and the isolated events of types 1 and 2.
+fn join_all(h: &mut H, session: SessionId) {
+    for (at, channel) in CHANNELS.iter().enumerate() {
+        h.call(session, Call::Join { req: at as u32 + 1, channel: Some(ch(channel)), types: Vec::new(), isolated: false, lease_ms: 50, dispatch: false });
+    }
+    h.call(session, Call::Join { req: ISOLATED, channel: None, types: vec![1, 2], isolated: true, lease_ms: 50, dispatch: false });
+}
 
 fn check(state: &State) -> Result<(), TestCaseError> {
     let mut in_lanes = 0usize;
@@ -59,13 +73,13 @@ fn check(state: &State) -> Result<(), TestCaseError> {
     let mut waiting = 0usize;
     let mut held = 0usize;
     let mut bytes = 0u64;
-    let mut roots: HashMap<Name, (u64, u64, u64)> = HashMap::new();
+    let mut roots: HashMap<u16, (u64, u64, u64)> = HashMap::new();
     let mut joins: HashMap<JoinId, (u32, u64)> = HashMap::new();
-    let mut groups: HashMap<(Name, GroupId), u32> = HashMap::new();
+    let mut groups: HashMap<(Channel, GroupId), u32> = HashMap::new();
     for (index, slot) in state.slots.iter() {
         let usage = state.usage(slot);
         bytes += usage.memory;
-        let root = roots.entry(slot.fixed.root.clone()).or_default();
+        let root = roots.entry(slot.fixed.root).or_default();
         root.0 += 1;
         root.1 += usage.share;
         root.2 += usage.disk;
@@ -75,14 +89,14 @@ fn check(state: &State) -> Result<(), TestCaseError> {
             Place::Delayed { .. } => {}
             Place::Claimed(attempt) => {
                 if let Some(join) = &attempt.join {
-                    let entry = joins.entry(join.clone()).or_default();
+                    let entry = joins.entry(*join).or_default();
                     entry.0 += 1;
                     entry.1 += slot.len();
                     prop_assert!(state.joins.get(join).is_some_and(|found| found.attempts.contains(&index)));
                 }
                 if let Some(group) = slot.fixed.group {
-                    if state.config.channels.settings(&slot.channel).serialize_group {
-                        *groups.entry((slot.channel.clone(), group)).or_default() += 1;
+                    if state.config.types.settings(slot.fixed.event_type).serialize_group {
+                        *groups.entry((slot.channel, group)).or_default() += 1;
                     }
                 }
             }
@@ -109,20 +123,18 @@ proptest! {
     #[test]
     fn random_operations_keep_the_ledgers_bookkeeping_consistent(steps in proptest::collection::vec(step(), 1..120), strict in any::<bool>()) {
         let mut config = if strict { super::strict() } else { super::config() };
-        config.channels.rules.insert(0, ChannelRule { pattern: Pattern("b".into()), settings: ChannelSettings { serialize_group: true, isolate_after: Some(2), ..ChannelSettings::default() } });
+        config.types.rules.insert(0, rule([2], TypeSettings { serialize_group: true, isolate_after: Some(2), ..TypeSettings::default() }));
         let mut h = H::with(config, true).cast();
         let workers = [W1, W2];
         for worker in workers {
-            for channel in CHANNELS {
-                h.call(worker, Call::Join { req: 1, channel: channel.into(), types: Vec::new(), lease_ms: 50, dispatch: false });
-            }
+            join_all(&mut h, worker);
         }
         let mut ids: Vec<EventId> = Vec::new();
         for step in steps {
-            let attempt = |h: &H, at: u8| ids.get(at as usize).and_then(|id| h.slot(*id).and_then(|slot| slot.attempt().map(|attempt| (*id, attempt.token, attempt.join.clone()))));
+            let attempt = |h: &H, at: u8| ids.get(at as usize).and_then(|id| h.slot(*id).and_then(|slot| slot.attempt().map(|attempt| (*id, attempt.token, attempt.join))));
             match step {
                 Step::Register(channel, grouped) => {
-                    let mut event = work(CHANNELS[channel as usize]).with_id(EventId::new_v7());
+                    let mut event = Envelope::claimable(ch(CHANNELS[channel as usize]), TYPES[channel as usize], Bytes::from_static(b"p")).with_id(EventId::new_v7());
                     if grouped {
                         event = event.with_group([channel; 16]);
                     }
@@ -130,14 +142,14 @@ proptest! {
                     h.produce(P, event);
                 }
                 Step::Window(worker, count) => {
-                    for channel in CHANNELS {
-                        h.call(workers[worker as usize], Call::Window { channel: channel.into(), count, bytes: 0 });
+                    for join in [1, 2, 3, ISOLATED] {
+                        h.call(workers[worker as usize], Call::Window { join, count, bytes: 0 });
                     }
                 }
                 Step::Complete(at, follow) => {
                     if let Some((id, token, join)) = attempt(&h, at) {
                         let session = join.map_or(W1, |join| join.0);
-                        let follow_ups = if follow { vec![work("a"), Envelope::dispatch("feed", "t", Bytes::new())] } else { Vec::new() };
+                        let follow_ups = if follow { vec![work("a"), Envelope::dispatch(ch("feed"), 10, Bytes::new())] } else { Vec::new() };
                         let seq = h.next_seq(session);
                         h.call(session, Call::Complete { seq, id, token, follow_ups, spooled: Vec::new() });
                     }
@@ -155,7 +167,7 @@ proptest! {
                 Step::Delete(at) => {
                     if let Some(id) = ids.get(at as usize).copied() {
                         let seq = h.next_seq(P);
-                        h.call(P, Call::Delete { seq, id, result: "out".into(), key: None });
+                        h.call(P, Call::Delete { seq, id, result: ch("out"), key: None });
                     }
                 }
                 Step::Claim(at) => {
@@ -168,9 +180,7 @@ proptest! {
                     let unwritten: Vec<ClaimToken> = h.s.slots.iter().filter_map(|(_, slot)| slot.attempt().filter(|attempt| attempt.join.as_ref().is_some_and(|join| join.0 == session)).map(|attempt| attempt.token)).step_by(2).collect();
                     h.close(session, &unwritten);
                     h.open(session, hello(Role::Work, session as u8));
-                    for channel in CHANNELS {
-                        h.call(session, Call::Join { req: 1, channel: channel.into(), types: Vec::new(), lease_ms: 50, dispatch: false });
-                    }
+                    join_all(&mut h, session);
                 }
                 Step::Advance(by) => {
                     h.now += by;

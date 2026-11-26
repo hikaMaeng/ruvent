@@ -25,7 +25,7 @@
 //! | `Release` | [`Call::Release`] |
 //! | `Claim` | [`Call::Claim`] |
 //! | `Claimed` | [`Outbound::Claimed`] |
-//! | `Subscribe`, `Unsubscribe` | [`Call::Subscribe`], [`Call::Unsubscribe`] with [`Target`] |
+//! | `Subscribe`, `Unsubscribe` | [`Call::Subscribe`], [`Call::Unsubscribe`] |
 //! | `Subscribed` (+ its `Notice`s) | [`Outbound::Subscribed`] |
 //! | `Unsubscribed` | [`Outbound::Unsubscribed`] |
 //! | `Notice` | [`Outbound::Notice`] |
@@ -38,12 +38,12 @@
 mod codes;
 mod stats;
 
-use crate::envelope::{ClaimToken, Envelope, EventId, ProducerId, WorkKey};
+use crate::envelope::{Channel, ClaimToken, Envelope, EventId, ProducerId, WorkKey};
 use crate::journal::Spooled;
 use crate::names::Name;
 
 pub use codes::{ByeReason, FaultKind, Refusal};
-pub use stats::{ChannelStat, Counters, IdleLane, Pressure, RootStat, Stats};
+pub use stats::{Counters, IdleLane, Pressure, RootStat, Stats, TypeStat};
 
 /// One engine-wide connection number. Never reused by one engine.
 pub type SessionId = u64;
@@ -79,13 +79,13 @@ pub struct Hello {
     pub linger_ms: Option<u64>,
     /// `false`: no `Committed` on this connection (a volatile broadcast-only producer).
     pub acks: bool,
-    /// The channels this producer will write to, checked before `Welcome` (2.7).
-    pub channels: Vec<Name>,
+    /// The types this producer will register, checked before `Welcome` (2.7).
+    pub types: Vec<u16>,
 }
 
 impl Hello {
     fn fresh(role: Role, credential: &str, producer: bool) -> Self {
-        Hello { role, credential: Name::new(credential), producer: producer.then(|| EventId::new_v7().0), nonce: EventId::new_v7().0, linger_ms: None, acks: true, channels: Vec::new() }
+        Hello { role, credential: Name::new(credential), producer: producer.then(|| EventId::new_v7().0), nonce: EventId::new_v7().0, linger_ms: None, acks: true, types: Vec::new() }
     }
 
     /// A production connection with a fresh producer id and nonce.
@@ -120,29 +120,6 @@ pub struct Welcome {
     pub superseded: bool,
 }
 
-/// What a subscription names: one channel, or every channel under a prefix
-/// at a `.` boundary (`a.b` matches `a.b.c` and `a.b.c.d`, not `a.bc` and not `a.b` itself).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Target {
-    Channel(Name),
-    Prefix(Name),
-}
-
-impl Target {
-    pub fn matches(&self, channel: &str) -> bool {
-        match self {
-            Target::Channel(name) => name.as_str() == channel,
-            Target::Prefix(prefix) => channel.len() > prefix.len() && channel.starts_with(prefix.as_str()) && channel.as_bytes()[prefix.len()] == b'.',
-        }
-    }
-
-    pub fn name(&self) -> &Name {
-        match self {
-            Target::Channel(name) | Target::Prefix(name) => name,
-        }
-    }
-}
-
 /// One event handed to a worker: an assignment from its window, or the answer
 /// to an explicit claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,26 +147,37 @@ pub enum Call {
         seq: Option<u64>,
         event: Envelope,
     },
-    /// Production. The outcome is a dispatch event on `result` whose payload names the deleted id.
+    /// Production. The outcome is a dispatch event of type 0 on `result`
+    /// whose payload names the deleted id ([`delete_outcome`]).
     Delete {
         seq: u64,
         id: EventId,
-        result: Name,
+        result: Channel,
         key: Option<WorkKey>,
     },
-    /// Work. `types` empty means every type on the channel. With `dispatch`,
-    /// the channel's dispatch events come to this connection too (2.8).
+    /// Work. What this connection takes: the claimable events of `channel`
+    /// (`None`: of every channel) whose type is in `types` (empty: every
+    /// type). At least one of the two is given; the credential must be granted
+    /// every type it asks for. With `isolated`, only isolated events (B6);
+    /// without, only the others. The join is named by this `req` in `Window`
+    /// and `Pending`; a name another join of the connection holds is refused
+    /// (`Malformed`) unless this join repeats that one's selection. A join that repeats one of the connection's selections
+    /// changes its terms and takes this name; one that overlaps another is
+    /// refused (`Overlap`), so every lane has at most one join per
+    /// connection. With `dispatch` (a channel join only), the channel's
+    /// dispatch events of the credential's types come to this connection too (2.8).
     Join {
         req: u32,
-        channel: Name,
-        types: Vec<Name>,
+        channel: Option<Channel>,
+        types: Vec<u16>,
+        isolated: bool,
         lease_ms: u64,
         dispatch: bool,
     },
     /// Work. How many assignments, and how many payload bytes (`0`: no byte
-    /// bound), this join may hold at once. Absolute (2.4).
+    /// bound), the join named `join` may hold at once. Absolute (2.4).
     Window {
-        channel: Name,
+        join: u32,
         count: u32,
         bytes: u64,
     },
@@ -223,15 +211,16 @@ pub enum Call {
         id: EventId,
         lease_ms: u64,
     },
-    /// Observation. With the waiting backlog after `after`.
+    /// Observation. From now on, the channel's notices and dispatch events
+    /// of the credential's types; with the waiting backlog after `after`.
     Subscribe {
         req: u32,
-        target: Target,
+        channel: Channel,
         after: Option<WorkKey>,
     },
     Unsubscribe {
         req: u32,
-        target: Target,
+        channel: Channel,
     },
     /// Observation, operator grant.
     Stats {
@@ -259,12 +248,12 @@ pub enum Outbound {
     Committed {
         seq: u64,
     },
-    /// The root channel is paused: hold registrations to it (2.6).
+    /// The root type is paused: hold registrations of it (2.6).
     Paused {
-        channel: Name,
+        event_type: u16,
     },
     Resumed {
-        channel: Name,
+        event_type: u16,
     },
     Joined {
         req: u32,
@@ -274,9 +263,9 @@ pub enum Outbound {
         req: u32,
         reason: Refusal,
     },
-    /// A full window would receive work that waits (2.4).
+    /// The full window of the join named `join` would receive work that waits (2.4).
     Pending {
-        channel: Name,
+        join: u32,
     },
     Assign(Assignment),
     Claimed {
@@ -286,14 +275,14 @@ pub enum Outbound {
     /// Notices for waiting events in work-key order; `more`: subscribe again after the last key.
     Subscribed {
         req: u32,
-        target: Target,
+        channel: Channel,
         backlog: Vec<Envelope>,
         more: bool,
     },
     Unsubscribed {
         req: u32,
     },
-    /// Claimable work: head and work key.
+    /// Claimable work: head and work key. Also when an event is isolated (its isolated bit set).
     Notice(Envelope),
     /// A dispatch event.
     Delivery(Envelope),
@@ -306,12 +295,23 @@ pub enum Outbound {
     },
 }
 
-/// The type of the dispatch event announcing a successful deletion.
-pub const DELETED: &str = "deleted";
-/// The type of the dispatch event announcing a failed deletion.
-pub const DELETE_FAILED: &str = "delete-failed";
+/// A delete outcome, read from its dispatch event's payload (its type is 0;
+/// the server routes it by the `result` channel alone): the id the `Delete`
+/// named (16 bytes), then one byte, `0` for deleted and otherwise the
+/// [`DeleteFailure`]. `None` for a payload of another shape.
+pub fn delete_outcome(payload: &[u8]) -> Option<(EventId, Result<(), DeleteFailure>)> {
+    let (id, rest) = payload.split_first_chunk::<16>()?;
+    let outcome = match rest {
+        [0] => Ok(()),
+        [1] => Err(DeleteFailure::Missing),
+        [2] => Err(DeleteFailure::Claimed),
+        [3] => Err(DeleteFailure::OtherRegistration),
+        _ => return None,
+    };
+    Some((EventId(*id), outcome))
+}
 
-/// Why a deletion failed, the last payload byte of a [`DELETE_FAILED`] event.
+/// Why a deletion failed, the last payload byte of a delete outcome ([`delete_outcome`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DeleteFailure {

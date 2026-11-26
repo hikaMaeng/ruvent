@@ -6,8 +6,8 @@ use super::*;
 use crate::engine::config::StorageConfig;
 use crate::journal::{End, Journal as _, Lane, Location, Part, Recovered, Replay, SegmentLog, SegmentState, Spooled, Written};
 
-/// Per event: key, channel, failures, attempt, delayed until, expiry.
-type View = Vec<(WorkKey, String, u16, Option<ClaimToken>, Option<u64>, Option<u64>)>;
+/// Per event: key, channel, failures, attempt, delayed until, expiry, isolated.
+type View = Vec<(WorkKey, Channel, u16, Option<ClaimToken>, Option<u64>, Option<u64>, bool)>;
 
 fn view(state: &State) -> View {
     let mut slots: Vec<_> = state
@@ -18,7 +18,7 @@ fn view(state: &State) -> View {
                 Place::Delayed { until } => Some(until),
                 _ => None,
             };
-            (slot.fixed.key, slot.channel.to_string(), slot.failures, slot.attempt().map(|attempt| attempt.token), delayed, slot.expires)
+            (slot.fixed.key, slot.channel, slot.failures, slot.attempt().map(|attempt| attempt.token), delayed, slot.expires, slot.isolated)
         })
         .collect();
     slots.sort();
@@ -43,7 +43,7 @@ fn replayed(config: &EngineConfig, items: Vec<Replay>, h: &H) -> State {
 }
 
 fn with_payload(len: usize) -> Envelope {
-    Envelope::claimable("work", "do", Bytes::from(vec![7u8; len]))
+    Envelope::claimable(ch("work"), 1, Bytes::from(vec![7u8; len]))
 }
 
 /// Changes made while the walk runs — to slots it has seen and to slots it
@@ -72,7 +72,7 @@ fn a_fuzzy_checkpoint_misses_no_change_made_during_its_walk() {
     // Not seen yet (ids 7 and 8): claimed explicitly, deleted.
     h.call(W2, Call::Claim { req: 1, id: id(7), lease_ms: 30_000 });
     let seq = h.next_seq(P);
-    h.call(P, Call::Delete { seq, id: id(8), result: "out".into(), key: None });
+    h.call(P, Call::Delete { seq, id: id(8), result: ch("out"), key: None });
     let mut more = 30;
     while let Some(part) = h.s.scan_slice() {
         parts_into(&mut items, part);
@@ -154,8 +154,8 @@ fn cached_payloads_are_released_at_the_watermark_and_go_out_through_a_read() {
     assert_eq!(h.s.counters.released, 2, "down to 7/8 of the watermark: ids 6 and 5");
     assert!(h.slot(id(6)).unwrap().cold() && h.slot(id(5)).unwrap().cold() && !h.slot(id(4)).unwrap().cold());
     assert!(h.s.paused.is_empty(), "a durable payload is not its root's share");
-    h.call(W1, Call::Join { req: 1, channel: "work".into(), types: Vec::new(), lease_ms: 30_000, dispatch: false });
-    let joined = h.call(W1, Call::Window { channel: "work".into(), count: 5, bytes: 0 });
+    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false });
+    let joined = h.call(W1, Call::Window { join: 1, count: 5, bytes: 0 });
     let reads: Vec<Location> = joined.sends.iter().filter_map(|send| send.read).collect();
     assert_eq!(reads, [h.slot(id(5)).unwrap().at.unwrap()], "only the cold one is read");
     let warm = joined.warm.first().copied().expect("the next of the lane is read ahead");
@@ -187,12 +187,12 @@ fn streamed_follow_ups_point_at_their_body_and_a_volatile_one_is_journaled_nowhe
     let mut h = H::durable(false).cast();
     h.join(W1, "work", 1);
     let parent = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
-    let follow_ups = vec![Envelope::claimable("next", "do", Bytes::new()).with_id(id(2)), Envelope::claimable("scratch.r", "do", Bytes::new()).with_id(id(3))];
+    let follow_ups = vec![Envelope::claimable(ch("next"), 1, Bytes::new()).with_id(id(2)), Envelope::claimable(ch("scratch.r"), VOLATILE, Bytes::new()).with_id(id(3))];
     let seq = h.next_seq(W1);
     let effects = h.call(W1, Call::Complete { seq, id: parent.event.id, token: parent.token, follow_ups, spooled: vec![(0, durable_body.clone()), (1, volatile_body.clone())] });
-    let registered: Vec<(String, Option<Location>)> =
-        effects.records.iter().filter_map(|record| if let Record::Register { event, at, .. } = record { Some((event.channel.to_string(), *at)) } else { None }).collect();
-    assert_eq!(registered, [("next".to_owned(), Some(durable_body.at))], "the volatile follow-up writes nothing");
+    let registered: Vec<(Channel, Option<Location>)> =
+        effects.records.iter().filter_map(|record| if let Record::Register { event, at, .. } = record { Some((event.channel, *at)) } else { None }).collect();
+    assert_eq!(registered, [(ch("next"), Some(durable_body.at))], "the volatile follow-up writes nothing");
     let (durable, volatile) = (h.slot(id(2)).unwrap(), h.slot(id(3)).unwrap());
     assert!(durable.cold() && volatile.cold() && durable.len() == 12 && volatile.len() == 8);
     assert_eq!(h.s.counters.spilled_bytes, 8);
@@ -222,14 +222,14 @@ fn the_disk_watermark_pauses_the_root_with_the_biggest_disk_share() {
     let memory = MemoryConfig { early_pause: 1.0, ..config().memory };
     let mut h = H::with(EngineConfig { storage, memory, ..config() }, true).cast();
     for _ in 0..3 {
-        h.produce(P, Envelope::claimable("a", "do", Bytes::from(vec![1u8; 20_000])));
+        h.produce(P, Envelope::claimable(ch("a"), 1, Bytes::from(vec![1u8; 20_000])));
     }
-    h.produce(P, Envelope::claimable("b", "do", Bytes::from(vec![1u8; 1_000])));
+    h.produce(P, Envelope::claimable(ch("b"), 2, Bytes::from(vec![1u8; 1_000])));
     assert_eq!(h.s.disk_budget(), Some(90_000));
     assert!(h.s.paused.is_empty());
     h.land_in(1, 75_000);
-    assert!(h.s.paused.contains("a") && !h.s.paused.contains("b"), "75,000 bytes is past 80% of 90,000");
-    assert!(h.s.roots[&Name::new("a")].paused.as_ref().is_some_and(|paused| paused.by_disk));
+    assert!(h.s.paused.contains(&1) && !h.s.paused.contains(&2), "75,000 bytes is past 80% of 90,000");
+    assert!(h.s.roots[&1].paused.as_ref().is_some_and(|paused| paused.by_disk));
     assert_eq!(h.s.pressure().disk_used, 75_000);
 }
 

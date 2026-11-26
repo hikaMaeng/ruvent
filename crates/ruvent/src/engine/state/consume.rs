@@ -7,7 +7,7 @@ use super::wheel::Due;
 use super::State;
 use crate::engine::config::Method;
 use crate::engine::ops::{Assignment, FaultKind, Outbound, Refusal, SessionId};
-use crate::envelope::{ClaimToken, EventId, WorkKey};
+use crate::envelope::{Channel, ClaimToken, EventId, WorkKey};
 use crate::journal::Record;
 use crate::names::Name;
 use std::collections::HashSet;
@@ -19,83 +19,145 @@ impl State {
             let mut members: Vec<(u64, JoinId)> = Vec::new();
             for join_id in self.channel_joins.get(&key.0).into_iter().flatten() {
                 if let Some(join) = self.joins.get_mut(join_id) {
-                    if join.covers(&key.1) {
-                        join.lanes.push(key.clone());
-                        members.push((join.order, join_id.clone()));
+                    if join.selects(key) {
+                        join.lanes.push(*key);
+                        members.push((join.order, *join_id));
                     }
                 }
             }
             members.sort();
-            let serialize = self.config.channels.settings(&key.0).serialize_group;
-            self.lanes.insert(key.clone(), Lane { members: members.into_iter().map(|(_, join)| join).collect(), serialize, ..Lane::default() });
+            let serialize = self.config.types.settings(key.1).serialize_group;
+            self.lanes.insert(*key, Lane { members: members.into_iter().map(|(_, join)| join).collect(), serialize, ..Lane::default() });
+            self.typed_lanes.entry(key.1).or_default().insert(*key);
         }
-        self.lanes.entry(key.clone()).or_default()
+        self.lanes.entry(*key).or_default()
     }
 
     /// Drops a lane that has neither events nor members.
     pub(super) fn tidy(&mut self, key: &LaneKey) {
         if self.lanes.get(key).is_some_and(Lane::is_idle) {
             self.lanes.remove(key);
+            if let Some(lanes) = self.typed_lanes.get_mut(&key.1) {
+                lanes.remove(key);
+                if lanes.is_empty() {
+                    self.typed_lanes.remove(&key.1);
+                }
+            }
         }
     }
 
-    /// `Join`: checks the claim grant here, once (2.7).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn join(&mut self, session: SessionId, credential: &Name, req: u32, channel: &Name, types: Vec<Name>, lease_ms: u64, dispatch: bool) {
-        if !self.allowed(credential, Method::Claim, channel) {
-            return self.send(session, Outbound::Refused { req, reason: crate::engine::ops::Refusal::Forbidden }, None);
+    /// The joins that may take from the lane, in join order: its channel
+    /// joins, then the joins without a channel that select it.
+    pub(super) fn candidates(&self, key: &LaneKey) -> Vec<JoinId> {
+        let mut found: Vec<JoinId> = self.lanes.get(key).map(|lane| lane.members.clone()).unwrap_or_default();
+        for id in self.type_joins.get(&key.1).into_iter().flatten() {
+            if self.joins.get(id).is_some_and(|join| join.selects(key)) {
+                found.push(*id);
+            }
         }
-        let channel = self.names.adopt(channel);
-        let types: Vec<Name> = types.iter().map(|name| self.names.adopt(name)).collect();
-        let id: JoinId = (session, channel.clone());
-        // A second join on the same channel replaces the first's terms, keeping what it holds.
-        let held = self.joins.remove(&id).map(|old| {
-            for lane in &old.lanes {
-                if let Some(lane) = self.lanes.get_mut(lane) {
-                    lane.drop_member(&id);
+        found
+    }
+
+    /// The lanes the join may take from (see [`State::candidates`]).
+    fn lanes_of(&self, id: &JoinId) -> Vec<LaneKey> {
+        let Some(join) = self.joins.get(id) else { return Vec::new() };
+        if join.channel.is_some() {
+            return join.lanes.clone();
+        }
+        let mut found = Vec::new();
+        for kind in &join.types {
+            found.extend(self.typed_lanes.get(kind).into_iter().flatten().filter(|lane| lane.2 == join.isolated));
+        }
+        found
+    }
+
+    /// The connection's join that selects the lane, if any (at most one, `Overlap`).
+    fn join_for(&self, session: SessionId, lane: &LaneKey) -> Option<JoinId> {
+        let open = self.sessions.get(&session)?;
+        open.joins.iter().map(|req| (session, *req)).find(|id| self.joins.get(id).is_some_and(|join| join.selects(lane)))
+    }
+
+    /// `Join`: the claim grant covers every type asked for (empty: every
+    /// type), checked here once (2.7). The channel, if any, must be a UUIDv7.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn join(&mut self, session: SessionId, credential: &Name, req: u32, channel: Option<Channel>, types: Vec<u16>, isolated: bool, lease_ms: u64, dispatch: bool) {
+        let refuse = |state: &mut State, reason| state.send(session, Outbound::Refused { req, reason }, None);
+        if (channel.is_none() && (types.is_empty() || dispatch)) || channel.is_some_and(|channel| !channel.is_valid()) {
+            return refuse(self, Refusal::Malformed);
+        }
+        let mut types = types;
+        types.sort_unstable();
+        types.dedup();
+        let granted = match self.config.grants.as_ref().map(|grants| grants.get(credential.as_str())) {
+            None => true,
+            Some(None) => false,
+            Some(Some(grant)) => grant.methods.contains(&Method::Claim) && if types.is_empty() { grant.types.is_all() } else { grant.types.contains_all(&types) },
+        };
+        if !granted {
+            return refuse(self, Refusal::Forbidden);
+        }
+        let mine: Vec<JoinId> = self.sessions.get(&session).map(|open| open.joins.iter().map(|join| (session, *join)).collect()).unwrap_or_default();
+        let same = mine.iter().find(|id| self.joins.get(*id).is_some_and(|join| join.is(&channel, &types, isolated))).copied();
+        if mine.iter().any(|id| Some(id) != same.as_ref() && self.joins.get(id).is_some_and(|join| join.overlaps(&channel, &types, isolated))) {
+            return refuse(self, Refusal::Overlap);
+        }
+        let id: JoinId = (session, req);
+        // A name names one join: another selection may not take a name in use,
+        // or the old join would stay in the lanes and the type lists unnamed.
+        if mine.contains(&id) && same != Some(id) {
+            return refuse(self, Refusal::Malformed);
+        }
+        // A join that repeats a selection replaces its terms and name, keeping what it holds.
+        let held = same.and_then(|old| self.unlink(&old).map(|join| (old, join))).map(|(old, join)| {
+            for index in &join.attempts {
+                if let Some(attempt) = self.slots.get_mut(*index).and_then(|slot| match &mut slot.place {
+                    Place::Claimed(attempt) => Some(attempt),
+                    _ => None,
+                }) {
+                    if attempt.join.as_ref() == Some(&old) {
+                        attempt.join = Some(id);
+                    }
                 }
             }
-            if old.dispatch {
-                super::remove_from(&mut self.subscribers.dispatch, &channel, session);
-            }
-            (old.count, old.bytes, old.claimed, old.claimed_bytes, old.attempts, old.order)
+            (join.count, join.bytes, join.claimed, join.claimed_bytes, join.attempts, join.order)
         });
         let (count, bytes, claimed, claimed_bytes, attempts, order) = held.unwrap_or_else(|| {
             let order = self.next_order;
             self.next_order += 1;
             (0, 0, 0, 0, HashSet::new(), order)
         });
-        let mut join = Join { types, lease_ms, count, bytes, claimed, claimed_bytes, signalled: false, order, dispatch, lanes: Vec::new(), attempts };
-        let covered: Vec<LaneKey> = self.lanes.keys().filter(|key| key.0 == channel && join.covers(&key.1)).cloned().collect();
-        for key in &covered {
-            if let Some(lane) = self.lanes.get_mut(key) {
-                let at = lane.members.iter().position(|member| self.joins.get(member).is_some_and(|other| other.order > order)).unwrap_or(lane.members.len());
-                lane.members.insert(at, id.clone());
+        let mut join = Join { channel, types, isolated, lease_ms, count, bytes, claimed, claimed_bytes, signalled: false, order, dispatch, lanes: Vec::new(), attempts };
+        if let Some(channel) = &channel {
+            let covered: Vec<LaneKey> = self.lanes.keys().filter(|key| join.selects(key)).cloned().collect();
+            for key in &covered {
+                if let Some(lane) = self.lanes.get_mut(key) {
+                    let at = lane.members.iter().position(|member| self.joins.get(member).is_some_and(|other| other.order > order)).unwrap_or(lane.members.len());
+                    lane.members.insert(at, id);
+                }
+            }
+            join.lanes = covered;
+            insert_ordered(self.channel_joins.entry(*channel).or_default(), &self.joins, id, order);
+            if dispatch {
+                self.subscribers.dispatch.entry(*channel).or_default().push(session);
+            }
+        } else {
+            for kind in join.types.clone() {
+                insert_ordered(self.type_joins.entry(kind).or_default(), &self.joins, id, order);
             }
         }
-        join.lanes = covered;
-        self.joins.insert(id.clone(), join);
-        let list = self.channel_joins.entry(channel.clone()).or_default();
-        if !list.contains(&id) {
-            list.push(id.clone());
-        }
-        if dispatch {
-            self.subscribers.dispatch.entry(channel.clone()).or_default().push(session);
-        }
+        self.joins.insert(id, join);
         if let Some(open) = self.sessions.get_mut(&session) {
-            if !open.joins.contains(&channel) {
-                open.joins.push(channel);
-            }
+            open.joins.push(req);
         }
         self.send(session, Outbound::Joined { req }, None);
         self.to_fill.push(id);
     }
 
     /// `Window`: the absolute number of assignments and bytes this join may hold (2.4).
-    pub(super) fn window(&mut self, session: SessionId, channel: &Name, count: u32, bytes: u64) {
-        let id: JoinId = (session, channel.clone());
+    pub(super) fn window(&mut self, session: SessionId, join: u32, count: u32, bytes: u64) {
+        let id: JoinId = (session, join);
         let Some(join) = self.joins.get_mut(&id) else {
-            return self.fault(session, FaultKind::Malformed, "a window for a channel this connection has not joined");
+            return self.fault(session, FaultKind::Malformed, "a window for a join this connection does not have");
         };
         join.count = count;
         join.bytes = bytes;
@@ -111,24 +173,9 @@ impl State {
     }
 
     /// Leaves a join because its connection closed.
-    pub(super) fn part(&mut self, session: SessionId, channel: Name, unwritten: &[ClaimToken]) {
-        let id: JoinId = (session, channel.clone());
-        let Some(join) = self.joins.remove(&id) else { return };
-        for lane in &join.lanes {
-            if let Some(found) = self.lanes.get_mut(lane) {
-                found.drop_member(&id);
-            }
-            self.tidy(lane);
-        }
-        if let Some(list) = self.channel_joins.get_mut(&channel) {
-            list.retain(|member| *member != id);
-            if list.is_empty() {
-                self.channel_joins.remove(&channel);
-            }
-        }
-        if join.dispatch {
-            super::remove_from(&mut self.subscribers.dispatch, &channel, session);
-        }
+    pub(super) fn part(&mut self, session: SessionId, join: u32, unwritten: &[ClaimToken]) {
+        let id: JoinId = (session, join);
+        let Some(join) = self.unlink(&id) else { return };
         let grace = super::millis(self.config.reconnect_grace);
         for index in join.attempts {
             let generation = self.slots.generation(index);
@@ -149,14 +196,16 @@ impl State {
     }
 
     /// Gives a join that has room the earliest eligible head of its lanes,
-    /// until it is full or nothing fits (2.4).
+    /// until it is full or nothing fits (2.4). A join without a channel looks
+    /// at every lane of its types: the cost is one head per such lane, and a
+    /// lane only it takes exists only while it has waiting events.
     pub(super) fn fill(&mut self, id: &JoinId) {
         loop {
             let Some(join) = self.joins.get(id) else { return };
             if !join.has_room() {
                 return;
             }
-            let lanes = join.lanes.clone();
+            let lanes = self.lanes_of(id);
             let mut best: Option<(WorkKey, Index, LaneKey)> = None;
             for lane in lanes {
                 if let Some((key, index, len)) = self.head(&lane) {
@@ -186,12 +235,14 @@ impl State {
     /// The next member with room for `len` bytes, starting at the cursor.
     fn pick(&mut self, lane: &LaneKey, len: u64) -> Option<JoinId> {
         let found = self.lanes.get(lane)?;
-        let count = found.members.len();
+        let cursor = found.cursor;
+        let candidates = self.candidates(lane);
+        let count = candidates.len();
         for step in 0..count {
-            let at = (found.cursor + step) % count;
-            let member = &found.members[at];
+            let at = (cursor + step) % count;
+            let member = &candidates[at];
             if self.joins.get(member).is_some_and(|join| join.fits(len)) {
-                let member = member.clone();
+                let member = *member;
                 if let Some(found) = self.lanes.get_mut(lane) {
                     found.cursor = (at + 1) % count;
                 }
@@ -207,28 +258,23 @@ impl State {
         if join.signalled {
             return;
         }
-        let lanes = join.lanes.clone();
-        for lane in lanes {
+        for lane in self.lanes_of(id) {
             if self.head(&lane).is_some() {
                 if let Some(join) = self.joins.get_mut(id) {
                     join.signalled = true;
                 }
-                let channel = id.1.clone();
-                self.send(id.0, Outbound::Pending { channel }, None);
+                self.send(id.0, Outbound::Pending { join: id.1 }, None);
                 return;
             }
         }
     }
 
     fn signal_pending(&mut self, lane: &LaneKey) {
-        let Some(found) = self.lanes.get(lane) else { return };
-        let members = found.members.clone();
-        for member in members {
+        for member in self.candidates(lane) {
             if let Some(join) = self.joins.get_mut(&member) {
                 if !join.signalled {
                     join.signalled = true;
-                    let channel = member.1.clone();
-                    self.send(member.0, Outbound::Pending { channel }, None);
+                    self.send(member.0, Outbound::Pending { join: member.1 }, None);
                 }
             }
         }
@@ -256,7 +302,7 @@ impl State {
                 expired.push(index);
                 continue;
             }
-            if lane.serialize && slot.fixed.group.is_some_and(|group| self.groups.contains_key(&(slot.channel.clone(), group))) {
+            if lane.serialize && slot.fixed.group.is_some_and(|group| self.groups.contains_key(&(slot.channel, group))) {
                 continue;
             }
             if net && self.roots.get(&slot.fixed.root).is_some_and(|root| root.blocks_growth()) {
@@ -280,10 +326,12 @@ impl State {
         if let Some(found) = self.lanes.get_mut(lane) {
             found.queue.remove(&key);
         }
+        // A lane only joins without a channel take goes once it is empty.
+        self.tidy(lane);
         let Some((lease_ms, credential)) = self.joins.get(id).map(|join| join.lease_ms).zip(self.sessions.get(&id.0).map(|open| open.credential.clone())) else { return };
         let token = self.next_token();
         let until = self.now.saturating_add(lease_ms);
-        let attempt = Attempt { token, lease_ms, until, credential, join: Some(id.clone()) };
+        let attempt = Attempt { token, lease_ms, until, credential, join: Some(*id) };
         let Some(len) = self.start(index, attempt) else { return };
         let more = {
             let Some(join) = self.joins.get_mut(id) else { return };
@@ -291,7 +339,7 @@ impl State {
             join.claimed_bytes += len;
             join.attempts.insert(index);
             let full = !join.has_room();
-            let lanes = join.lanes.clone();
+            let lanes = if full { self.lanes_of(id) } else { Vec::new() };
             let more = full && lanes.iter().any(|lane| self.lanes.get(lane).is_some_and(|lane| !lane.queue.is_empty()));
             if more {
                 if let Some(join) = self.joins.get_mut(id) {
@@ -315,9 +363,9 @@ impl State {
         let slot = self.slots.get_mut(index)?;
         let (token, until, lease_ms, credential) = (attempt.token, attempt.until, attempt.lease_ms, attempt.credential.clone());
         slot.place = Place::Claimed(attempt);
-        let (len, durable, key, group, channel) = (slot.len(), slot.fixed.durable, slot.fixed.key, slot.fixed.group, slot.channel.clone());
+        let (len, durable, key, group, channel, event_type) = (slot.len(), slot.fixed.durable, slot.fixed.key, slot.fixed.group, slot.channel, slot.fixed.event_type);
         if let Some(group) = group {
-            if self.config.channels.settings(&channel).serialize_group {
+            if self.config.types.settings(event_type).serialize_group {
                 *self.groups.entry((channel, group)).or_default() += 1;
             }
         }
@@ -335,7 +383,7 @@ impl State {
         let refuse = |state: &mut State, reason| state.send(session, Outbound::Refused { req, reason }, None);
         let Some(index) = self.slots.by_id(&id) else { return refuse(self, Refusal::Missing) };
         let Some(slot) = self.slots.get(index) else { return refuse(self, Refusal::Missing) };
-        if !self.allowed(credential, Method::Claim, &slot.channel) {
+        if !self.allowed(credential, Method::Claim, slot.fixed.event_type) {
             return refuse(self, Refusal::Forbidden);
         }
         match slot.place {
@@ -347,17 +395,16 @@ impl State {
             self.expire(index);
             return refuse(self, Refusal::Missing);
         }
-        let (lane, key, root, channel) = (slot.lane(), slot.fixed.key, slot.fixed.root.clone(), slot.channel.clone());
+        let (lane, key, root) = (slot.lane(), slot.fixed.key, slot.fixed.root);
         if matches!(slot.place, Place::Held) {
-            self.unhold(&root, &lane, key);
+            self.unhold(root, &lane, key);
         } else if let Some(found) = self.lanes.get_mut(&lane) {
             found.queue.remove(&key);
         }
-        let join_id: JoinId = (session, channel);
-        let join = self.joins.contains_key(&join_id).then_some(join_id.clone());
+        let join = self.join_for(session, &lane);
         let token = self.next_token();
         let until = self.now.saturating_add(lease_ms);
-        let Some(len) = self.start(index, Attempt { token, lease_ms, until, credential: credential.clone(), join: join.clone() }) else { return };
+        let Some(len) = self.start(index, Attempt { token, lease_ms, until, credential: credential.clone(), join }) else { return };
         if let Some(join) = join.and_then(|join| self.joins.get_mut(&join)) {
             join.claimed += 1;
             join.claimed_bytes += len;
@@ -390,7 +437,7 @@ impl State {
     }
 
     /// `Extend`: re-arms the lease at its length from now, and moves the
-    /// attempt to this connection's join on the channel, if it has one (2.4).
+    /// attempt to this connection's join that selects its lane, if it has one (2.4).
     /// Never journaled: a restart re-arms every lease anyway.
     pub(super) fn extend(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken) {
         let Some(index) = self.attempt_for(session, credential, id, token) else { return };
@@ -398,12 +445,19 @@ impl State {
         let now = self.now;
         let Some(slot) = self.slots.get_mut(index) else { return };
         let len = slot.len();
-        let channel = slot.channel.clone();
+        let lane = slot.lane();
+        let Some(target) = self.join_for(session, &lane) else {
+            let Some(Place::Claimed(attempt)) = self.slots.get_mut(index).map(|slot| &mut slot.place) else { return };
+            attempt.until = now.saturating_add(attempt.lease_ms);
+            let until = attempt.until;
+            self.wheel.wake_at(until, index, generation, Due::Lease(token));
+            return;
+        };
+        let Some(slot) = self.slots.get_mut(index) else { return };
         let Place::Claimed(attempt) = &mut slot.place else { return };
         attempt.until = now.saturating_add(attempt.lease_ms);
         let until = attempt.until;
-        let target: JoinId = (session, channel);
-        let moved = if attempt.join.as_ref() != Some(&target) && self.joins.contains_key(&target) { Some(attempt.join.replace(target.clone())) } else { None };
+        let moved = if attempt.join.as_ref() != Some(&target) && self.joins.contains_key(&target) { Some(attempt.join.replace(target)) } else { None };
         self.wheel.wake_at(until, index, generation, Due::Lease(token));
         if let Some(previous) = moved {
             if let Some(previous) = previous.and_then(|previous| self.joins.get_mut(&previous).map(|join| (previous, join))) {
@@ -420,4 +474,39 @@ impl State {
             }
         }
     }
+
+    /// Takes a join out of every index (lanes, channel or type lists, the
+    /// dispatch subscribers, its connection's list) and returns it.
+    fn unlink(&mut self, id: &JoinId) -> Option<Join> {
+        let join = self.joins.remove(id)?;
+        for lane in &join.lanes {
+            if let Some(found) = self.lanes.get_mut(lane) {
+                found.drop_member(id);
+            }
+            self.tidy(lane);
+        }
+        match &join.channel {
+            Some(channel) => {
+                super::remove_from(&mut self.channel_joins, channel, *id);
+                if join.dispatch {
+                    super::remove_from(&mut self.subscribers.dispatch, channel, id.0);
+                }
+            }
+            None => {
+                for kind in &join.types {
+                    super::remove_from(&mut self.type_joins, kind, *id);
+                }
+            }
+        }
+        if let Some(open) = self.sessions.get_mut(&id.0) {
+            open.joins.retain(|req| *req != id.1);
+        }
+        Some(join)
+    }
+}
+
+/// Puts `id` into a join list at its join order.
+fn insert_ordered(list: &mut Vec<JoinId>, joins: &std::collections::HashMap<JoinId, Join>, id: JoinId, order: u64) {
+    let at = list.iter().position(|other| joins.get(other).is_some_and(|other| other.order > order)).unwrap_or(list.len());
+    list.insert(at, id);
 }

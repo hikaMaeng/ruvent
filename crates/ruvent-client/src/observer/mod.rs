@@ -13,14 +13,14 @@
 //! number of calls handled so far — and the server's answer comes back in
 //! the stream as [`Observed::Subscribed`] with that ticket, behind every
 //! delivery the server sent before it. So the k-th call is in effect on a
-//! server from its first `Subscribed` for that target with `ticket ≥ k`:
+//! server from its first `Subscribed` for that channel with `ticket ≥ k`:
 //! what follows it in the stream was sent after the subscription took
 //! effect (a proxy uses this to never hand a user an event sent before its
 //! own join).
 //!
 //! | state | key | scope | lifetime | bound | cleared by |
 //! | --- | --- | --- | --- | --- | --- |
-//! | subscriptions | target | observer | `subscribe` ~ `unsubscribe` | targets asked | the caller |
+//! | subscriptions | channel | observer | `subscribe` ~ `unsubscribe` | channels asked | the caller |
 //! | answers waited for | (server, request number) | connection | asked ~ answered or disconnection | calls in progress | SDK |
 //! | subscribe tickets | observer | observer | start ~ drop | one counter | never cleared |
 //! | server list and lines | server address | process | while listed | servers | SDK |
@@ -30,7 +30,7 @@ use crate::line::{Event, Line, Spec};
 use crate::link::Connector;
 use crate::servers::{Server, ServerList};
 use parking_lot::Mutex;
-use ruvent::{ByeReason, Call, Envelope, Hello, Link, Outbound, Refusal, Stats, Target};
+use ruvent::{ByeReason, Call, Channel, Envelope, Hello, Link, Outbound, Refusal, Stats};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -58,14 +58,15 @@ impl Default for ObserverConfig {
 pub enum Observed {
     /// A dispatch event, as sent.
     Delivery { server: Server, event: Envelope },
-    /// Claimable work on a subscribed channel: head and work key.
+    /// Claimable work on a subscribed channel: head and work key. With its
+    /// isolated bit set, the event was isolated (B6): the work gave up.
     Notice { server: Server, event: Envelope },
     /// Subscribed again on a new connection; `restarted`: the server restarted.
     Up { server: Server, restarted: bool },
-    /// `server` confirmed a subscription to `target` sent with `ticket` (see
+    /// `server` confirmed a subscription to `channel` sent with `ticket` (see
     /// the module's "When a subscription takes effect"). Comes before the
     /// subscription's backlog notices and before the call's answer.
-    Subscribed { server: Server, target: Target, ticket: u64 },
+    Subscribed { server: Server, channel: Channel, ticket: u64 },
     /// The connection ended; what was dispatched until the next `Up` is lost.
     Gap { server: Server, bye: Option<ByeReason> },
 }
@@ -117,8 +118,8 @@ impl Collect {
 }
 
 enum Command {
-    Subscribe(Target, oneshot::Sender<Result<(), Refusal>>),
-    Unsubscribe(Target, oneshot::Sender<Result<(), Refusal>>),
+    Subscribe(Channel, oneshot::Sender<Result<(), Refusal>>),
+    Unsubscribe(Channel, oneshot::Sender<Result<(), Refusal>>),
     Stats(Server, oneshot::Sender<Result<Stats, Refusal>>),
     Drain(Server, oneshot::Sender<Result<(), Refusal>>),
 }
@@ -143,19 +144,19 @@ impl Observer {
     pub fn start(connector: Arc<dyn Connector>, servers: &dyn ServerList, config: ObserverConfig) -> (Observer, mpsc::Receiver<Observed>) {
         let (out, stream) = mpsc::channel(config.queue.max(1));
         let (commands, command_rx) = mpsc::channel(64);
-        let actor = Actor { connector, hello: Hello::observer(&config.credential), config, out, targets: BTreeSet::new(), lines: HashMap::new(), tickets: 0 };
+        let actor = Actor { connector, hello: Hello::observer(&config.credential), config, out, channels: BTreeSet::new(), lines: HashMap::new(), tickets: 0 };
         let task = tokio::spawn(actor.run(servers.watch(), command_rx));
         (Observer { commands, _task: Arc::new(Task(task)) }, stream)
     }
 
     /// Subscribes on every connected server (and every later connection).
     /// Answers once every connected server answered; the first refusal wins.
-    pub async fn subscribe(&self, target: Target) -> Result<(), Refusal> {
-        self.call(|done| Command::Subscribe(target, done)).await?
+    pub async fn subscribe(&self, channel: Channel) -> Result<(), Refusal> {
+        self.call(|done| Command::Subscribe(channel, done)).await?
     }
 
-    pub async fn unsubscribe(&self, target: Target) -> Result<(), Refusal> {
-        self.call(|done| Command::Unsubscribe(target, done)).await?
+    pub async fn unsubscribe(&self, channel: Channel) -> Result<(), Refusal> {
+        self.call(|done| Command::Unsubscribe(channel, done)).await?
     }
 
     /// One server's statistics (operator grant).
@@ -220,30 +221,11 @@ struct Actor {
     hello: Hello,
     config: ObserverConfig,
     out: mpsc::Sender<Observed>,
-    targets: BTreeSet<TargetKey>,
+    channels: BTreeSet<Channel>,
     lines: HashMap<Server, ObserveLine>,
     /// `subscribe` calls handled so far: the last ticket given (see the module's
     /// "When a subscription takes effect"). One counter, never reset.
     tickets: u64,
-}
-
-/// A target kept in order.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct TargetKey(bool, String);
-
-impl TargetKey {
-    fn of(target: &Target) -> Self {
-        TargetKey(matches!(target, Target::Prefix(_)), target.name().as_str().to_owned())
-    }
-
-    fn target(&self) -> Target {
-        let name = ruvent::Name::new(&self.1);
-        if self.0 {
-            Target::Prefix(name)
-        } else {
-            Target::Channel(name)
-        }
-    }
 }
 
 impl Actor {
@@ -298,12 +280,12 @@ impl Actor {
     async fn event(&mut self, event: Event) -> bool {
         match event {
             Event::Up { server, epoch, link, restarted, .. } => {
-                let targets: Vec<Target> = self.targets.iter().map(TargetKey::target).collect();
+                let channels: Vec<Channel> = self.channels.iter().copied().collect();
                 let ticket = self.tickets;
                 let Some(line) = self.lines.get_mut(&server) else { return true };
                 let mut live = Live { epoch, link, next_req: 1, asks: HashMap::new() };
-                for target in targets {
-                    live.ask(|req| Call::Subscribe { req, target, after: None }, Ask::Subscribe { collect: None, ticket }).await;
+                for channel in channels {
+                    live.ask(|req| Call::Subscribe { req, channel, after: None }, Ask::Subscribe { collect: None, ticket }).await;
                 }
                 line.live = Some(live);
                 self.out.send(Observed::Up { server, restarted }).await.is_ok()
@@ -314,11 +296,11 @@ impl Actor {
                 match *message {
                     Outbound::Delivery(event) => return self.out.send(Observed::Delivery { server, event }).await.is_ok(),
                     Outbound::Notice(event) => return self.out.send(Observed::Notice { server, event }).await.is_ok(),
-                    Outbound::Subscribed { req, target, backlog, .. } => {
+                    Outbound::Subscribed { req, channel, backlog, .. } => {
                         if let Some(Ask::Subscribe { collect, ticket }) = live.asks.remove(&req) {
                             // The confirmation goes into the stream before the caller is
                             // answered: whoever acts on the answer finds it already queued.
-                            if self.out.send(Observed::Subscribed { server: server.clone(), target, ticket }).await.is_err() {
+                            if self.out.send(Observed::Subscribed { server: server.clone(), channel, ticket }).await.is_err() {
                                 return false;
                             }
                             if let Some(collect) = collect {
@@ -378,25 +360,23 @@ impl Actor {
 
     async fn command(&mut self, command: Command) {
         match command {
-            Command::Subscribe(target, done) => {
+            Command::Subscribe(channel, done) => {
                 self.tickets += 1;
                 let ticket = self.tickets;
-                self.targets.insert(TargetKey::of(&target));
+                self.channels.insert(channel);
                 let collect = Collect::new(self.lines.values().filter(|line| line.live.is_some()).count(), done);
                 for line in self.lines.values_mut() {
                     if let Some(live) = line.live.as_mut() {
-                        let target = target.clone();
-                        live.ask(|req| Call::Subscribe { req, target, after: None }, Ask::Subscribe { collect: Some(collect.clone()), ticket }).await;
+                        live.ask(|req| Call::Subscribe { req, channel, after: None }, Ask::Subscribe { collect: Some(collect.clone()), ticket }).await;
                     }
                 }
             }
-            Command::Unsubscribe(target, done) => {
-                self.targets.remove(&TargetKey::of(&target));
+            Command::Unsubscribe(channel, done) => {
+                self.channels.remove(&channel);
                 let collect = Collect::new(self.lines.values().filter(|line| line.live.is_some()).count(), done);
                 for line in self.lines.values_mut() {
                     if let Some(live) = line.live.as_mut() {
-                        let target = target.clone();
-                        live.ask(|req| Call::Unsubscribe { req, target }, Ask::Unsubscribe(Some(collect.clone()))).await;
+                        live.ask(|req| Call::Unsubscribe { req, channel }, Ask::Unsubscribe(Some(collect.clone()))).await;
                     }
                 }
             }

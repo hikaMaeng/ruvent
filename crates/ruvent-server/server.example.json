@@ -7,13 +7,13 @@
       "name": "workers",
       "token": "workers-secret-change-me",
       "methods": ["register_claimable", "register_dispatch", "claim", "complete", "subscribe", "unsubscribe"],
-      "channels": ["orders.*", "jobs.*", "reply.*"]
+      "types": ["10-29", "100-199"]
     },
     {
       "name": "proxy",
       "token": "proxy-secret-change-me",
       "methods": ["register_claimable", "register_dispatch", "delete", "claim", "complete", "subscribe", "unsubscribe"],
-      "channels": ["chat.*", "orders.*", "proxy.*", "reply.*"],
+      "types": ["10-19", "100-199"],
       "delegate": true
     },
     {
@@ -26,11 +26,11 @@
   "producers": { "linger_ms": 3600000, "max_entries": 1000000 },
   "memory": { "limit": 8589934592, "high_watermark": 0.8 },
   "storage": { "segment_bytes": 67108864, "disk_capacity": 107374182400 },
-  "channels": {
+  "types": {
     "default": { "isolate_after": 5 },
     "rules": [
-      { "pattern": "jobs.*", "isolate_after": 3, "serialize_group": true },
-      { "pattern": "proxy.*", "volatile": true }
+      { "types": ["20-29"], "isolate_after": 3, "serialize_group": true },
+      { "types": ["100-199"], "volatile": true }
     ]
   },
   "connection": {
@@ -40,8 +40,7 @@
   },
   "snapshot": {
     "directory": "data/snapshots",
-    "channels": ["orders.*"],
-    "types": [],
+    "types": ["10-19"],
     "max_events": 4096,
     "max_age_ms": 5000
   }

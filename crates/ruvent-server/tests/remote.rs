@@ -3,8 +3,8 @@
 //! (retransmissions, gaps, unread sockets, version 1).
 
 use ruvent::{
-    Assignment, ByeReason, Bytes, Call, Client, Engine, EngineConfig, Envelope, EventId, FaultKind, Grant, Grants, Hello, Inbox, Incoming, MemoryConfig, Method, Methods, Name, Outbound, Pattern,
-    Refusal, Role, SegmentLog, Target, Welcome,
+    Assignment, ByeReason, Bytes, Call, Channel, Client, Engine, EngineConfig, Envelope, EventId, FaultKind, Grant, Grants, Hello, Inbox, Incoming, MemoryConfig, Method, Methods, Name, Outbound,
+    Refusal, Role, SegmentLog, TypeSet, Welcome,
 };
 use ruvent_client::remote::{connect, Options, Refused};
 use ruvent_protocol::{features, Body, Decoder, Encoder, Message, RecordReader, Side, DICTIONARY, VERSION};
@@ -27,6 +27,8 @@ const WAIT: Duration = Duration::from_secs(10);
 /// How long "nothing arrives" is watched for.
 const QUIET: Duration = Duration::from_millis(150);
 const LEASE: Duration = Duration::from_secs(60);
+/// The tests' volatile type (plan 9.15: volatility is a type's setting).
+const VOLATILE: u16 = 900;
 
 struct Server {
     address: String,
@@ -101,11 +103,22 @@ async fn durable(path: &PathBuf, config: EngineConfig) -> Engine {
 }
 
 fn job(channel: &str, payload: &'static [u8]) -> Envelope {
-    Envelope::claimable(channel, "do", Bytes::from_static(payload)).with_id(EventId::new_v7())
+    Envelope::claimable(ch(channel), 1, Bytes::from_static(payload)).with_id(EventId::new_v7())
+}
+
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
 }
 
 fn raw_hello(role: Role, producer: [u8; 16], nonce: [u8; 16]) -> Hello {
-    Hello { role, credential: Name::new(""), producer: (role != Role::Observe).then_some(producer), nonce, linger_ms: None, acks: true, channels: Vec::new() }
+    Hello { role, credential: Name::new(""), producer: (role != Role::Observe).then_some(producer), nonce, linger_ms: None, acks: true, types: Vec::new() }
 }
 
 /// One wire v2 connection driven by hand.
@@ -205,45 +218,52 @@ async fn each_role_does_its_own_work_over_tcp() {
     let (producer, _produced) = dial(&server, Hello::producer("x")).await;
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
     let (observer, mut seen) = dial(&server, Hello::observer("x")).await;
-    observer.subscribe(Target::Channel("feed".into()), None).await.unwrap();
-    worker.join("orders".into(), Vec::new(), LEASE, false).await.unwrap();
-    worker.window("orders".into(), 4, 0).await.unwrap();
+    observer.subscribe(ch("feed"), None).await.unwrap();
+    let worker_join = worker.join(Some(ch("orders")), Vec::new(), false, LEASE, false).await.unwrap();
+    worker.window(worker_join, 4, 0).await.unwrap();
 
     let (seq, id) = producer.register(job("orders", b"p")).await.unwrap();
     producer.committed(seq).await.unwrap();
     let assigned = assignment(&mut work).await;
     assert_eq!((assigned.event.id, assigned.event.payload.as_ref(), assigned.event.principal.as_deref()), (id, &b"p"[..], Some("svc")));
     assert!(assigned.until > 0 && assigned.until <= LEASE.as_millis() as u64, "the lease left when it was written: {}", assigned.until);
-    let done = worker.complete(id, assigned.token, vec![Envelope::dispatch("feed", "created", Bytes::from_static(b"x"))]).await.unwrap();
+    let done = worker.complete(id, assigned.token, vec![Envelope::dispatch(ch("feed"), 2, Bytes::from_static(b"x"))]).await.unwrap();
     worker.committed(done).await.unwrap();
     let created = delivery(&mut seen).await;
-    assert_eq!((created.event_type.as_str(), created.payload.as_ref(), created.principal.as_deref()), ("created", &b"x"[..], Some("svc")));
+    assert_eq!((created.event_type, created.payload.as_ref(), created.principal.as_deref()), (2, &b"x"[..], Some("svc")));
 
-    let (_, posted) = producer.register(Envelope::dispatch("feed", "post", Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
+    let (_, posted) = producer.register(Envelope::dispatch(ch("feed"), 3, Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
     assert_eq!(delivery(&mut seen).await.id, posted);
-    assert_eq!(producer.join("orders".into(), Vec::new(), LEASE, false).await, Err(Refusal::Malformed));
+    assert_eq!(producer.join(Some(ch("orders")), Vec::new(), false, LEASE, false).await, Err(Refusal::Malformed));
     let stats = observer.stats().await.unwrap();
     assert_eq!((stats.waiting, stats.claimed), (0, 0));
 }
 
-/// A wrong token, a production connection declaring a channel it may not
-/// write, and an observer asking for what its grant lacks are refused with
-/// their reason (2.7).
+/// A wrong token, a production connection declaring a type it may not
+/// register, and an observer asking for what its grant lacks are refused
+/// with their reason (2.7). Grants are by type (plan 9.15): a subscription
+/// is the method alone, and hands the reader only the types it is granted;
+/// a channel that is not a UUIDv7 is refused as malformed.
 #[tokio::test]
-async fn a_wrong_token_and_a_forbidden_channel_are_refused_with_their_reason() {
+async fn a_wrong_token_and_a_forbidden_type_are_refused_with_their_reason() {
     let mut grants = Grants::new();
     grants.insert("svc".into(), Grant::all());
-    grants.insert("reader".into(), Grant { methods: vec![Method::Subscribe, Method::Unsubscribe], channels: vec![Pattern("pub.*".into())], delegate: false });
+    grants.insert("reader".into(), Grant { methods: vec![Method::Subscribe, Method::Unsubscribe], types: TypeSet::from_ranges([(100, 199)]), delegate: false });
     let engine = Engine::volatile(EngineConfig { grants: Some(grants), ..EngineConfig::default() }).await;
     let server = server(&engine).await;
     let error = connect(&server.address, "nope", Hello::producer("x"), Options::default()).await.err().unwrap();
     assert_eq!((error.kind(), Refused::of(&error)), (io::ErrorKind::PermissionDenied, Some(ByeReason::Token)));
-    let declared = Hello { channels: vec!["secret".into()], ..Hello::producer("x") };
+    let declared = Hello { types: vec![150], ..Hello::producer("x") };
     let error = connect(&server.address, "reader-token", declared, Options::default()).await.err().unwrap();
-    assert_eq!(Refused::of(&error), Some(ByeReason::Forbidden));
-    let (reader, _inbox) = connect(&server.address, "reader-token", Hello::observer("x"), Options::default()).await.unwrap();
-    assert_eq!(reader.subscribe(Target::Channel("secret".into()), None).await, Err(Refusal::Forbidden));
-    assert!(reader.subscribe(Target::Channel("pub.news".into()), None).await.is_ok());
+    assert_eq!(Refused::of(&error), Some(ByeReason::Forbidden), "it may read type 150, not register it");
+    let (reader, mut inbox) = connect(&server.address, "reader-token", Hello::observer("x"), Options::default()).await.unwrap();
+    assert_eq!(reader.subscribe(Channel([0; 16]), None).await, Err(Refusal::Malformed));
+    assert!(reader.subscribe(ch("pub.news"), None).await.is_ok());
+    let (producer, _) = dial(&server, Hello::producer("x")).await;
+    for event_type in [5, 150] {
+        producer.register_committed(Envelope::dispatch(ch("pub.news"), event_type, Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
+    }
+    assert_eq!(delivery(&mut inbox).await.event_type, 150, "type 5 is not the reader's to read");
     assert_eq!(reader.stats().await, Err(Refusal::Forbidden));
     assert_eq!(reader.drain().await, Err(Refusal::Forbidden));
 }
@@ -274,7 +294,7 @@ async fn acknowledgements_are_cumulative_not_one_per_registration() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let server = server(&engine).await;
     let (mut raw, _) = Raw::welcomed(&server.address, raw_hello(Role::Produce, [3; 16], [4; 16])).await;
-    raw.send((1..=2000).map(|seq| register(seq, Envelope::dispatch("feed", "tick", Bytes::new())))).await;
+    raw.send((1..=2000).map(|seq| register(seq, Envelope::dispatch(ch("feed"), 4, Bytes::new())))).await;
     let mut acknowledgements = 0;
     loop {
         if let Message::Outbound(Outbound::Committed { seq }) = raw.expect().await {
@@ -333,11 +353,11 @@ async fn a_window_takes_work_up_to_its_size_and_a_completion_frees_a_slot() {
     let server = server(&engine).await;
     let (producer, _) = dial(&server, Hello::producer("x")).await;
     for payload in [&b"1"[..], b"2", b"3"] {
-        producer.register_committed(Envelope::claimable("orders", "do", Bytes::from_static(payload))).await.unwrap();
+        producer.register_committed(Envelope::claimable(ch("orders"), 1, Bytes::from_static(payload))).await.unwrap();
     }
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    worker.join("orders".into(), Vec::new(), LEASE, false).await.unwrap();
-    worker.window("orders".into(), 2, 0).await.unwrap();
+    let worker_join = worker.join(Some(ch("orders")), Vec::new(), false, LEASE, false).await.unwrap();
+    worker.window(worker_join, 2, 0).await.unwrap();
     let first = assignment(&mut work).await;
     let second = assignment(&mut work).await;
     assert!(second.more, "the window is full and one more waits");
@@ -360,18 +380,18 @@ async fn a_large_body_arrives_whole() {
     let (producer, _) = dial(&server, Hello::producer("x")).await;
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
     let (observer, mut seen) = dial(&server, Hello::observer("x")).await;
-    observer.subscribe(Target::Channel("feed".into()), None).await.unwrap();
-    worker.join("big".into(), Vec::new(), LEASE, false).await.unwrap();
-    worker.window("big".into(), 1, 0).await.unwrap();
-    producer.register_committed(Envelope::claimable("big", "do", body.clone())).await.unwrap();
+    observer.subscribe(ch("feed"), None).await.unwrap();
+    let worker_join = worker.join(Some(ch("big")), Vec::new(), false, LEASE, false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
+    producer.register_committed(Envelope::claimable(ch("big"), 1, body.clone())).await.unwrap();
     let assigned = assignment(&mut work).await;
     assert_eq!(assigned.event.payload, body);
-    worker.complete(assigned.event.id, assigned.token, vec![Envelope::dispatch("feed", "copy", body.clone())]).await.unwrap();
+    worker.complete(assigned.event.id, assigned.token, vec![Envelope::dispatch(ch("feed"), 5, body.clone())]).await.unwrap();
     assert_eq!(delivery(&mut seen).await.payload, body);
     // Over the bound, the client refuses it before it leaves (B13).
     let over = Bytes::from(vec![0u8; ruvent_protocol::MAX_BODY + 1]);
-    assert_eq!(producer.register(Envelope::dispatch("feed", "x", over)).await.map(|_| ()), Err(Refusal::Closed));
-    producer.register_committed(Envelope::dispatch("feed", "still", Bytes::new())).await.unwrap();
+    assert_eq!(producer.register(Envelope::dispatch(ch("feed"), 6, over)).await.map(|_| ()), Err(Refusal::Closed));
+    producer.register_committed(Envelope::dispatch(ch("feed"), 7, Bytes::new())).await.unwrap();
 }
 
 /// Under memory pressure a work connection does not stop reading: a
@@ -387,10 +407,7 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
         let memory = MemoryConfig { limit: Some(10_000), slot_bytes: 100, early_pause: 1.0, ..MemoryConfig::default() };
         let engine = durable(&path, {
             let mut config = EngineConfig { memory, ..EngineConfig::default() };
-            config
-                .channels
-                .rules
-                .insert(0, ruvent::ChannelRule { pattern: ruvent::Pattern("scratch.*".into()), settings: ruvent::ChannelSettings { volatile: true, ..ruvent::ChannelSettings::default() } });
+            config.types.rules.insert(0, ruvent::TypeRule { types: TypeSet::of([VOLATILE]), settings: ruvent::TypeSettings { volatile: true, ..ruvent::TypeSettings::default() } });
             config
         })
         .await;
@@ -398,14 +415,14 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
         let (producer, _) = dial(&server, Hello::producer("x")).await;
         let (worker, mut work) = dial(&server, Hello::worker("x")).await;
         producer.register_committed(job("work", b"p")).await.unwrap();
-        worker.join("work".into(), Vec::new(), LEASE, false).await.unwrap();
-        worker.window("work".into(), 1, 0).await.unwrap();
+        let worker_join = worker.join(Some(ch("work")), Vec::new(), false, LEASE, false).await.unwrap();
+        worker.window(worker_join, 1, 0).await.unwrap();
         let assigned = assignment(&mut work).await;
         for _ in 0..11 {
-            producer.register_committed(Envelope::claimable("scratch.x", "do", Bytes::from(vec![0u8; 1000]))).await.unwrap();
+            producer.register_committed(Envelope::claimable(ch("scratch.x"), VOLATILE, Bytes::from(vec![0u8; 1000]))).await.unwrap();
         }
-        assert!(engine.body_to_disk("next", durable_body.len() as u64) && engine.body_to_disk("scratch.y", volatile_body.len() as u64), "{:?}", engine.pressure());
-        let follow_ups = vec![Envelope::claimable("next", "do", durable_body.clone()), Envelope::claimable("scratch.y", "do", volatile_body.clone())];
+        assert!(engine.body_to_disk(1, durable_body.len() as u64) && engine.body_to_disk(VOLATILE, volatile_body.len() as u64), "{:?}", engine.pressure());
+        let follow_ups = vec![Envelope::claimable(ch("next"), 1, durable_body.clone()), Envelope::claimable(ch("scratch.y"), VOLATILE, volatile_body.clone())];
         let seq = worker.complete(assigned.event.id, assigned.token, follow_ups).await.unwrap();
         worker.committed(seq).await.unwrap();
         assert_eq!(stats(&server).await.counters.spilled_bytes, volatile_body.len() as u64, "the volatile body went to disk");
@@ -415,8 +432,8 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
     let engine = durable(&path, EngineConfig::default()).await;
     let server = server(&engine).await;
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    worker.join("next".into(), Vec::new(), LEASE, false).await.unwrap();
-    worker.window("next".into(), 1, 0).await.unwrap();
+    let worker_join = worker.join(Some(ch("next")), Vec::new(), false, LEASE, false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     assert_eq!(assignment(&mut work).await.event.payload, durable_body);
 }
 
@@ -427,14 +444,14 @@ async fn an_observer_that_does_not_read_is_sent_bye_slow() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let server = Server::start(&engine, ServerOptions { unsent: 1 << 20, ..ServerOptions::default() }).await;
     let (mut observer, _) = Raw::welcomed(&server.address, raw_hello(Role::Observe, [0; 16], [8; 16])).await;
-    observer.send([call(Call::Subscribe { req: 1, target: Target::Channel("feed".into()), after: None })]).await;
+    observer.send([call(Call::Subscribe { req: 1, channel: ch("feed"), after: None })]).await;
     assert!(matches!(observer.expect().await, Message::Outbound(Outbound::Subscribed { req: 1, .. })));
     let (producer, _) = dial(&server, Hello::producer("x")).await;
     let payload = Bytes::from(vec![1u8; 1 << 20]);
     let sent = 64;
     let mut last = 0;
     for _ in 0..sent {
-        last = producer.register(Envelope::dispatch("feed", "big", payload.clone())).await.unwrap().0;
+        last = producer.register(Envelope::dispatch(ch("feed"), 8, payload.clone())).await.unwrap().0;
     }
     producer.committed(last).await.unwrap();
     let mut deliveries = 0;
@@ -471,7 +488,7 @@ async fn draining_while_producers_send_misses_no_final_acknowledgement() {
                 let batch: Vec<Message> = (0..20)
                     .map(|_| {
                         seq += 1;
-                        register(seq, Envelope::claimable("work", "do", Bytes::from_static(b"p")))
+                        register(seq, Envelope::claimable(ch("work"), 1, Bytes::from_static(b"p")))
                     })
                     .collect();
                 if writer.send(batch).await.is_err() {
@@ -529,7 +546,7 @@ async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
         let (_, id) = producer.register_committed(job("work", b"p")).await.unwrap();
         let (mut worker, welcome) = Raw::welcomed(&server.address, raw_hello(Role::Work, [21; 16], [22; 16])).await;
         worker
-            .send([call(Call::Join { req: 1, channel: "work".into(), types: Vec::new(), lease_ms: 30_000, dispatch: false }), call(Call::Window { channel: "work".into(), count: 1, bytes: 0 })])
+            .send([call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false }), call(Call::Window { join: 1, count: 1, bytes: 0 })])
             .await;
         assert_eq!(worker.expect().await, Message::Outbound(Outbound::Joined { req: 1 }));
         let token = match worker.expect().await {
@@ -553,8 +570,8 @@ async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
     assert!(welcome.generation > generation);
     worker
         .send([
-            call(Call::Join { req: 1, channel: "work".into(), types: Vec::new(), lease_ms: 30_000, dispatch: false }),
-            call(Call::Window { channel: "work".into(), count: 1, bytes: 0 }),
+            call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false }),
+            call(Call::Window { join: 1, count: 1, bytes: 0 }),
             call(Call::Extend { id, token }),
             call(Call::Complete { seq: 1, id, token, follow_ups: Vec::new(), spooled: Vec::new() }),
         ])
@@ -577,7 +594,7 @@ async fn a_bye_is_read_whole_even_when_the_peer_had_sent_more_than_the_server_re
     let pumping = tokio::spawn(async move {
         let filler = Bytes::from(vec![0u8; 64 << 10]);
         let mut messages = vec![register(1, job("work", b"a")), register(3, job("work", b"gap"))];
-        messages.extend((4..68).map(|seq| register(seq, Envelope::dispatch("feed", "filler", filler.clone()))));
+        messages.extend((4..68).map(|seq| register(seq, Envelope::dispatch(ch("feed"), 9, filler.clone()))));
         writer.send(messages).await.unwrap();
         writer
     });
@@ -626,8 +643,8 @@ async fn version_1_and_other_versions_are_refused() {
     let mut encoder = Encoder::new(DICTIONARY);
     encoder.push(&Message::Hello { version: VERSION, features: 0, token: TOKEN.into(), hello: Hello::producer("x") }).unwrap();
     let mut bytes = encoder.take().concat();
-    // Version 2 (an envelope with `reply` and `correlation`) is another version now.
-    bytes[7] = 2;
+    // Version 3 (the type as a name number) is another version now.
+    bytes[7] = 3;
     let stream = TcpStream::connect(&server.address).await.unwrap();
     let (read, mut write) = stream.into_split();
     write.write_all(&bytes).await.unwrap();
@@ -647,11 +664,11 @@ async fn assignments_never_written_go_back_at_once_when_the_worker_goes() {
     let payload = Bytes::from(vec![3u8; 1 << 20]);
     let total = 48;
     for _ in 0..total {
-        producer.register_committed(Envelope::claimable("big", "do", payload.clone())).await.unwrap();
+        producer.register_committed(Envelope::claimable(ch("big"), 1, payload.clone())).await.unwrap();
     }
     let (mut stalled, _) = Raw::welcomed(&server.address, raw_hello(Role::Work, [41; 16], [42; 16])).await;
     stalled
-        .send([call(Call::Join { req: 1, channel: "big".into(), types: Vec::new(), lease_ms: 600_000, dispatch: false }), call(Call::Window { channel: "big".into(), count: total, bytes: 0 })])
+        .send([call(Call::Join { req: 1, channel: Some(ch("big")), types: Vec::new(), isolated: false, lease_ms: 600_000, dispatch: false }), call(Call::Window { join: 1, count: total, bytes: 0 })])
         .await;
     loop {
         let stats = stats(&server).await;
@@ -662,8 +679,8 @@ async fn assignments_never_written_go_back_at_once_when_the_worker_goes() {
     }
     drop(stalled);
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    worker.join("big".into(), Vec::new(), LEASE, false).await.unwrap();
-    worker.window("big".into(), total, 0).await.unwrap();
+    let worker_join = worker.join(Some(ch("big")), Vec::new(), false, LEASE, false).await.unwrap();
+    worker.window(worker_join, total, 0).await.unwrap();
     let mut returned = 0;
     while let Ok(incoming) = tokio::time::timeout(Duration::from_secs(1), work.recv()).await {
         if let Some(Incoming::Assign(assignment)) = incoming {
@@ -688,7 +705,7 @@ async fn a_backlog_larger_than_one_page_is_read_to_the_end_by_subscribing_again(
     let mut seen = Vec::new();
     let mut after = None;
     loop {
-        let page = observer.subscribe(Target::Channel("orders".into()), after).await.unwrap();
+        let page = observer.subscribe(ch("orders"), after).await.unwrap();
         seen.extend(page.notices.iter().map(|notice| notice.key));
         after = page.last();
         if !page.more {

@@ -2,7 +2,7 @@
 //! a real disk.
 
 use super::*;
-use crate::envelope::{ClaimToken, Envelope, EventId};
+use crate::envelope::{Channel, ClaimToken, Envelope, EventId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,15 +15,27 @@ fn scratch() -> PathBuf {
     directory.join("log")
 }
 
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
+}
+
 fn key(arrival: u64) -> WorkKey {
     WorkKey { generation: 1, arrival }
 }
 
+/// A registration of type 1 on the channel labelled `channel`, its own root.
 fn registration(arrival: u64, channel: &str) -> Record {
-    let mut event = Envelope::claimable(channel, "do", Bytes::from(vec![arrival as u8; 3 + arrival as usize])).with_id(EventId::new_v7()).with_delegate("user-1");
+    let mut event = Envelope::claimable(ch(channel), 1, Bytes::from(vec![arrival as u8; 3 + arrival as usize])).with_id(EventId::new_v7()).with_delegate("user-1");
     event.key = Some(key(arrival));
     event.principal = Some("svc".into());
-    Record::Register { event, root: Name::new(channel), at: None }
+    Record::Register { event, root: 1, at: None }
 }
 
 fn batch(first: u64, records: Vec<Record>) -> Batch {
@@ -63,7 +75,7 @@ fn records(items: &[Replay]) -> Vec<(u64, Record)> {
 /// on disk, a registration comes with its location.
 fn as_recovered(record: &Record, at: Option<Location>) -> Record {
     match record {
-        Record::Register { event, root, at: None } => Record::Register { event: Envelope { payload: Bytes::new(), ..event.clone() }, root: root.clone(), at },
+        Record::Register { event, root, at: None } => Record::Register { event: Envelope { payload: Bytes::new(), ..event.clone() }, root: *root, at },
         other => other.clone(),
     }
 }
@@ -71,7 +83,7 @@ fn as_recovered(record: &Record, at: Option<Location>) -> Record {
 #[test]
 fn every_record_kind_survives_a_reopen_and_payloads_stay_on_disk() {
     let path = scratch();
-    let mut timed = Envelope::claimable("orders", "do", Bytes::from_static(b"t")).with_id(EventId::new_v7()).with_group([5; 16]);
+    let mut timed = Envelope::claimable(ch("orders"), 1, Bytes::from_static(b"t")).with_id(EventId::new_v7()).with_group([5; 16]);
     timed.key = Some(key(9));
     timed.not_before = Some(70_000);
     timed.expires = Some(90_000);
@@ -85,10 +97,11 @@ fn every_record_kind_survives_a_reopen_and_payloads_stay_on_disk() {
         Record::Reclaim { key: key(0), failures: 4 },
         Record::Release { key: key(0), failures: 5, visible_at: Some(123_456) },
         Record::Release { key: key(0), failures: 5, visible_at: None },
-        Record::Isolate { key: key(0), channel: "isolated.orders".into(), failures: 5, expires: Some(604_800_000) },
+        Record::Isolate { key: key(0), failures: 5, expires: Some(604_800_000) },
+        Record::Isolate { key: key(0), failures: 6, expires: None },
         Record::Relocate { key: key(0), at: Location { segment: 3, offset: 1 << 40, len: 16, crc: 9 } },
         Record::Body { payload: Bytes::from_static(b"inline, pointed at by nothing") },
-        Record::Register { event: Envelope { payload: Bytes::new(), ..timed }, root: "upstream".into(), at: Some(streamed) },
+        Record::Register { event: Envelope { payload: Bytes::new(), ..timed }, root: u16::MAX, at: Some(streamed) },
         registration(1, "orders"),
         Record::Remove(key(1)),
         Record::Producer { number: 0, seq: 77 },
@@ -135,8 +148,8 @@ fn a_second_engine_cannot_open_a_log_in_use() {
 }
 
 /// A single-file journal (format 2 or older, or format 3's single file) and a
-/// segment of another format — format 3's included — are refused and left as
-/// they were (B12).
+/// segment of another format — formats 3 and 4 included — are refused and left
+/// as they were (B12).
 #[test]
 fn a_single_file_or_older_journal_is_refused_and_left_byte_for_byte() {
     let path = scratch();
@@ -151,7 +164,7 @@ fn a_single_file_or_older_journal_is_refused_and_left_byte_for_byte() {
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir_all(&path).unwrap();
     let segment = path.join("0000000001.seg");
-    for version in [2u8, 3] {
+    for version in [2u8, 3, 4] {
         let mut foreign = b"rvseg\0".to_vec();
         foreign.push(version);
         foreign.extend_from_slice(&[1; 40]);
@@ -239,7 +252,8 @@ fn segments_roll_at_their_size_and_each_defines_its_own_names() {
     assert!(created.len() >= 3, "{created:?}");
     for number in &created {
         let bytes = std::fs::read(path.join(format!("{number:010}.seg"))).unwrap();
-        assert!(bytes.windows(6).any(|window| window == b"orders"), "segment {number} defines the channel it uses");
+        assert!(bytes.windows(6).any(|window| window == b"user-1"), "segment {number} defines the names it uses (the delegate)");
+        assert!(bytes.windows(16).any(|window| window == ch("orders").0), "segment {number} carries the channel as its 16 octets");
     }
     let (items, end) = drain(SegmentLog::open_with(&path, 200).unwrap().1).unwrap();
     assert_eq!((records(&items).len(), end.serial), (12, 12));

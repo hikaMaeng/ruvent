@@ -3,11 +3,11 @@
 프록시의 골조다. 이벤트 서버의 발송 팬아웃 계층(개편 계획 4장)에서, 모든 프록시가 필요로 하면서 틀리기 쉬운 두 가지만 준다.
 
 * 서버 목록의 모든 서버에 붙는 서버별 상향 관찰 연결
-* 구독 규칙: 대상(채널 또는 접두사)마다 서버별 상위 구독 하나, 구성원별 효력 시점
+* 구독 규칙: 채널마다 서버별 상위 구독 하나, 구성원별 효력 시점
 
 ## 범위
 
-이벤트 서버는 프로토콜 하나만 말한다. TCP 위의 ruvent wire(v3)다. 프록시와 워커 서버는 SDK(`ruvent-client`)로 그 프로토콜만 써서 붙는다. 클라이언트는 이벤트 서버에 직접 붙지 않는다.
+이벤트 서버는 프로토콜 하나만 말한다. TCP 위의 ruvent wire(v4)다. 프록시와 워커 서버는 SDK(`ruvent-client`)로 그 프로토콜만 써서 붙는다. 클라이언트는 이벤트 서버에 직접 붙지 않는다.
 
 그 밖은 전부 프록시 프로그램의 것이다. 이 크레이트는 어느 것도 정하지 않는다.
 
@@ -16,21 +16,22 @@
 | 클라이언트 쪽 프로토콜(WebSocket, HTTP, WebRTC, …) | 프로그램 자신의 서버 |
 | 클라이언트가 누구이고 무엇을 구독·등록할 수 있는지 | 프로그램의 검사 → [`Member::subscribe`] |
 | 등록 | 프로그램 자신의 `ruvent_client::producer::Producer` |
-| 요청–응답 | 요청 하나가 구성원 하나다. 요청마다 응답 채널(이름은 프로그램이 정한다, 예: UUID)을 [`Member::subscribe`]로 구독하고, 그 채널 이름을 payload에 넣어 프로그램 자신의 `Producer`로 등록하고, 오는 것을 클라이언트에 쓴다. 끝 조건(종결 이벤트, 시간)을 보고 구성원을 버리면 구독이 풀린다. 기한·재전송도 프로그램이 정한다 |
+| 요청–응답 | 요청 하나가 구성원 하나다. 요청마다 채널(`Channel::new()`, UUIDv7)을 [`Member::subscribe`]로 구독하고, 그 채널에 요청을 프로그램 자신의 `Producer`로 등록하고(타입은 프로그램이 정한 요청 타입), 오는 것을 클라이언트에 쓴다. 격리 비트가 켜진 통지는 요청이 포기됐다는 뜻이다. 끝 조건(종결 이벤트, 시간)을 보고 구성원을 버리면 구독이 풀린다. 기한·재전송도 프로그램이 정한다 |
 | 느린 클라이언트에 대한 역압 | 골조는 `member_buffer`까지 찬 구성원을 떼어 낸다(스트림이 끝난다). 그것을 클라이언트에게 어떻게 알릴지는 프로그램이 정한다 |
 | 준비 상태를 어떻게 내보일지(`/health`, 지표) | 프로그램. 이 크레이트는 [`Health`] 값만 준다 |
 
 ## 사용
 
 ```rust
-use ruvent_proxy::{Fanout, FanoutConfig, Servers, Target, Tcp, Upstream};
+use ruvent_proxy::{Channel, Fanout, FanoutConfig, Servers, Tcp, Upstream};
 use std::sync::Arc;
 
 let upstream = Upstream::new(Arc::new(Tcp::new("proxy-token")), Servers::new(["10.0.0.1:7400", "10.0.0.2:7400"]));
 let fanout = Fanout::start(FanoutConfig::default(), upstream);
 // 프로그램 자신의 클라이언트 연결마다:
 let (member, mut events) = fanout.attach().await?;
-member.subscribe(Target::Channel("chat.room-7".into())).await?; // 프로그램의 검사 뒤에
+let channel = Channel::new(); // 요청 하나의 스트림, 또는 클라이언트가 받은 채널
+member.subscribe(channel).await?; // 프로그램의 검사 뒤에
 while let Some(event) = events.recv().await {
     // `event`(Arc<Envelope>)를 프로그램의 프로토콜로 클라이언트에게 쓴다.
 }
@@ -40,9 +41,9 @@ while let Some(event) = events.recv().await {
 | --- | --- |
 | `Fanout::start(config, upstream)` | 허브 태스크를 띄우고 목록의 모든 서버에 관찰 연결을 연다. 곧바로 돌아온다 |
 | `Fanout::attach()` | 구성원 하나. 스트림은 서버가 보낸 엔벨롭을 `Arc`로 나눠 준다. payload는 건드리지 않는다 |
-| `Member::subscribe(target)` | 자기 구독이 한 서버에서 효력을 가질 때 돌아온다. 같은 구성원의 재호출은 즉시 성공한다 |
-| `Member::unsubscribe(target)` | 마지막 구성원이 떠나면 상위 구독을 한 번 취소한다 |
-| `Member` 버림 | 구성원을 떼어 내고 모든 대상에서 뺀다 |
+| `Member::subscribe(channel)` | 자기 구독이 한 서버에서 효력을 가질 때 돌아온다. 같은 구성원의 재호출은 즉시 성공한다 |
+| `Member::unsubscribe(channel)` | 마지막 구성원이 떠나면 상위 구독을 한 번 취소한다 |
+| `Member` 버림 | 구성원을 떼어 내고 모든 채널에서 뺀다 |
 | `Fanout::ready()`, `is_ready()`, `health()`, `watch_health()` | 서버별 관찰 연결과 준비 상태 |
 | `Fanout::stop()` | 모든 구성원의 스트림을 끝내고 상향을 놓는다. 모든 핸들이 사라져도 멈춘다 |
 
@@ -80,7 +81,7 @@ while let Some(event) = events.recv().await {
 | --- | --- |
 | `src/**/tests.rs` | 구독 장부, 준비 상태 계산 |
 | `tests/fanout.rs` | 같은 프로세스의 엔진(SDK `Local`): 집약, 효력 시점, 재접속과 재구독, 목록에 더한 서버, 느린 구성원, 원 엔벨롭 공유, 정지와 상향 해제 |
-| `tests/acceptance.rs` | 실제 `ruvent-server`에 TCP로 붙인 인수: 효력 시점 불변식, 접두사 구독, 서버 2대, 상향 상실과 준비 상태, 요청별 응답 채널(실제 워커, 요청 2건 동시) |
+| `tests/acceptance.rs` | 실제 `ruvent-server`에 TCP로 붙인 인수: 효력 시점 불변식, UUIDv7이 아닌 채널의 거절, 서버 2대, 상향 상실과 준비 상태, 요청별 채널(타입 참여 워커, 요청 2건 동시) |
 
 [`Member::subscribe`]: src/fanout/mod.rs
 [`Health`]: src/health/mod.rs

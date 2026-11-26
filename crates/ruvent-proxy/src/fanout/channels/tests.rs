@@ -6,20 +6,27 @@ use std::sync::Arc;
 
 type Book = Channels<&'static str>;
 
-fn channel(text: &str) -> Target {
-    Target::Channel(text.into())
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
 }
 
-fn prefix(text: &str) -> Target {
-    Target::Prefix(text.into())
+fn channel(label: &str) -> Channel {
+    ch(label)
 }
 
 fn server(name: &str) -> Server {
     Arc::from(name)
 }
 
-fn sub(target: Target, ticket: u64) -> Call {
-    Call::Subscribe { target, ticket }
+fn sub(channel: Channel, ticket: u64) -> Call {
+    Call::Subscribe { channel, ticket }
 }
 
 fn oks(step: &Step<&'static str>) -> Vec<&'static str> {
@@ -31,15 +38,15 @@ fn errors(step: &Step<&'static str>) -> Vec<(&'static str, SubscribeError)> {
 }
 
 fn audience(book: &Book, name: &str, on: &str) -> Vec<MemberId> {
-    book.audience(name, &server(on))
+    book.audience(&channel(name), &server(on))
 }
 
-/// Joins `user` to `target` and runs it to "subscribed" on `on`: confirmation, then the call's answer.
-fn joined(book: &mut Book, user: MemberId, target: Target, on: &str, label: &'static str) -> u64 {
-    let step = book.join(user, target.clone(), label);
+/// Joins `user` to `channel` and runs it to "subscribed" on `on`: confirmation, then the call's answer.
+fn joined(book: &mut Book, user: MemberId, channel: Channel, on: &str, label: &'static str) -> u64 {
+    let step = book.join(user, channel, label);
     let Some(Call::Subscribe { ticket, .. }) = step.calls.first().cloned() else { panic!("no subscribe issued") };
-    book.confirmed(&server(on), &target, ticket);
-    assert_eq!(oks(&book.answered(&target, ticket, Ok(()))), vec![label]);
+    book.confirmed(&server(on), &channel, ticket);
+    assert_eq!(oks(&book.answered(&channel, ticket, Ok(()))), vec![label]);
     ticket
 }
 
@@ -69,7 +76,7 @@ fn the_answer_and_the_confirmation_settle_in_either_order() {
     assert_eq!(oks(&book.confirmed(&server("s0"), &channel("room"), 1)), vec!["u1"]);
 }
 
-/// Every join of a new user issues its own subscribe, even on a target already subscribed.
+/// Every join of a new user issues its own subscribe, even on a channel already subscribed.
 #[test]
 fn every_join_issues_its_own_subscribe() {
     let mut book = Book::new();
@@ -91,7 +98,7 @@ fn an_earlier_confirmation_does_not_activate_a_later_joiner() {
     assert_eq!(audience(&book, "room", "s0"), vec![1, 2]);
 }
 
-/// Joining a target one's join was already answered on is answered at once and issues nothing.
+/// Joining a channel one's join was already answered on is answered at once and issues nothing.
 #[test]
 fn joining_twice_is_answered_at_once_without_a_call() {
     let mut book = Book::new();
@@ -122,7 +129,7 @@ fn a_user_is_in_effect_per_server() {
     assert_eq!(audience(&book, "room", "s1"), vec![1]);
 }
 
-/// Confirmations and answers for targets or tickets nobody waits for change nothing.
+/// Confirmations and answers for channels or tickets nobody waits for change nothing.
 #[test]
 fn confirmations_and_answers_nobody_asked_for_are_ignored() {
     let mut book = Book::new();
@@ -174,14 +181,14 @@ fn resubscribing_waits_for_the_second_subscribes_confirmation() {
     assert_eq!(audience(&book, "room", "s0"), vec![1]);
 }
 
-/// Leaving everything leaves every target; leaving what one never joined does nothing.
+/// Leaving everything leaves every channel; leaving what one never joined does nothing.
 #[test]
-fn leaving_all_leaves_every_target_and_unknown_ones_do_nothing() {
+fn leaving_all_leaves_every_channel_and_unknown_ones_do_nothing() {
     let mut book = Book::new();
     joined(&mut book, 1, channel("a"), "s0", "a");
-    joined(&mut book, 1, prefix("b"), "s0", "b");
-    let step = book.leave_all(1, [channel("a"), prefix("b")]);
-    assert_eq!(step.calls, vec![Call::Unsubscribe(channel("a")), Call::Unsubscribe(prefix("b"))]);
+    joined(&mut book, 1, channel("b"), "s0", "b");
+    let step = book.leave_all(1, [channel("a"), channel("b")]);
+    assert_eq!(step.calls, vec![Call::Unsubscribe(channel("a")), Call::Unsubscribe(channel("b"))]);
     assert!(book.leave(1, &channel("never")).calls.is_empty());
 }
 
@@ -222,24 +229,16 @@ fn a_join_with_no_server_connected_waits_for_the_first_confirmation() {
     assert_eq!(oks(&book.confirmed(&server("s0"), &channel("room"), 1)), vec!["early"], "said at the connection with the calls handled so far");
 }
 
-// ── prefixes ─────────────────────────────────────────────────────────────
+// ── one channel, no hierarchy ────────────────────────────────────────────
 
-/// A prefix takes every channel below it at a `.` boundary, at any depth, and nothing else.
+/// A channel is an id: a member of one channel hears nothing of any other,
+/// however alike their labels were (there is no prefix any more).
 #[test]
-fn a_prefix_takes_every_channel_below_it_at_a_dot() {
+fn a_member_hears_only_its_own_channel() {
     let mut book = Book::new();
-    joined(&mut book, 1, prefix("room"), "s0", "u1");
-    assert_eq!(audience(&book, "room.1", "s0"), vec![1]);
-    assert_eq!(audience(&book, "room.a.b", "s0"), vec![1]);
-    assert!(audience(&book, "room", "s0").is_empty() && audience(&book, "roomy.1", "s0").is_empty());
-}
-
-/// A user on a channel and on a prefix above it is in that channel's audience once.
-#[test]
-fn a_user_on_a_channel_and_its_prefix_is_in_the_audience_once() {
-    let mut book = Book::new();
-    joined(&mut book, 1, channel("room.1"), "s0", "exact");
-    joined(&mut book, 1, prefix("room"), "s0", "prefix");
-    joined(&mut book, 2, prefix("room"), "s0", "other");
-    assert_eq!(audience(&book, "room.1", "s0"), vec![1, 2]);
+    joined(&mut book, 1, channel("room"), "s0", "u1");
+    joined(&mut book, 2, channel("room.1"), "s0", "u2");
+    assert_eq!(audience(&book, "room", "s0"), vec![1]);
+    assert_eq!(audience(&book, "room.1", "s0"), vec![2]);
+    assert!(audience(&book, "room.2", "s0").is_empty());
 }

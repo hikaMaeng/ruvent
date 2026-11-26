@@ -1,6 +1,6 @@
 //! The event slots: a dense arena, an id index and slot generations.
 
-use crate::envelope::{ClaimToken, Digest, Envelope, EventId, GroupId, Kind, WorkKey};
+use crate::envelope::{Channel, ClaimToken, Digest, Envelope, EventId, GroupId, Kind, WorkKey};
 use crate::journal::Location;
 use crate::names::Name;
 use bytes::Bytes;
@@ -10,8 +10,8 @@ use std::collections::HashMap;
 /// generation tells an old reference from a new one.
 pub(super) type Index = u32;
 
-/// A join: (work connection, channel).
-pub(super) type JoinId = (crate::engine::ops::SessionId, Name);
+/// A join: (work connection, the `req` of its `Join`).
+pub(super) type JoinId = (crate::engine::ops::SessionId, u32);
 
 /// One attempt of a claimed event.
 #[derive(Clone, Debug)]
@@ -31,7 +31,7 @@ pub(super) struct Attempt {
 /// Where an event is.
 #[derive(Clone, Debug)]
 pub(super) enum Place {
-    /// In its lane, `(channel, type)`, at its work key.
+    /// In its lane, `(channel, type, isolated)`, at its work key.
     Waiting,
     /// In its root's hold lane: skipped while the root is paused (2.6).
     Held,
@@ -49,14 +49,15 @@ pub(super) enum Place {
 pub(super) struct Fixed {
     pub id: EventId,
     pub key: WorkKey,
-    pub event_type: Name,
-    pub root: Name,
+    pub event_type: u16,
+    /// The type of the event that started its lineage: what it is accounted and paused under (2.6).
+    pub root: u16,
     pub principal: Option<Name>,
     pub delegate: Option<Name>,
     pub group: Option<GroupId>,
     /// The visibility time it was registered with (absolute), for the envelope.
     pub not_before: Option<u64>,
-    /// Journaled: on a durable channel of a server with a journal.
+    /// Journaled: of a durable type, on a server with a journal.
     pub durable: bool,
     /// Uptime when registered, for "oldest waiting" ages.
     pub registered_at: u64,
@@ -73,8 +74,9 @@ pub(super) struct Fixed {
 #[derive(Clone, Debug)]
 pub(super) struct Slot {
     pub fixed: Fixed,
-    /// Changes on isolation.
-    pub channel: Name,
+    pub channel: Channel,
+    /// Reached the failure threshold (B6): waits in its isolated lane. Changes on isolation.
+    pub isolated: bool,
     pub failures: u16,
     /// Absolute uptime; changes on isolation.
     pub expires: Option<u64>,
@@ -107,11 +109,12 @@ impl Slot {
         let fixed = &self.fixed;
         Envelope {
             id: fixed.id,
-            channel: self.channel.clone(),
-            event_type: fixed.event_type.clone(),
+            channel: self.channel,
+            event_type: fixed.event_type,
             kind: Kind::Claimable,
             failures: self.failures,
             key: Some(fixed.key),
+            isolated: self.isolated,
             principal: fixed.principal.clone(),
             delegate: fixed.delegate.clone(),
             not_before: fixed.not_before,
@@ -121,8 +124,8 @@ impl Slot {
         }
     }
 
-    pub fn lane(&self) -> (Name, Name) {
-        (self.channel.clone(), self.fixed.event_type.clone())
+    pub fn lane(&self) -> (Channel, u16, bool) {
+        (self.channel, self.fixed.event_type, self.isolated)
     }
 
     /// The payload's length, wherever it is.

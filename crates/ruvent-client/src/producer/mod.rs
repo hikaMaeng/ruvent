@@ -7,14 +7,14 @@
 //!   It returns once handed over; [`Producer::send_committed`] also waits for
 //!   the cumulative `Committed`. It **waits** — never refuses — while the
 //!   chosen line's buffer is at its byte bound (S8), while every candidate
-//!   has the channel paused (2.6), or while no server is connected.
+//!   has the event's type paused (2.6), or while no server is connected.
 //! * A registration once numbered goes only to that server again: after a
 //!   reconnection everything above `Welcome.resume` is sent again under the
 //!   same numbers, or numbered again from `resume + 1` when the server lost
 //!   the record ([`crate::buffer`]). Only `Bye{draining}` (after the final
 //!   `Committed`) and the server leaving the list move the rest elsewhere.
-//! * `Paused{channel}` holds that channel's sends to that server only;
-//!   another server, or another channel, goes on.
+//! * `Paused{type}` holds that type's registrations to that server only;
+//!   another server, or another type, goes on. Deletions are never held.
 //! * The producer id is new at every start unless [`ProducerConfig::id`]
 //!   keeps one (a durable outbox). `Bye{superseded}`, a reconnection that
 //!   finds the id superseded, and a refused token, version or grant end the
@@ -28,7 +28,7 @@
 //! | unacknowledged buffer | (server, seq) | production line | sent ~ `Committed` | [`ProducerConfig::unacked_bytes`] per line (`send` waits) | SDK (acknowledgement) |
 //! | server list and lines | server address | process | while the list names it | servers | SDK (list changes) |
 //! | selection state | server → connected, unacked bytes, draining | process | the line's | servers | SDK |
-//! | pause marks | (server, channel) | production line | `Paused` ~ `Resumed` or disconnection | paused channels | SDK |
+//! | pause marks | (server, root type) | production line | `Paused` ~ `Resumed` or disconnection | paused types (≤ 65,536) | SDK |
 //! | reconnection back-off | server | line | disconnection ~ welcome | servers | SDK ([`crate::line`]) |
 //! | retry budget | the producer | process | the producer's | one counter | SDK ([`RetryBudget`]) |
 
@@ -42,7 +42,7 @@ use crate::link::Connector;
 use crate::servers::{Server, ServerList};
 pub use budget::RetryBudget;
 use parking_lot::Mutex;
-use ruvent::{ByeReason, Call, Envelope, EventId, Hello, Link, Name, Outbound, ProducerId, WorkKey};
+use ruvent::{ByeReason, Call, Channel, Envelope, EventId, Hello, Link, Outbound, ProducerId, WorkKey};
 pub use selector::{Candidate, Choice, LeastUnacked, Selector};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -134,20 +134,28 @@ pub(crate) type Gate = watch::Receiver<BTreeSet<Server>>;
 #[derive(Clone)]
 enum Op {
     Register(Envelope),
-    Delete { id: EventId, result: Name, key: Option<WorkKey> },
+    Delete { id: EventId, result: Channel, key: Option<WorkKey> },
 }
 
 impl Op {
     fn call(&self, seq: u64) -> Call {
         match self {
             Op::Register(event) => Call::Register { seq: Some(seq), event: event.clone() },
-            Op::Delete { id, result, key } => Call::Delete { seq, id: *id, result: result.clone(), key: *key },
+            Op::Delete { id, result, key } => Call::Delete { seq, id: *id, result: *result, key: *key },
         }
     }
 
-    fn channel(&self) -> Option<&Name> {
+    fn channel(&self) -> Option<Channel> {
         match self {
-            Op::Register(event) => Some(&event.channel),
+            Op::Register(event) => Some(event.channel),
+            Op::Delete { .. } => None,
+        }
+    }
+
+    /// The type a pause holds: a registration is its own root (2.6).
+    fn event_type(&self) -> Option<u16> {
+        match self {
+            Op::Register(event) => Some(event.event_type),
             Op::Delete { .. } => None,
         }
     }
@@ -180,7 +188,7 @@ struct LineState {
     /// The epoch of the live connection.
     connected: Option<u64>,
     draining: bool,
-    paused: HashSet<Name>,
+    paused: HashSet<u16>,
     buffer: Unacked<Pending>,
     io: Arc<tokio::sync::Mutex<Io>>,
 }
@@ -274,8 +282,9 @@ impl Producer {
     }
 
     /// Deletes a waiting event on `server` (an explicit cancel, 7장); the
-    /// outcome is a dispatch event on `result` whose payload names the deleted id.
-    pub async fn delete(&self, server: &Server, id: EventId, result: Name, key: Option<WorkKey>) -> Result<(), ProducerError> {
+    /// outcome is a dispatch event of type 0 on `result` whose payload names
+    /// the deleted id ([`ruvent::delete_outcome`]).
+    pub async fn delete(&self, server: &Server, id: EventId, result: Channel, key: Option<WorkKey>) -> Result<(), ProducerError> {
         let only: BTreeSet<Server> = [server.clone()].into();
         let (_, gate) = watch::channel(only);
         self.place(Op::Delete { id, result, key }, Some(gate), None, false).await.map(|_| ())
@@ -403,7 +412,7 @@ async fn place(shared: &Arc<Shared>, pending: Pending, blocked: Option<&AtomicBo
             let acks = shared.config.acks;
             let Some(line) = state.lines.get_mut(&server) else { continue };
             let open = line.connected == Some(io.epoch) && !line.draining;
-            let paused = pending.op.channel().is_some_and(|channel| line.paused.contains(channel));
+            let paused = pending.op.event_type().is_some_and(|kind| line.paused.contains(&kind));
             let full = !line.buffer.is_empty() && line.buffer.bytes().saturating_add(pending.op.bytes()) > limit;
             if !open || paused || full {
                 continue;
@@ -434,14 +443,14 @@ fn pick(shared: &Shared, pending: &Pending, gate: Option<&mut Gate>) -> Result<P
         return Err(ProducerError::Closed);
     }
     let allowed: Option<BTreeSet<Server>> = gate.map(|gate| gate.borrow_and_update().clone());
-    let channel = pending.op.channel().cloned().unwrap_or_else(|| Name::new(""));
+    let (channel, event_type) = (pending.op.channel(), pending.op.event_type());
     let mut candidates: Vec<(Candidate, Arc<tokio::sync::Mutex<Io>>, bool)> = state
         .lines
         .iter()
         .filter(|(server, line)| line.connected.is_some() && !line.draining && allowed.as_ref().is_none_or(|allowed| allowed.contains(*server)))
         .map(|(server, line)| {
             let full = !line.buffer.is_empty() && line.buffer.bytes().saturating_add(pending.op.bytes()) > shared.config.unacked_bytes;
-            (Candidate { server: server.clone(), unacked_bytes: line.buffer.bytes(), paused: line.paused.contains(&channel) }, line.io.clone(), full)
+            (Candidate { server: server.clone(), unacked_bytes: line.buffer.bytes(), paused: event_type.is_some_and(|kind| line.paused.contains(&kind)) }, line.io.clone(), full)
         })
         .collect();
     candidates.sort_by(|a, b| a.0.server.cmp(&b.0.server));
@@ -453,7 +462,7 @@ fn pick(shared: &Shared, pending: &Pending, gate: Option<&mut Gate>) -> Result<P
         Op::Register(event) => event.group,
         Op::Delete { .. } => None,
     };
-    let Some(index) = shared.config.selector.select(&Choice { channel: &channel, group, candidates: &listed }) else {
+    let Some(index) = shared.config.selector.select(&Choice { channel, event_type, group, candidates: &listed }) else {
         return Ok(Pick::Wait { paused: listed.iter().all(|candidate| candidate.paused) });
     };
     let Some((candidate, io, full)) = candidates.into_iter().nth(index) else {
@@ -579,11 +588,11 @@ async fn handle(shared: &Arc<Shared>, event: Event) {
             }
             match *message {
                 Outbound::Committed { seq } => told(line.buffer.ack(seq)),
-                Outbound::Paused { channel } => {
-                    line.paused.insert(channel);
+                Outbound::Paused { event_type } => {
+                    line.paused.insert(event_type);
                 }
-                Outbound::Resumed { channel } => {
-                    line.paused.remove(&channel);
+                Outbound::Resumed { event_type } => {
+                    line.paused.remove(&event_type);
                 }
                 _ => return,
             }

@@ -20,7 +20,7 @@
 #![allow(clippy::print_stdout)]
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{connect, Bytes, Durability, Engine, EngineConfig, Envelope, EventId, Hello, Methods, SegmentLog, WorkKey};
+use ruvent::{connect, Bytes, Channel, Durability, Engine, EngineConfig, Envelope, EventId, Hello, Methods, SegmentLog, WorkKey};
 use std::time::{Duration, Instant};
 
 const WORKERS: usize = 64;
@@ -32,10 +32,12 @@ async fn lifecycles(engine: &Engine, total: usize) -> (usize, Duration) {
         let (producer, _) = connect(engine, Hello::producer("bench"), 1024).await.expect("connect");
         let (worker, _) = connect(engine, Hello::worker("bench"), 1024).await.expect("connect");
         let share = total / WORKERS;
+        // Each task's own stream: a channel is a UUIDv7 made by whoever starts it.
+        let channel = Channel::new();
         tasks.push(tokio::spawn(async move {
             let mut done = 0;
             for _ in 0..share {
-                let (_, id) = producer.register_committed(Envelope::claimable("work", "do", Bytes::from_static(&[0; 16]))).await.expect("register");
+                let (_, id) = producer.register_committed(Envelope::claimable(channel, 1, Bytes::from_static(&[0; 16]))).await.expect("register");
                 let claimed = worker.claim(id, Duration::from_secs(60)).await.expect("claim");
                 let seq = worker.complete(id, claimed.token, Vec::new()).await.expect("complete");
                 if worker.committed(seq).await.is_ok() {
@@ -85,8 +87,8 @@ async fn main() {
 
     let key = WorkKey { generation: 1, arrival: 1 };
     let payload = Bytes::from_static(&[0; 16]);
-    let dispatch = Envelope::dispatch("feed", "news", payload.clone()).with_id(EventId::new_v7());
-    let waiting = Envelope { key: Some(key), ..Envelope::claimable("work", "do", payload.clone()).with_id(EventId::new_v7()) };
+    let dispatch = Envelope::dispatch(Channel::new(), 30, payload.clone()).with_id(EventId::new_v7());
+    let waiting = Envelope { key: Some(key), ..Envelope::claimable(Channel::new(), 1, payload.clone()).with_id(EventId::new_v7()) };
     let claimed = Envelope { failures: 1, ..waiting.clone() };
     for (label, event, layout) in
         [("dispatch/delivery", &dispatch, Layout::Delivery), ("waiting/journal", &waiting, Layout::Journal), ("assigned", &claimed, Layout::Assigned), ("notice", &waiting, Layout::Notice)]

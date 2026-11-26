@@ -1,6 +1,6 @@
 //! The operational snapshot. Not a method, and not the recovery journal.
 //!
-//! The engine copies events on the configured channels and types to a
+//! The engine copies events of the configured types to a
 //! collector as they are registered — claimable and dispatch alike — without
 //! waiting. The collector gathers a unit (a count or an age, whichever comes
 //! first) and writes it to its own file. Nothing here is replayed or re-sent
@@ -17,7 +17,8 @@
 
 use crate::envelope::codec::{self as body, Layout, Malformed, Reader};
 use crate::envelope::{Envelope, Kind};
-use crate::names::{Name, Pattern};
+use crate::names::Name;
+use crate::types::TypeSet;
 use bytes::{BufMut, Bytes};
 use std::collections::HashMap;
 use std::io;
@@ -37,10 +38,8 @@ const DISPATCH: u8 = 3;
 #[derive(Clone, Debug)]
 pub struct SnapshotConfig {
     pub directory: PathBuf,
-    /// Channels to collect. Empty means none.
-    pub channels: Vec<Pattern>,
-    /// Event types to collect on those channels. Empty means all.
-    pub types: Vec<String>,
+    /// Event types to collect, on every channel. Empty means none.
+    pub types: TypeSet,
     /// A file is written once this many events are collected…
     pub max_events: usize,
     /// …or this long after the first event of the unit, whichever comes first.
@@ -50,12 +49,12 @@ pub struct SnapshotConfig {
 }
 
 impl SnapshotConfig {
-    pub fn new(directory: impl Into<PathBuf>, channels: Vec<Pattern>) -> Self {
-        SnapshotConfig { directory: directory.into(), channels, types: Vec::new(), max_events: 4096, max_age: Duration::from_secs(5), buffer: 65_536 }
+    pub fn new(directory: impl Into<PathBuf>, types: TypeSet) -> Self {
+        SnapshotConfig { directory: directory.into(), types, max_events: 4096, max_age: Duration::from_secs(5), buffer: 65_536 }
     }
 
-    pub fn wants(&self, channel: &str, event_type: &str) -> bool {
-        self.channels.iter().any(|pattern| pattern.matches(channel)) && (self.types.is_empty() || self.types.iter().any(|wanted| wanted == event_type))
+    pub fn wants(&self, event_type: u16) -> bool {
+        self.types.contains(event_type)
     }
 }
 

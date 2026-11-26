@@ -1,4 +1,8 @@
-//! Managed memory, disk, the high watermarks and root-channel pause (2.6).
+//! Managed memory, disk, the high watermarks and root-type pause (2.6).
+//!
+//! A root is the type of the event that started a lineage: a registration
+//! is its own root, a follow-up counts to its parent's. Channels are one per
+//! request and say nothing about who floods; the type does (plan 9.15).
 //!
 //! Each resource has a budget (the limit minus the reserve) and one high
 //! watermark, measured on what is left once paused roots' shares are taken
@@ -16,9 +20,8 @@ use super::roots::{Notified, Paused, Root};
 use super::slots::Slot;
 use super::State;
 use crate::engine::ops::{Outbound, SessionId};
-use crate::names::Name;
 
-/// The most root channels remembered as "drained before" once they hold
+/// The most root types remembered as "drained before" once they hold
 /// nothing (the `drained` set). Past it the set is cleared, which can only
 /// make a root look new — an early pause it would have been spared.
 pub(super) const DRAINED: usize = 4096;
@@ -41,25 +44,25 @@ impl State {
         Usage { memory: meta + held, share: meta + if slot.fixed.durable { 0 } else { held }, disk: if slot.fixed.durable || slot.at.is_some() { slot.len() } else { 0 } }
     }
 
-    pub(super) fn account_add(&mut self, root: &Name, usage: Usage) {
+    pub(super) fn account_add(&mut self, root: u16, usage: Usage) {
         self.slot_bytes += usage.memory;
-        if !self.roots.contains_key(root) {
+        if !self.roots.contains_key(&root) {
             // A root that drained before it emptied is not one that never drains.
-            let ended = u64::from(self.drained.remove(root));
-            self.roots.insert(root.clone(), Root { ended, ..Root::default() });
+            let ended = u64::from(self.drained.remove(&root));
+            self.roots.insert(root, Root { ended, ..Root::default() });
         }
-        let entry = self.roots.entry(root.clone()).or_default();
+        let entry = self.roots.entry(root).or_default();
         entry.events += 1;
         entry.bytes += usage.share;
         entry.disk += usage.disk;
-        if self.grown.last() != Some(root) {
-            self.grown.push(root.clone());
+        if self.grown.last() != Some(&root) {
+            self.grown.push(root);
         }
     }
 
-    pub(super) fn account_remove(&mut self, root: &Name, usage: Usage) {
+    pub(super) fn account_remove(&mut self, root: u16, usage: Usage) {
         self.slot_bytes = self.slot_bytes.saturating_sub(usage.memory);
-        if let Some(entry) = self.roots.get_mut(root) {
+        if let Some(entry) = self.roots.get_mut(&root) {
             entry.events = entry.events.saturating_sub(1);
             entry.bytes = entry.bytes.saturating_sub(usage.share);
             entry.disk = entry.disk.saturating_sub(usage.disk);
@@ -68,9 +71,9 @@ impl State {
                     if self.drained.len() >= DRAINED {
                         self.drained.clear();
                     }
-                    self.drained.insert(root.clone());
+                    self.drained.insert(root);
                 }
-                self.roots.remove(root);
+                self.roots.remove(&root);
             }
         }
     }
@@ -93,13 +96,13 @@ impl State {
 
     /// A production connection registered `len` bytes to `root`. A paused root
     /// tells it `Paused` once; past the allowance its reading stops (S14).
-    pub(super) fn pause_notice(&mut self, session: SessionId, root: &Name, len: u64) {
+    pub(super) fn pause_notice(&mut self, session: SessionId, root: u16, len: u64) {
         let allowance = self.config.pause_allowance;
-        let Some(paused) = self.roots.get_mut(root).and_then(|root| root.paused.as_mut()) else { return };
+        let Some(paused) = self.roots.get_mut(&root).and_then(|root| root.paused.as_mut()) else { return };
         match paused.notified.get_mut(&session) {
             None => {
                 paused.notified.insert(session, Notified { bytes: 0, allowance: allowance.saturating_add(len), stopped: false });
-                self.send(session, Outbound::Paused { channel: root.clone() }, None);
+                self.send(session, Outbound::Paused { event_type: root }, None);
             }
             Some(notified) => {
                 notified.bytes = notified.bytes.saturating_add(len);
@@ -112,26 +115,26 @@ impl State {
     }
 
     /// Pauses `root` for the resource it is high on.
-    pub(super) fn pause(&mut self, root: &Name, by_disk: bool) {
-        let Some(entry) = self.roots.get_mut(root) else { return };
+    pub(super) fn pause(&mut self, root: u16, by_disk: bool) {
+        let Some(entry) = self.roots.get_mut(&root) else { return };
         if entry.paused.is_some() {
             return;
         }
         entry.paused = Some(Paused { at_bytes: entry.bytes, at_disk: entry.disk, by_disk, ..Paused::default() });
-        self.paused.insert(root.clone());
+        self.paused.insert(root);
         self.counters.pauses += 1;
     }
 
-    pub(super) fn resume(&mut self, root: &Name) {
+    pub(super) fn resume(&mut self, root: u16) {
         self.release_holds(root);
-        self.paused.remove(root);
-        let Some(entry) = self.roots.get_mut(root) else { return };
+        self.paused.remove(&root);
+        let Some(entry) = self.roots.get_mut(&root) else { return };
         let Some(paused) = entry.paused.take() else { return };
         if entry.is_empty() {
-            self.roots.remove(root);
+            self.roots.remove(&root);
         }
         for (session, notified) in paused.notified {
-            self.send(session, Outbound::Resumed { channel: root.clone() }, None);
+            self.send(session, Outbound::Resumed { event_type: root }, None);
             if notified.stopped {
                 self.effects.reading.push((session, true));
             }
@@ -148,9 +151,9 @@ impl State {
             if left_used < self.config.memory.high_watermark * left_budget {
                 return;
             }
-            let biggest = self.roots.iter().filter(|(_, root)| root.paused.is_none() && share(root) > 0).max_by_key(|(_, root)| share(root)).map(|(name, _)| name.clone());
+            let biggest = self.roots.iter().filter(|(_, root)| root.paused.is_none() && share(root) > 0).max_by_key(|(_, root)| share(root)).map(|(kind, _)| *kind);
             let Some(biggest) = biggest else { return };
-            self.pause(&biggest, by_disk);
+            self.pause(biggest, by_disk);
         }
     }
 
@@ -178,13 +181,13 @@ impl State {
             if entry.paused.is_some() {
                 continue;
             }
-            let bounded = self.config.channels.settings(&root).max_backlog.is_some_and(|bound| entry.events > bound.count || entry.bytes > bound.bytes);
+            let bounded = self.config.types.settings(root).max_backlog.is_some_and(|bound| entry.events > bound.count || entry.bytes > bound.bytes);
             // A root none of whose lineages ever ended is paused early (S19).
             let never_drained = entry.ended == 0;
             let early_memory = never_drained && entry.bytes >= early.max(1);
             let early_on_disk = never_drained && early_disk.is_some_and(|early| entry.disk >= early.max(1));
             if bounded || early_memory || early_on_disk {
-                self.pause(&root, early_on_disk && !early_memory);
+                self.pause(root, early_on_disk && !early_memory);
             }
         }
         self.pause_biggest(used, budget, |root| root.bytes, false);
@@ -207,9 +210,9 @@ impl State {
                 }
             };
             if (share as f64) < release * at as f64 {
-                self.resume(&root);
+                self.resume(root);
             } else if holds && share <= at {
-                self.release_holds(&root);
+                self.release_holds(root);
             }
         }
     }

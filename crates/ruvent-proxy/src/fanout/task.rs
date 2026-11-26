@@ -22,7 +22,7 @@
 use super::channels::{Call, Channels, MemberId, Step};
 use super::SubscribeError;
 use crate::health::Health;
-use ruvent::{Envelope, Refusal, Target};
+use ruvent::{Channel, Envelope, Refusal};
 use ruvent_client::observer::{Observed, Observer};
 use ruvent_client::servers::Server;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -38,12 +38,12 @@ pub(super) enum Command {
     },
     Join {
         member: MemberId,
-        target: Target,
+        channel: Channel,
         reply: Reply,
     },
     Leave {
         member: MemberId,
-        target: Target,
+        channel: Channel,
     },
     Detach {
         member: MemberId,
@@ -54,14 +54,14 @@ pub(super) enum Command {
 
 /// What the subscribe worker reports back: the answer of one subscribe call.
 struct Report {
-    target: Target,
+    channel: Channel,
     ticket: u64,
     result: Result<(), Refusal>,
 }
 
 struct Attached {
     out: mpsc::Sender<Arc<Envelope>>,
-    targets: HashSet<Target>,
+    joined: HashSet<Channel>,
 }
 
 type Reply = oneshot::Sender<Result<(), SubscribeError>>;
@@ -110,14 +110,14 @@ enum Wake {
 async fn subscribe_worker(observer: Observer, mut calls: mpsc::UnboundedReceiver<Call>, reports: mpsc::Sender<Report>) {
     while let Some(call) = calls.recv().await {
         match call {
-            Call::Subscribe { target, ticket } => {
-                let result = observer.subscribe(target.clone()).await;
-                if reports.send(Report { target, ticket, result }).await.is_err() {
+            Call::Subscribe { channel, ticket } => {
+                let result = observer.subscribe(channel).await;
+                if reports.send(Report { channel, ticket, result }).await.is_err() {
                     return;
                 }
             }
-            Call::Unsubscribe(target) => {
-                let _ = observer.unsubscribe(target).await;
+            Call::Unsubscribe(channel) => {
+                let _ = observer.unsubscribe(channel).await;
             }
         }
     }
@@ -153,8 +153,8 @@ impl Hub {
                 changed = self.list.changed(), if listing => Wake::List(changed.is_ok()),
             };
             match wake {
-                Wake::Report(Some(Report { target, ticket, result })) => {
-                    let step = self.channels.answered(&target, ticket, result);
+                Wake::Report(Some(Report { channel, ticket, result })) => {
+                    let step = self.channels.answered(&channel, ticket, result);
                     self.apply(step);
                 }
                 // The worker holds the observer; without it there is nothing to watch.
@@ -182,8 +182,8 @@ impl Hub {
     fn observed(&mut self, observed: Observed) {
         match observed {
             Observed::Delivery { server, event } => self.delivery(&server, event),
-            Observed::Subscribed { server, target, ticket } => {
-                let step = self.channels.confirmed(&server, &target, ticket);
+            Observed::Subscribed { server, channel, ticket } => {
+                let step = self.channels.confirmed(&server, &channel, ticket);
                 self.apply(step);
             }
             // A fresh connection: nothing is in effect there until it confirms.
@@ -216,23 +216,23 @@ impl Hub {
             Command::Attach { out, reply } => {
                 let id = self.next_member;
                 self.next_member += 1;
-                self.members.insert(id, Attached { out, targets: HashSet::new() });
+                self.members.insert(id, Attached { out, joined: HashSet::new() });
                 let _ = reply.send(id);
             }
-            Command::Join { member, target, reply } => {
+            Command::Join { member, channel, reply } => {
                 let Some(attached) = self.members.get_mut(&member) else {
                     let _ = reply.send(Err(SubscribeError::Left));
                     return;
                 };
-                attached.targets.insert(target.clone());
-                let step = self.channels.join(member, target, reply);
+                attached.joined.insert(channel);
+                let step = self.channels.join(member, channel, reply);
                 self.apply(step);
             }
-            Command::Leave { member, target } => {
+            Command::Leave { member, channel } => {
                 if let Some(attached) = self.members.get_mut(&member) {
-                    attached.targets.remove(&target);
+                    attached.joined.remove(&channel);
                 }
-                let step = self.channels.leave(member, &target);
+                let step = self.channels.leave(member, &channel);
                 self.apply(step);
             }
             Command::Detach { member } => self.detach(member),
@@ -240,10 +240,10 @@ impl Hub {
         }
     }
 
-    /// Drops a member: its stream ends (the hub held the only sender) and it leaves every target.
+    /// Drops a member: its stream ends (the hub held the only sender) and it leaves every channel.
     fn detach(&mut self, member: MemberId) {
         let Some(attached) = self.members.remove(&member) else { return };
-        let step = self.channels.leave_all(member, attached.targets);
+        let step = self.channels.leave_all(member, attached.joined);
         self.apply(step);
     }
 

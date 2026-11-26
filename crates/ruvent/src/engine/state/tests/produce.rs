@@ -22,16 +22,16 @@ fn a_retransmitted_sequence_is_dropped_and_a_gap_closes_the_connection() {
 #[test]
 fn committed_waits_for_the_disk_for_durable_work_and_not_for_volatile() {
     let mut h = H::durable(false).cast();
-    let volatile = h.produce(P, work("scratch.x").with_id(id(1)));
-    assert_eq!(committed(&volatile, P), [1], "a volatile registration commits when applied");
+    let light = h.produce(P, volatile("scratch.x").with_id(id(1)));
+    assert_eq!(committed(&light, P), [1], "a volatile registration commits when applied");
     let durable = h.produce(P, work("work").with_id(id(2)));
     assert!(committed(&durable, P).is_empty(), "a durable one waits for its batch");
-    let after = h.produce(P, work("scratch.x").with_id(id(3)));
+    let after = h.produce(P, volatile("scratch.x").with_id(id(3)));
     assert!(committed(&after, P).is_empty(), "cumulative: a volatile one behind a durable one waits too");
     let landed = h.land();
     assert_eq!(committed(&landed, P), [3], "the landing confirms everything up to the last applied");
     // A dispatch event never waits either.
-    let dispatched = h.produce(P, Envelope::dispatch("feed", "t", Bytes::new()));
+    let dispatched = h.produce(P, Envelope::dispatch(ch("feed"), 10, Bytes::new()));
     assert_eq!(committed(&dispatched, P), [4]);
 }
 
@@ -57,7 +57,7 @@ fn committed_goes_out_once_every_n_while_later_work_still_waits() {
 fn a_volatile_broadcast_producer_can_turn_acknowledgements_off() {
     let mut h = H::volatile();
     h.open(P, Hello { acks: false, ..hello(Role::Produce, 1) });
-    let effects = h.produce(P, Envelope::dispatch("feed", "t", Bytes::new()));
+    let effects = h.produce(P, Envelope::dispatch(ch("feed"), 10, Bytes::new()));
     assert!(committed(&effects, P).is_empty());
 }
 
@@ -97,7 +97,7 @@ fn a_duplicate_id_with_the_same_content_is_dropped_and_other_content_is_a_confli
     let same = h.produce(P, work("work").with_id(id(1)));
     assert!(faults(&same, P).is_empty());
     assert_eq!(h.s.counters.duplicates, 1);
-    let other = Envelope::claimable("work", "do", Bytes::from_static(b"other")).with_id(id(1));
+    let other = Envelope::claimable(ch("work"), 1, Bytes::from_static(b"other")).with_id(id(1));
     let conflict = h.produce(P, other.clone());
     assert_eq!(faults(&conflict, P), [FaultKind::IdConflict]);
     let again = h.produce(P, other);
@@ -106,16 +106,20 @@ fn a_duplicate_id_with_the_same_content_is_dropped_and_other_content_is_a_confli
     assert_eq!(h.waiting("work"), 1);
 }
 
+/// Each case is told by its kind; nothing of them is applied. The grant is
+/// by type: the channel never decides (plan 9.15).
 #[test]
-fn malformed_requests_invalid_ids_and_forbidden_channels_are_faults() {
+fn malformed_requests_invalid_ids_and_forbidden_types_are_faults() {
     let mut grants = Grants::new();
-    grants.insert("svc".into(), Grant { methods: vec![crate::engine::config::Method::RegisterClaimable], channels: vec![Pattern("pub.*".into())], delegate: false });
+    grants.insert("svc".into(), Grant { methods: vec![crate::engine::config::Method::RegisterClaimable], types: TypeSet::of([1]), delegate: false });
     let mut h = H::with(EngineConfig { grants: Some(grants), ..config() }, false);
     h.open(P, hello(Role::Produce, 1));
     let cases: Vec<(Envelope, FaultKind)> = vec![
         (Envelope { failures: 1, ..work("pub.x") }, FaultKind::Malformed),
+        (Envelope { isolated: true, ..work("pub.x") }, FaultKind::Malformed),
+        (Envelope::claimable(ch("pub.x"), crate::envelope::SERVER_TYPE, Bytes::new()), FaultKind::Malformed),
         (work("pub.x").with_id(EventId([0xff; 16])), FaultKind::InvalidId),
-        (work("private"), FaultKind::Forbidden),
+        (Envelope::claimable(ch("pub.x"), 2, Bytes::new()), FaultKind::Forbidden),
         (work("pub.x").with_delegate("alice"), FaultKind::Forbidden),
     ];
     for (event, kind) in cases {
@@ -123,25 +127,33 @@ fn malformed_requests_invalid_ids_and_forbidden_channels_are_faults() {
         assert!(faults(&effects, P).is_empty() || faults(&effects, P) == [kind], "{kind:?}");
         assert_eq!(h.s.sessions[&P].faults & kind.bit(), kind.bit(), "{kind:?} was told");
     }
-    assert_eq!(h.waiting("pub.x") + h.waiting("private"), 0);
+    assert_eq!(h.s.live(), 0);
 }
 
-/// A production connection declares its channels in `Hello` and is checked before `Welcome` (2.7).
+/// Type 0 is the server's own: no producer registers it, even with every grant.
 #[test]
-fn declared_channels_are_checked_before_welcome() {
+fn registering_the_servers_own_type_is_malformed() {
+    let mut h = H::volatile().cast();
+    let effects = h.produce(P, Envelope::dispatch(ch("feed"), crate::envelope::SERVER_TYPE, Bytes::new()));
+    assert_eq!(faults(&effects, P), [FaultKind::Malformed]);
+}
+
+/// A production connection declares its types in `Hello` and is checked before `Welcome` (2.7).
+#[test]
+fn declared_types_are_checked_before_welcome() {
     let mut grants = Grants::new();
-    grants.insert("svc".into(), Grant { methods: vec![crate::engine::config::Method::RegisterClaimable], channels: vec![Pattern("pub.*".into())], delegate: false });
+    grants.insert("svc".into(), Grant { methods: vec![crate::engine::config::Method::RegisterClaimable], types: TypeSet::from_ranges([(10, 19)]), delegate: false });
     let mut h = H::with(EngineConfig { grants: Some(grants), ..config() }, false);
-    let refused = h.open(P, Hello { channels: vec!["private".into()], ..hello(Role::Produce, 1) });
+    let refused = h.open(P, Hello { types: vec![12, 20], ..hello(Role::Produce, 1) });
     assert_eq!(sent(&refused, P), [Outbound::Bye(ByeReason::Forbidden)]);
-    let accepted = h.open(P + 10, Hello { channels: vec!["pub.a".into()], ..hello(Role::Produce, 2) });
+    let accepted = h.open(P + 10, Hello { types: vec![10, 19], ..hello(Role::Produce, 2) });
     assert!(matches!(sent(&accepted, P + 10).as_slice(), [Outbound::Welcome(_)]));
 }
 
 #[test]
 fn a_call_the_role_does_not_send_is_refused() {
     let mut h = H::volatile().cast();
-    let effects = h.call(P, Call::Join { req: 5, channel: "work".into(), types: Vec::new(), lease_ms: 1000, dispatch: false });
+    let effects = h.call(P, Call::Join { req: 5, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 1000, dispatch: false });
     assert_eq!(faults(&effects, P), [FaultKind::Malformed]);
     assert!(sent(&effects, P).contains(&Outbound::Refused { req: 5, reason: Refusal::Malformed }));
     let emit = h.call(W1, Call::Register { seq: None, event: work("work") });

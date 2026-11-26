@@ -1,9 +1,7 @@
 //! What leaves relative to the disk, and what a restart finds.
 
 use crate::support::*;
-use ruvent::{
-    connect, ByeReason, Bytes, Call, Durability, Engine, EngineConfig, Envelope, Hello, Incoming, Methods, Outbound, Pattern, Recovered, Refusal, SegmentLog, SnapshotConfig, StorageConfig, Target,
-};
+use ruvent::{connect, ByeReason, Bytes, Call, Durability, Engine, EngineConfig, Envelope, Hello, Incoming, Methods, Outbound, Recovered, Refusal, SegmentLog, SnapshotConfig, StorageConfig, TypeSet};
 use std::time::Duration;
 
 fn strict() -> EngineConfig {
@@ -19,9 +17,9 @@ async fn under_strict_nothing_uncommitted_is_visible_while_the_disk_is_held() {
     let (producer, _) = producer(&engine).await;
     let (observer, mut watched) = observer(&engine).await;
     let (worker, mut assignments) = worker(&engine).await;
-    observer.subscribe(Target::Channel("work".into()), None).await.unwrap();
-    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    observer.subscribe(ch("work"), None).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     let (seq, id) = producer.register(work("work")).await.unwrap();
     let (late, _) = observer_and_backlog(&engine).await;
     assert!(late.is_empty(), "not in a backlog");
@@ -50,7 +48,7 @@ async fn under_strict_nothing_uncommitted_is_visible_while_the_disk_is_held() {
 
 async fn observer_and_backlog(engine: &Engine) -> (Vec<Envelope>, ruvent::Client) {
     let (late, _) = observer(engine).await;
-    (late.subscribe(Target::Channel("work".into()), None).await.unwrap().notices, late)
+    (late.subscribe(ch("work"), None).await.unwrap().notices, late)
 }
 
 /// Strict: a completion's dispatch follow-up A, then a dispatch B to the same
@@ -60,20 +58,20 @@ async fn under_strict_one_connection_receives_in_processing_order() {
     let gate = Gate::new();
     let engine = Engine::start(strict(), gate.clone(), Recovered::default()).await.unwrap();
     let (observer, mut watched) = observer(&engine).await;
-    observer.subscribe(Target::Channel("feed".into()), None).await.unwrap();
+    observer.subscribe(ch("feed"), None).await.unwrap();
     let (producer, _) = producer(&engine).await;
     let (worker, mut assignments) = worker(&engine).await;
-    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     producer.register(work("work")).await.unwrap();
     gate.release(1);
     let assignment = next_assignment(&mut assignments).await;
-    worker.complete(assignment.event.id, assignment.token, vec![Envelope::dispatch("feed", "A", Bytes::new())]).await.unwrap();
+    worker.complete(assignment.event.id, assignment.token, vec![Envelope::dispatch(ch("feed"), 33, Bytes::new())]).await.unwrap();
     // A round trip on another connection: the completion is applied before B
     // is. (Not on the observer: its answer would queue behind A.)
     let (barrier, _) = crate::support::observer(&engine).await;
     barrier.stats().await.unwrap();
-    producer.register(Envelope::dispatch("feed", "B", Bytes::new())).await.unwrap();
+    producer.register(Envelope::dispatch(ch("feed"), 34, Bytes::new())).await.unwrap();
     assert!(stays_quiet(&mut watched).await, "A waits for the disk and B waits behind A");
     gate.release(8);
     let order: Vec<String> = [next_event(&mut watched).await, next_event(&mut watched).await]
@@ -83,7 +81,7 @@ async fn under_strict_one_connection_receives_in_processing_order() {
             other => panic!("{other:?}"),
         })
         .collect();
-    assert_eq!(order, ["A", "B"]);
+    assert_eq!(order, ["33", "34"]);
 }
 
 /// A failed write stops the engine with the reason; the change it carried is
@@ -93,7 +91,7 @@ async fn a_failed_write_stops_the_engine_and_releases_nothing_it_carried() {
     let engine = Engine::start(strict(), Failing { good: 1 }, Recovered::default()).await.unwrap();
     let (producer, _) = producer(&engine).await;
     let (observer, mut watched) = observer(&engine).await;
-    observer.subscribe(Target::Channel("work".into()), None).await.unwrap();
+    observer.subscribe(ch("work"), None).await.unwrap();
     let (seq, _) = producer.register(work("work")).await.unwrap();
     assert_eq!(producer.committed(seq).await, Err(Refusal::Closed));
     let stopped = engine.stopped().await.unwrap_err();
@@ -106,10 +104,10 @@ async fn a_failed_write_stops_the_engine_and_releases_nothing_it_carried() {
 async fn a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on() {
     let engine = Engine::volatile(EngineConfig { outbound: 4, ..EngineConfig::default() }).await;
     let (stalled, mut stalled_out) = engine.open(Hello::observer("svc")).await.unwrap();
-    stalled.call(Call::Subscribe { req: 1, target: Target::Channel("feed".into()), after: None }).await.unwrap();
+    stalled.call(Call::Subscribe { req: 1, channel: ch("feed"), after: None }).await.unwrap();
     let (producer, _) = producer(&engine).await;
     for _ in 0..10 {
-        producer.register(Envelope::dispatch("feed", "t", Bytes::new())).await.unwrap();
+        producer.register(Envelope::dispatch(ch("feed"), 10, Bytes::new())).await.unwrap();
     }
     let (seq, _) = producer.register(work("work")).await.unwrap();
     assert!(producer.committed(seq).await.is_ok(), "the engine never waited on the stalled connection");
@@ -133,13 +131,13 @@ async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_worke
         let (producer, _) = producer(&engine).await;
         let mut ids = Vec::new();
         for index in 0..3u8 {
-            let (seq, id) = producer.register(Envelope::claimable("work", "do", Bytes::from(vec![index]))).await.unwrap();
+            let (seq, id) = producer.register(Envelope::claimable(ch("work"), 1, Bytes::from(vec![index]))).await.unwrap();
             producer.committed(seq).await.unwrap();
             ids.push(id);
         }
         let (worker, mut assignments) = connect(&engine, hello.clone(), 64).await.unwrap();
-        worker.join("work".into(), Vec::new(), Duration::from_secs(60), false).await.unwrap();
-        worker.window("work".into(), 1, 0).await.unwrap();
+        let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(60), false).await.unwrap();
+        worker.window(worker_join, 1, 0).await.unwrap();
         let assignment = next_assignment(&mut assignments).await;
         drop(worker);
         engine.shutdown().await.unwrap();
@@ -148,14 +146,14 @@ async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_worke
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
     let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
     let (observer, _) = observer(&engine).await;
-    let backlog = observer.subscribe(Target::Channel("work".into()), None).await.unwrap();
+    let backlog = observer.subscribe(ch("work"), None).await.unwrap();
     assert_eq!(backlog.notices.iter().map(|notice| notice.id).collect::<Vec<_>>(), ids[1..], "the claimed one is not waiting");
     let (worker, mut assignments) = connect(&engine, hello, 64).await.unwrap();
-    worker.join("work".into(), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(60), false).await.unwrap();
     worker.extend(assignment.event.id, assignment.token).await.unwrap();
     let done = worker.complete(assignment.event.id, assignment.token, Vec::new()).await.unwrap();
     worker.committed(done).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     let next = next_assignment(&mut assignments).await;
     assert_eq!((next.event.id, next.event.failures), (ids[1], 0));
     assert!(observer.stats().await.unwrap().waiting == 1);
@@ -200,8 +198,8 @@ async fn checkpoints_let_empty_segments_go_and_the_log_restarts_from_what_is_lef
         let engine = Engine::start(config.clone(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let (worker, mut assignments) = worker(&engine).await;
-        worker.join("work".into(), Vec::new(), Duration::from_secs(60), false).await.unwrap();
-        worker.window("work".into(), 1, 0).await.unwrap();
+        let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(60), false).await.unwrap();
+        worker.window(worker_join, 1, 0).await.unwrap();
         for _ in 0..200 {
             producer.register(work("work")).await.unwrap();
             let assignment = next_assignment(&mut assignments).await;
@@ -221,8 +219,8 @@ async fn checkpoints_let_empty_segments_go_and_the_log_restarts_from_what_is_lef
     let (journal, recovered) = SegmentLog::open_with(&path, storage.segment_bytes).unwrap();
     let engine = Engine::start(config, journal, recovered).await.unwrap();
     let (observer, _) = observer(&engine).await;
-    assert_eq!(observer.subscribe(Target::Channel("kept".into()), None).await.unwrap().notices.len(), 1);
-    assert!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.is_empty());
+    assert_eq!(observer.subscribe(ch("kept"), None).await.unwrap().notices.len(), 1);
+    assert!(observer.subscribe(ch("work"), None).await.unwrap().notices.is_empty());
 }
 
 /// A normal shutdown writes the stopped ledger's checkpoint last, so the next
@@ -242,7 +240,7 @@ async fn a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clo
         (before, engine.generation())
     };
     let items = ruvent::journal::read_checkpoint(path.join("checkpoint.ckpt")).unwrap();
-    assert!(items.iter().any(|item| matches!(item, ruvent::Replay::Entry(entry) if &*entry.event.channel == "work")));
+    assert!(items.iter().any(|item| matches!(item, ruvent::Replay::Entry(entry) if entry.event.channel == ch("work"))));
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
     let mut source = recovered.into_source();
     let mut records = 0;
@@ -256,7 +254,7 @@ async fn a_shutdown_writes_a_checkpoint_the_next_start_reads_no_tail_and_the_clo
     assert!(restarted.uptime() >= before, "the clock starts where it stopped, not at zero");
     assert_eq!(restarted.generation(), generation + 1);
     let (observer, _) = observer(&restarted).await;
-    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 1);
+    assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices.len(), 1);
 }
 
 /// Drain: every production connection gets its final `Committed` and then
@@ -283,17 +281,17 @@ async fn drain_gives_every_producer_a_final_committed_before_bye() {
     assert!(operator.stats().await.unwrap().draining);
 }
 
-/// The operational snapshot collects the chosen channels in units and writes
-/// the last unit on shutdown. It is not replayed.
+/// The operational snapshot collects the chosen types, on any channel, in
+/// units and writes the last unit on shutdown. It is not replayed.
 #[tokio::test]
-async fn chosen_channels_are_collected_into_snapshot_files() {
+async fn chosen_types_are_collected_into_snapshot_files() {
     let directory = scratch("snapshot");
-    let snapshot = SnapshotConfig { max_events: 3, max_age: Duration::from_secs(3600), ..SnapshotConfig::new(directory.clone(), vec![Pattern("audit.*".into())]) };
+    let snapshot = SnapshotConfig { max_events: 3, max_age: Duration::from_secs(3600), ..SnapshotConfig::new(directory.clone(), TypeSet::from_ranges([(1, 1), (35, 35)])) };
     let engine = Engine::volatile(EngineConfig { snapshot: Some(snapshot), ..EngineConfig::default() }).await;
     let (client, _) = producer(&engine).await;
     for index in 0..7u8 {
-        client.register(Envelope::dispatch("audit.login", "login", Bytes::from(vec![index]))).await.unwrap();
-        client.register(Envelope::dispatch("noise", "x", Bytes::new())).await.unwrap();
+        client.register(Envelope::dispatch(ch(&format!("audit.login.{index}")), 35, Bytes::from(vec![index]))).await.unwrap();
+        client.register(Envelope::dispatch(ch("audit.login.0"), 6, Bytes::new())).await.unwrap();
     }
     client.register_committed(work("audit.jobs")).await.unwrap();
     drop(client);
@@ -306,7 +304,59 @@ async fn chosen_channels_are_collected_into_snapshot_files() {
     }
     assert_eq!(files.len(), 3);
     assert_eq!(events.len(), 8);
-    assert!(events.iter().all(|event| event.channel.starts_with("audit.")));
+    assert!(events.iter().all(|event| event.event_type == 35 || event.event_type == 1), "type 6 shares a channel with type 35 and is not collected");
+    assert_eq!(events.iter().filter(|event| event.event_type == 35).map(|event| event.channel).collect::<std::collections::HashSet<_>>().len(), 7, "every channel of a chosen type");
     let stats = engine.snapshot_stats().unwrap();
     assert_eq!(stats.written.load(std::sync::atomic::Ordering::Relaxed), 8);
+}
+
+/// An event that reaches its type's failure threshold is isolated in place
+/// (B6): it keeps its channel, the channel's subscribers get its notice with
+/// the isolated bit, joins for the others no longer take it, an isolated join
+/// does, and the isolation survives a restart.
+#[tokio::test]
+async fn an_isolated_event_stays_on_its_channel_and_only_an_isolated_join_takes_it_across_a_restart() {
+    let path = scratch("isolated").join("journal");
+    let mut config = EngineConfig::default();
+    config.types.default.isolate_after = Some(1);
+    let id = {
+        let (journal, recovered) = SegmentLog::open(&path).unwrap();
+        let engine = Engine::start(config.clone(), journal, recovered).await.unwrap();
+        let (producer, _) = producer(&engine).await;
+        let (observer, mut watched) = observer(&engine).await;
+        observer.subscribe(ch("request"), None).await.unwrap();
+        let (worker, mut assignments) = worker(&engine).await;
+        let worker_join = worker.join(None, vec![1], false, Duration::from_secs(30), false).await.unwrap();
+        worker.window(worker_join, 4, 0).await.unwrap();
+        let (seq, id) = producer.register(work("request")).await.unwrap();
+        producer.committed(seq).await.unwrap();
+        assert!(matches!(next_event(&mut watched).await, Some(Incoming::Notice(notice)) if notice.id == id && !notice.isolated));
+        let assignment = next_assignment(&mut assignments).await;
+        worker.release(id, assignment.token, Duration::ZERO, true).await.unwrap();
+        match next_event(&mut watched).await {
+            Some(Incoming::Notice(notice)) => assert!(notice.id == id && notice.isolated && notice.channel == ch("request") && notice.failures == 1, "{notice:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(stays_quiet(&mut assignments).await, "a join for the others does not take it");
+        assert_eq!(observer.stats().await.unwrap().counters.isolated, 1);
+        drop((producer, observer, worker));
+        engine.shutdown().await.unwrap();
+        id
+    };
+    let (journal, recovered) = SegmentLog::open(&path).unwrap();
+    let engine = Engine::start(config, journal, recovered).await.unwrap();
+    let (observer, _) = observer(&engine).await;
+    let backlog = observer.subscribe(ch("request"), None).await.unwrap();
+    assert!(backlog.notices.len() == 1 && backlog.notices[0].isolated, "still isolated after the restart: {backlog:?}");
+    let (worker, mut assignments) = worker(&engine).await;
+    let plain = worker.join(None, vec![1], false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(plain, 4, 0).await.unwrap();
+    assert!(stays_quiet(&mut assignments).await);
+    let isolated = worker.join(None, vec![1], true, Duration::from_secs(30), false).await.unwrap();
+    worker.window(isolated, 4, 0).await.unwrap();
+    let assignment = next_assignment(&mut assignments).await;
+    assert!(assignment.event.id == id && assignment.event.isolated && assignment.event.channel == ch("request"));
+    let done = worker.complete(id, assignment.token, Vec::new()).await.unwrap();
+    worker.committed(done).await.unwrap();
+    assert_eq!(observer.stats().await.unwrap().waiting, 0);
 }

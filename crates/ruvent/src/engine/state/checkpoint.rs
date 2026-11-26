@@ -118,5 +118,5 @@ fn entry(slot: &Slot) -> Entry {
         Place::Delayed { until } => Standing::Delayed { until: *until },
         Place::Claimed(attempt) => Standing::Claimed { token: attempt.token, lease_ms: attempt.lease_ms, credential: attempt.credential.clone() },
     };
-    Entry { event, root: slot.fixed.root.clone(), at: slot.at, serial: slot.serial, standing }
+    Entry { event, root: slot.fixed.root, at: slot.at, serial: slot.serial, standing }
 }

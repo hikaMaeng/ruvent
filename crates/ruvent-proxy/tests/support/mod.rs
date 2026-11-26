@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use parking_lot::Mutex;
-use ruvent::{async_trait, Bytes, Call, Client, Engine, EngineConfig, Envelope, Hello, Inbox, Incoming, Link, Methods, Outbound, Role, Target};
+use ruvent::{async_trait, Bytes, Call, Channel, Client, Engine, EngineConfig, Envelope, Hello, Inbox, Incoming, Link, Methods, Outbound, Role};
 use ruvent_proxy::{Connector, Local, Servers, Upstream};
 use std::collections::HashMap;
 use std::future::Future;
@@ -14,6 +14,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let channel = Channel(bytes);
+    LABELS.lock().insert(channel, label.to_owned());
+    channel
+}
+
+/// The labels `ch` was given, so the tap and the assertions read as labels.
+///
+/// | key | channel | scope | the test process | lifetime | the process | bound | labels the tests use | cleared by | nobody |
+static LABELS: std::sync::LazyLock<Mutex<HashMap<Channel, String>>> = std::sync::LazyLock::new(Mutex::default);
+
+/// The label a test channel was made from, or its UUID text.
+pub fn label(channel: &Channel) -> String {
+    LABELS.lock().get(channel).cloned().unwrap_or_else(|| channel.to_string())
+}
 
 /// Generous: a broken test fails instead of hanging.
 pub const WAIT: Duration = Duration::from_secs(15);
@@ -52,17 +75,18 @@ pub async fn one() -> (Engine, Upstream) {
     (engines[0].clone(), Upstream::new(local, servers))
 }
 
-/// Registers a dispatch event straight on `engine` and waits until it is applied.
+/// Registers a dispatch event on the channel labelled `channel` straight on
+/// `engine` and waits until it is applied.
 pub async fn dispatch(engine: &Engine, channel: &str, payload: impl Into<Bytes>) {
     let (peer, _inbox) = ruvent::connect(engine, Hello::producer("peer"), 64).await.unwrap();
-    let (seq, _) = peer.register(Envelope::dispatch(channel, "said", payload.into())).await.unwrap();
+    let (seq, _) = peer.register(Envelope::dispatch(ch(channel), 16, payload.into())).await.unwrap();
     peer.committed(seq).await.unwrap();
 }
 
-/// An observation connection straight to `engine`, subscribed to `target`.
-pub async fn watch_target(engine: &Engine, target: Target) -> (Client, Inbox) {
+/// An observation connection straight to `engine`, subscribed to `channel`.
+pub async fn watch_channel(engine: &Engine, channel: Channel) -> (Client, Inbox) {
     let (watcher, inbox) = ruvent::connect(engine, Hello::observer("watcher"), 256).await.unwrap();
-    watcher.subscribe(target, None).await.unwrap();
+    watcher.subscribe(channel, None).await.unwrap();
     (watcher, inbox)
 }
 
@@ -96,7 +120,7 @@ impl Tap {
         self.calls.lock().push(call);
     }
 
-    /// Every later observation call (`subscribe room`, `unsubscribe room.*` for a prefix), in order.
+    /// Every later observation call (`subscribe room`, `unsubscribe room`, by label), in order.
     pub fn follow(&self) -> mpsc::UnboundedReceiver<String> {
         let (feed, calls) = mpsc::unbounded_channel();
         *self.feed.lock() = Some(feed);
@@ -107,7 +131,7 @@ impl Tap {
         self.calls.lock().clone()
     }
 
-    /// Dispatch events on `channel` that reached the proxy's observation connections.
+    /// Dispatch events on the channel labelled `channel` that reached the proxy's observation connections.
     pub fn delivered(&self, channel: &str) -> usize {
         self.deliveries.lock().get(channel).copied().unwrap_or_default()
     }
@@ -122,13 +146,6 @@ impl Tap {
         if let Some(cuts) = &*self.cuts.lock() {
             cuts.send_modify(|count| *count += 1);
         }
-    }
-}
-
-fn shown(target: &Target) -> String {
-    match target {
-        Target::Channel(name) => name.to_string(),
-        Target::Prefix(name) => format!("{name}.*"),
     }
 }
 
@@ -149,8 +166,8 @@ impl Link for TapLink {
     async fn send(&self, call: Call) -> Result<(), ruvent::Closed> {
         if self.observes {
             match &call {
-                Call::Subscribe { target, .. } => self.tap.record(format!("subscribe {}", shown(target))),
-                Call::Unsubscribe { target, .. } => self.tap.record(format!("unsubscribe {}", shown(target))),
+                Call::Subscribe { channel, .. } => self.tap.record(format!("subscribe {}", label(channel))),
+                Call::Unsubscribe { channel, .. } => self.tap.record(format!("unsubscribe {}", label(channel))),
                 _ => {}
             }
         }
@@ -191,7 +208,7 @@ impl Connector for Tapped {
                 };
                 let Some(message) = message else { break };
                 if let (true, Outbound::Delivery(event)) = (observes, &message) {
-                    *tap.deliveries.lock().entry(event.channel.to_string()).or_default() += 1;
+                    *tap.deliveries.lock().entry(label(&event.channel)).or_default() += 1;
                 }
                 if sink.send(message).await.is_err() {
                     break;

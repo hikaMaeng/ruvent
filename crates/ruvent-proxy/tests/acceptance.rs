@@ -6,11 +6,11 @@
 
 mod support;
 
-use ruvent::{Engine, EngineConfig, Envelope, Target};
+use ruvent::{Channel, Engine, EngineConfig, Envelope, Refusal};
 use ruvent_client::link::Connector;
 use ruvent_client::producer::{Producer, ProducerConfig};
 use ruvent_client::worker::{Service, Worker};
-use ruvent_proxy::{Fanout, FanoutConfig, Servers, Tcp, Upstream};
+use ruvent_proxy::{Fanout, FanoutConfig, Servers, SubscribeError, Tcp, Upstream};
 use ruvent_server::{serve, Credentials, ServerOptions};
 use std::io;
 use std::net::SocketAddr;
@@ -65,8 +65,8 @@ fn text(event: &Arc<Envelope>) -> String {
     String::from_utf8_lossy(&event.payload).into_owned()
 }
 
-fn channel(name: &str) -> Target {
-    Target::Channel(name.into())
+fn channel(name: &str) -> Channel {
+    support::ch(name)
 }
 
 /// > 신규 join은 자기 구독 표지를 기다리고, 이미 활성인 같은 사용자의 재호출은 즉시 성공한다
@@ -98,28 +98,25 @@ async fn the_subscription_rule_holds_through_a_real_event_server() {
     assert_eq!(text(&next(&mut early_events).await), "4", "nothing from the gap");
 }
 
-/// > 접두사 구독(서버). 서버의 구독 집합이 정확 이름과 접두사를 받는다. … 프록시는 사용자 채널 묶음을 접두사 하나로 구독할 수 있다.
+/// > 채널은 특수한 이름이나 식별자를 갖지 않고 uuid7에 근접한 일관된 형식만 받는다.
 ///
-/// (Plan 4장.) A member subscribing the prefix `room` gets every channel
-/// below `room` at a `.` boundary, at any depth, in order — not `room`
-/// itself and not `roomy`, which a plain `starts_with` would take.
+/// (Plan 9.15.) A channel is a UUIDv7: a subscription to anything else is
+/// refused by the event server and the member hears that refusal; a member
+/// on one channel hears nothing of another, however alike (no prefixes).
 #[tokio::test]
-async fn a_prefix_subscription_takes_every_channel_below_it_through_a_real_event_server() {
+async fn a_channel_that_is_not_a_uuid_v7_is_refused_through_a_real_event_server() {
     let server = event_server().await;
     let fanout = fanout(&[&server]).await;
     let (member, mut events) = fanout.attach().await.unwrap();
-    member.subscribe(Target::Prefix("room".into())).await.unwrap();
-    for (channel, payload) in [("room", "0"), ("room.1", "1"), ("roomy", "2"), ("room.a.b", "3"), ("roomy.1", "4"), ("room.2", "5")] {
-        support::dispatch(&server.engine, channel, payload).await;
+    let mut v4 = channel("room").0;
+    v4[6] = (v4[6] & 0x0f) | 0x40;
+    for bad in [Channel([0; 16]), Channel(v4)] {
+        assert_eq!(within("the refusal", member.subscribe(bad)).await, Err(SubscribeError::Refused(Refusal::Malformed)), "{bad}");
     }
-    let mut got = Vec::new();
-    for _ in 0..3 {
-        let event = next(&mut events).await;
-        got.push((event.channel.to_string(), text(&event)));
-    }
-    assert_eq!(got, [("room.1".to_owned(), "1".to_owned()), ("room.a.b".to_owned(), "3".to_owned()), ("room.2".to_owned(), "5".to_owned())]);
-    support::dispatch(&server.engine, "room.end", "9").await;
-    assert_eq!(text(&next(&mut events).await), "9", "nothing else came in between");
+    member.subscribe(channel("room")).await.unwrap();
+    support::dispatch(&server.engine, "room.1", "0").await;
+    support::dispatch(&server.engine, "room", "1").await;
+    assert_eq!(text(&next(&mut events).await), "1", "only the channel itself reaches its member");
 }
 
 /// > 상향 연결은 서버마다 역할별로 하나다. … 서버 목록 공급자를 받아 모든 서버에 붙도록 넓힌다.
@@ -168,14 +165,14 @@ async fn an_upstream_that_goes_away_shows_in_health() {
     assert_eq!(text(&next(&mut events).await), "7", "the server still up keeps serving");
 }
 
-/// > 요청–응답은 구성원 하나다. 요청마다 응답 채널을 구독하고, 그 채널 이름을 payload에 넣어 등록하고, 오는 것을 클라이언트에 쓴다.
+/// > 여러클라이언트-프록시-여러채널+같은타입으로 요청이벤트 전송-이벤트서버:타입으로 등록된 워커서버에게 이벤트전달-워커서버:요청타입의 이벤트를 전부 접수하고 채널별로 분리하여 인퍼런스 프로세스 진행-… 해당 채널로 스트리밍조각을 페이로드로 이벤트 전송-이벤트서버는 해당 채널로 들어온 발송이벤트를 프록시에게 전달
 ///
-/// (Plan 4장, v4.8.) No request–response helper and no flow id in the
-/// envelope: each request gets its own answer channel, named by the program
-/// and carried in the request's payload. A worker answers there with plain
-/// dispatch — pieces while it runs, the last one with its completion — and
-/// the event server routes by channel alone. Two requests in flight at once
-/// each get their own pieces, in order, and nothing of the other's.
+/// (Plan 9.14, 9.15.) Each request is its own channel, a fresh UUIDv7, and
+/// every request has the same type. One worker joins the type, not the
+/// channels, and answers each request on that request's channel with plain
+/// dispatch — pieces while it runs, the last one with its completion. Two
+/// requests in flight at once each get their own pieces, in order, and
+/// nothing of the other's.
 #[tokio::test]
 async fn each_request_is_answered_on_its_own_channel_in_order() {
     let server = event_server().await;
@@ -183,12 +180,13 @@ async fn each_request_is_answered_on_its_own_channel_in_order() {
     let connector: Arc<dyn Connector> = Arc::new(Tcp::new("proxy-token"));
     let list = Servers::new([server.address.to_string()]);
     let worker = Worker::builder(connector.clone(), &list)
-        .service(Service::new("calls").on("call", |cx| async move {
-            let answer = String::from_utf8(cx.payload().to_vec()).unwrap();
+        .service(Service::typed().on(15, |cx| async move {
+            let answer = cx.channel();
+            let name = String::from_utf8(cx.payload().to_vec()).unwrap();
             for n in 0..3 {
-                cx.emit_now(Envelope::dispatch(answer.as_str(), "piece", format!("{answer}:{n}").into_bytes())).await.unwrap();
+                cx.emit_now(Envelope::dispatch(answer, 13, format!("{name}:{n}").into_bytes())).await.unwrap();
             }
-            cx.emit_dispatch(answer.as_str(), "end", Vec::new());
+            cx.emit_dispatch(answer, 14, Vec::new());
             Ok(())
         }))
         .start();
@@ -197,15 +195,15 @@ async fn each_request_is_answered_on_its_own_channel_in_order() {
     for name in ["answer.0b1e", "answer.7c2d"] {
         let (member, events) = fanout.attach().await.unwrap();
         member.subscribe(channel(name)).await.unwrap();
-        producer.send(Envelope::claimable("calls", "call", name.as_bytes().to_vec())).await.unwrap();
+        producer.send(Envelope::claimable(channel(name), 15, name.as_bytes().to_vec())).await.unwrap();
         asks.push((name, member, events));
     }
     for (name, member, mut events) in asks {
         let mut got = Vec::new();
         loop {
             let event = next(&mut events).await;
-            assert_eq!(event.channel.as_str(), name, "only this request's channel reaches its member");
-            if event.event_type.as_str() == "end" {
+            assert_eq!(event.channel, channel(name), "only this request's channel reaches its member");
+            if event.event_type == 14 {
                 break;
             }
             got.push(text(&event));

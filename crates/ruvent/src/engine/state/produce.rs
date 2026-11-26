@@ -4,8 +4,8 @@ use super::slots::{Fixed, Index, Place, Slot};
 use super::wheel::Due;
 use super::State;
 use crate::engine::config::Method;
-use crate::engine::ops::{DeleteFailure, FaultKind, Outbound, Role, SessionId, DELETED, DELETE_FAILED};
-use crate::envelope::{Digest, Envelope, EventId, Kind, WorkKey};
+use crate::engine::ops::{DeleteFailure, FaultKind, Outbound, Role, SessionId};
+use crate::envelope::{Channel, Digest, Envelope, EventId, Kind, WorkKey, SERVER_TYPE};
 use crate::journal::{Location, Record};
 use crate::names::Name;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -13,9 +13,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 fn delete_payload(id: EventId, failure: Option<DeleteFailure>) -> Bytes {
     let mut payload = BytesMut::with_capacity(17);
     payload.put_slice(&id.0);
-    if let Some(failure) = failure {
-        payload.put_u8(failure as u8);
-    }
+    payload.put_u8(failure.map_or(0, |failure| failure as u8));
     payload.freeze()
 }
 
@@ -23,8 +21,16 @@ impl State {
     /// Checks a registration request or a follow-up and resolves its names.
     /// Faults (once per kind) and returns `None` when it may not be applied.
     pub(super) fn admit(&mut self, session: SessionId, credential: &Name, event: Envelope) -> Option<Envelope> {
-        if event.failures != 0 || event.key.is_some() || event.principal.is_some() || event.channel.is_empty() {
-            self.fault(session, FaultKind::Malformed, "a request may not carry failures, a work key or a principal");
+        if event.failures != 0 || event.key.is_some() || event.principal.is_some() || event.isolated {
+            self.fault(session, FaultKind::Malformed, "a request may not carry failures, a work key, a principal or the isolated bit");
+            return None;
+        }
+        if !event.channel.is_valid() {
+            self.fault(session, FaultKind::Malformed, "the channel is not a UUIDv7");
+            return None;
+        }
+        if event.event_type == SERVER_TYPE {
+            self.fault(session, FaultKind::Malformed, "type 0 is the server's own");
             return None;
         }
         if event.kind == Kind::Dispatch && (event.not_before.is_some() || event.expires.is_some() || event.group.is_some()) {
@@ -39,13 +45,11 @@ impl State {
             Kind::Claimable => Method::RegisterClaimable,
             Kind::Dispatch => Method::RegisterDispatch,
         };
-        if !self.allowed(credential, method, &event.channel) || (event.delegate.is_some() && !self.may_delegate(credential)) {
-            self.fault(session, FaultKind::Forbidden, "the credential may not register this here");
+        if !self.allowed(credential, method, event.event_type) || (event.delegate.is_some() && !self.may_delegate(credential)) {
+            self.fault(session, FaultKind::Forbidden, "the credential may not register this type");
             return None;
         }
         let mut event = event;
-        event.channel = self.names.adopt(&event.channel);
-        event.event_type = self.names.adopt(&event.event_type);
         for name in [&mut event.delegate].into_iter().flatten() {
             *name = self.names.adopt(name);
         }
@@ -67,8 +71,8 @@ impl State {
                         return self.same_id(session, index, &event, FaultKind::IdConflict);
                     }
                 }
-                let root = event.channel.clone();
-                self.pause_notice(session, &root, event.payload.len() as u64);
+                let root = event.event_type;
+                self.pause_notice(session, root, event.payload.len() as u64);
                 self.enqueue(event, root, None);
             }
         }
@@ -88,12 +92,12 @@ impl State {
     /// Queues an admitted claimable event (its id may still be nil) under
     /// `root`. `streamed`: its payload was received to disk there (2.6) and
     /// `event.payload` is empty.
-    pub(super) fn enqueue(&mut self, mut event: Envelope, root: Name, streamed: Option<Location>) -> Index {
+    pub(super) fn enqueue(&mut self, mut event: Envelope, root: u16, streamed: Option<Location>) -> Index {
         let explicit = !event.id.is_nil();
         if !explicit {
             event.id = self.fresh_id();
         }
-        let durable = self.journaled && !self.config.channels.settings(&event.channel).volatile;
+        let durable = self.journaled && !self.config.types.settings(event.event_type).volatile;
         let digest = match streamed {
             Some(at) => at.digest(),
             None => Digest::of(&event.payload),
@@ -105,7 +109,7 @@ impl State {
             id: event.id,
             key,
             event_type: event.event_type,
-            root: root.clone(),
+            root,
             principal: event.principal,
             delegate: event.delegate,
             group: event.group,
@@ -115,10 +119,10 @@ impl State {
             visible_from: if durable { self.carrying } else { 0 },
             digest: explicit.then_some(digest),
         };
-        let slot = Slot { fixed, channel: event.channel, failures: 0, expires, place: Place::Waiting, commit: 0, serial: 0, payload: event.payload, at: streamed };
+        let slot = Slot { fixed, channel: event.channel, isolated: false, failures: 0, expires, place: Place::Waiting, commit: 0, serial: 0, payload: event.payload, at: streamed };
         let usage = self.usage(&slot);
         let index = self.slots.insert(slot);
-        self.account_add(&root, usage);
+        self.account_add(root, usage);
         let generation = self.slots.generation(index);
         if let Some(at) = streamed {
             // A streamed payload is live in its body segment from now on.
@@ -153,28 +157,36 @@ impl State {
         index
     }
 
-    /// Hands a dispatch event to the channel's subscribers as of now, and forgets it.
+    /// Hands a dispatch event to the channel's subscribers and dispatch joins
+    /// as of now whose credential reads its type, and forgets it.
     pub(super) fn deliver(&mut self, event: Envelope, gate: Option<u64>) {
-        for session in self.subscribers.of(&event.channel, true) {
+        for session in self.readers(&event.channel, true, event.event_type) {
             self.send(session, Outbound::Delivery(event.clone()), gate);
         }
         self.observe(&event);
     }
 
     pub(super) fn observe(&mut self, event: &Envelope) {
-        if self.config.snapshot.as_ref().is_some_and(|snapshot| snapshot.wants(&event.channel, &event.event_type)) {
+        if self.config.snapshot.as_ref().is_some_and(|snapshot| snapshot.wants(event.event_type)) {
             self.effects.observed.push(event.clone());
         }
     }
 
     /// `Delete`: a waiting (or delayed, or held) event goes; the outcome is a
-    /// dispatch event on `result` either way.
-    pub(super) fn delete(&mut self, session: SessionId, credential: &Name, id: EventId, result: &Name, key: Option<WorkKey>) {
-        let result = self.names.adopt(result);
+    /// dispatch event of type 0 on `result` either way. The grant is checked
+    /// against the event's type when it is there, the method alone when not.
+    pub(super) fn delete(&mut self, session: SessionId, credential: &Name, id: EventId, result: Channel, key: Option<WorkKey>) {
+        if !result.is_valid() {
+            return self.fault(session, FaultKind::Malformed, "the result channel is not a UUIDv7");
+        }
         let found = self.slots.by_id(&id);
-        let channel = found.and_then(|index| self.slots.get(index)).map(|slot| slot.channel.clone());
-        if !self.allowed(credential, Method::Delete, &result) || channel.as_ref().is_some_and(|channel| !self.allowed(credential, Method::Delete, channel)) {
-            return self.fault(session, FaultKind::Forbidden, "the credential may not delete here");
+        let event_type = found.and_then(|index| self.slots.get(index)).map(|slot| slot.fixed.event_type);
+        let granted = match event_type {
+            Some(event_type) => self.allowed(credential, Method::Delete, event_type),
+            None => self.has_method(credential, Method::Delete),
+        };
+        if !granted {
+            return self.fault(session, FaultKind::Forbidden, "the credential may not delete this type");
         }
         let failure = match found.and_then(|index| self.slots.get(index).map(|slot| (index, slot))) {
             None => Some(DeleteFailure::Missing),
@@ -191,8 +203,7 @@ impl State {
                 }
             }
         }
-        let event_type = self.names.intern(if failure.is_none() { DELETED } else { DELETE_FAILED });
-        let notice = Envelope { id: self.fresh_id(), principal: Some(credential.clone()), ..Envelope::dispatch(result, event_type, delete_payload(id, failure)) };
+        let notice = Envelope { id: self.fresh_id(), principal: Some(credential.clone()), ..Envelope::dispatch(result, SERVER_TYPE, delete_payload(id, failure)) };
         self.deliver(notice, gate);
     }
 }

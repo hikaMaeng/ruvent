@@ -3,7 +3,7 @@
 
 mod support;
 
-use ruvent::{Envelope, Target};
+use ruvent::{Channel, Envelope};
 use ruvent_proxy::{Fanout, FanoutConfig, Member, SubscribeError, Upstream};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +24,8 @@ async fn setup(config: FanoutConfig) -> Setup {
     Setup { engine, fanout, tap }
 }
 
-fn room() -> Target {
-    Target::Channel("room".into())
+fn room() -> Channel {
+    support::ch("room")
 }
 
 async fn next(events: &mut mpsc::Receiver<Arc<Envelope>>) -> Option<u64> {
@@ -156,7 +156,7 @@ async fn after_the_upstream_drops_the_fanout_resubscribes() {
     setup.tap.cut();
     assert_eq!(next_call(&mut calls).await, "subscribe room", "said again on the new connection");
     eventually("the fan-out is ready again", || setup.fanout.is_ready()).await;
-    assert_eq!(&*first_after(&setup.engine, &mut events).await.channel, "room");
+    assert_eq!(first_after(&setup.engine, &mut events).await.channel, room());
     drop(handle);
 }
 
@@ -210,7 +210,7 @@ async fn a_server_added_to_the_list_is_subscribed_for_every_member() {
     handle.subscribe(room()).await.unwrap();
     servers.set(["s0", "s1"]);
     eventually("both servers are up", || fanout.health().servers.len() == 2 && fanout.is_ready()).await;
-    assert_eq!(&*first_after(&engines[1], &mut events).await.channel, "room");
+    assert_eq!(first_after(&engines[1], &mut events).await.channel, room());
     drop(handle);
 }
 
@@ -256,7 +256,7 @@ async fn members_share_the_envelopes_as_the_server_sent_them() {
     b.subscribe(room()).await.unwrap();
     dispatch(&setup.engine, "room", &b"\xff\x00binary"[..]).await;
     let (one, two) = (within("a's event", a_events.recv()).await.unwrap(), within("b's event", b_events.recv()).await.unwrap());
-    assert_eq!((&*one.channel, &one.payload[..]), ("room", &b"\xff\x00binary"[..]));
+    assert_eq!((one.channel, &one.payload[..]), (room(), &b"\xff\x00binary"[..]));
     assert!(Arc::ptr_eq(&one, &two), "one envelope, shared");
     drop((a, b));
 }
@@ -274,7 +274,7 @@ async fn stopping_the_hub_ends_every_stream_and_lets_go_of_the_upstream() {
     assert!(!setup.fanout.is_ready());
     assert!(!setup.fanout.ready().await, "waiting for readiness returns at once once stopped");
     assert_eq!(setup.fanout.attach().await.err(), Some(SubscribeError::Stopped));
-    assert_eq!(handle.subscribe(Target::Channel("other".into())).await, Err(SubscribeError::Stopped));
+    assert_eq!(handle.subscribe(support::ch("other")).await, Err(SubscribeError::Stopped));
     eventually("every upstream connection is let go", || setup.tap.live() == 0).await;
 }
 

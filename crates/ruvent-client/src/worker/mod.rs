@@ -47,6 +47,7 @@ pub mod windows;
 
 pub use context::{Context, EmitError};
 pub use handler::Retry;
+pub(crate) use service::Selection;
 pub use service::Service;
 
 use crate::line::backoff::Reconnect;
@@ -176,7 +177,7 @@ impl Builder {
 
     /// Starts connecting to every server. Returns at once.
     pub fn start(self) -> Worker {
-        let books = self.services.iter().map(|service| (service.channel.clone(), Book::new(service.slots))).collect();
+        let books = self.services.iter().map(|service| (service.label(), Book::new(service.slots))).collect();
         let shared = Arc::new(Shared { books: Mutex::new(books), counters: Counters::default(), refused: Mutex::default() });
         let (commands, command_rx) = mpsc::channel(4);
         let (messages, message_rx) = mpsc::channel(1024);
@@ -369,12 +370,11 @@ impl Actor {
                 if restarted {
                     self.shared.counters.restarts.fetch_add(1, Ordering::Relaxed);
                 }
-                let services: Vec<(usize, Name, Vec<Name>, Duration)> =
-                    self.services.iter().enumerate().map(|(index, service)| (index, service.channel.clone(), service.handlers.keys().cloned().collect(), service.lease)).collect();
+                let services: Vec<(usize, Selection, Duration)> = self.services.iter().enumerate().map(|(index, service)| (index, service.selection(), service.lease)).collect();
                 let Some(line) = self.lines.get_mut(&server) else { return };
                 line.up(epoch, link, &welcome).await;
-                for (index, channel, types, lease) in services {
-                    line.join(index, channel, types, lease, false).await;
+                for (index, selection, lease) in services {
+                    line.join(index, selection, lease, false).await;
                 }
             }
             Event::Message { server, epoch, message, .. } => {
@@ -402,20 +402,20 @@ impl Actor {
     async fn outbound(&mut self, server: Server, message: Outbound) {
         match message {
             Outbound::Joined { req } => {
-                let Some(index) = self.lines.get_mut(&server).and_then(|line| line.answered(req)) else { return };
+                let Some(index) = self.lines.get_mut(&server).and_then(|line| line.answered(req, true)) else { return };
                 self.joined(&server, index).await;
             }
             Outbound::Refused { req, reason } => {
                 if let Some(line) = self.lines.get_mut(&server) {
-                    line.answered(req);
+                    line.answered(req, false);
                 }
                 if reason != Refusal::Closed {
                     self.shared.counters.refused.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Outbound::Assign(assignment) => self.assigned(server, assignment).await,
-            Outbound::Pending { channel } => {
-                let Some(index) = self.service(&channel) else { return };
+            Outbound::Pending { join } => {
+                let Some(index) = self.lines.get(&server).and_then(|line| line.service_of(join)) else { return };
                 let changes = self.shared.books.lock()[index].1.pending(&server);
                 self.send_windows(index, changes).await;
             }
@@ -428,8 +428,9 @@ impl Actor {
         }
     }
 
-    fn service(&self, channel: &Name) -> Option<usize> {
-        self.services.iter().position(|service| service.channel == *channel)
+    /// The service whose join selects the event (at most one: the server refuses overlapping joins).
+    fn service(&self, event: &Envelope) -> Option<usize> {
+        self.services.iter().position(|service| service.selects(event))
     }
 
     /// The join took effect on a new connection: extend this server's runs of
@@ -456,7 +457,7 @@ impl Actor {
     async fn assigned(&mut self, server: Server, assignment: Assignment) {
         let Assignment { event, token, lease_ms, until, more } = assignment;
         let id = event.id;
-        let index = self.service(&event.channel);
+        let index = self.service(&event);
         let arrival = match index {
             Some(index) if self.shutting.is_none() => {
                 let (arrival, changes) = self.shared.books.lock()[index].1.assigned(&server, more);
@@ -570,7 +571,8 @@ impl Actor {
                 continue;
             }
             self.shared.counters.windows.fetch_add(1, Ordering::Relaxed);
-            line.tell(Call::Window { channel: service.channel.clone(), count, bytes: service.window_bytes }).await;
+            let Some(join) = line.join_of(index) else { continue };
+            line.tell(Call::Window { join, count, bytes: service.window_bytes }).await;
         }
     }
 

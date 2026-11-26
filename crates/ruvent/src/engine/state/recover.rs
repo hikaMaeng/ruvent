@@ -16,7 +16,6 @@ use super::wheel::Due;
 use super::State;
 use crate::envelope::{Envelope, ProducerId, WorkKey};
 use crate::journal::{End, Entry, Location, Record, Recovered, Replay, Standing};
-use crate::names::Name;
 use std::collections::HashMap;
 
 /// What replay keeps while it runs.
@@ -74,13 +73,13 @@ impl State {
     }
 
     /// A slot from a registration or a checkpoint entry.
-    fn rebuild(&mut self, event: Envelope, root: &Name, at: Option<Location>, serial: u64, place: Place) -> Option<Index> {
+    fn rebuild(&mut self, event: Envelope, root: u16, at: Option<Location>, serial: u64, place: Place) -> Option<Index> {
         let key = event.key?;
         let fixed = Fixed {
             id: event.id,
             key,
-            event_type: self.names.adopt(&event.event_type),
-            root: self.names.adopt(root),
+            event_type: event.event_type,
+            root,
             principal: event.principal.map(|name| self.names.adopt(&name)),
             delegate: event.delegate.map(|name| self.names.adopt(&name)),
             group: event.group,
@@ -90,8 +89,7 @@ impl State {
             visible_from: 0,
             digest: None,
         };
-        let channel = self.names.adopt(&event.channel);
-        let slot = Slot { fixed, channel, failures: event.failures, expires: event.expires, place, commit: 0, serial, payload: event.payload, at };
+        let slot = Slot { fixed, channel: event.channel, isolated: event.isolated, failures: event.failures, expires: event.expires, place, commit: 0, serial, payload: event.payload, at };
         Some(self.slots.insert(slot))
     }
 
@@ -118,7 +116,7 @@ impl State {
                     Standing::Claimed { token, lease_ms, credential } => Place::Claimed(Attempt { token, lease_ms, until: 0, credential: self.names.adopt(&credential), join: None }),
                 };
                 let key = event.key;
-                if let (Some(key), Some(index)) = (key, self.rebuild(event, &root, at, serial, place)) {
+                if let (Some(key), Some(index)) = (key, self.rebuild(event, root, at, serial, place)) {
                     replayer.keys.insert(key, index);
                 }
             }
@@ -149,7 +147,7 @@ impl State {
                     Some(until) => Place::Delayed { until },
                     None => Place::Waiting,
                 };
-                if let Some(index) = self.rebuild(event, &root, at, serial, place) {
+                if let Some(index) = self.rebuild(event, root, at, serial, place) {
                     replayer.keys.insert(key, index);
                 }
             }
@@ -184,10 +182,9 @@ impl State {
                     slot.serial = serial;
                 }
             }
-            Record::Isolate { key, channel, failures, expires } => {
-                let channel = self.names.adopt(&channel);
+            Record::Isolate { key, failures, expires } => {
                 if let Some(slot) = newer(self, &key).and_then(|index| self.slots.get_mut(index)) {
-                    slot.channel = channel;
+                    slot.isolated = true;
                     slot.failures = failures;
                     slot.expires = expires;
                     slot.place = Place::Waiting;
@@ -252,8 +249,8 @@ impl State {
             }
             if let Some(slot) = self.slots.get(index) {
                 let usage = self.usage(slot);
-                let root = slot.fixed.root.clone();
-                self.account_add(&root, usage);
+                let root = slot.fixed.root;
+                self.account_add(root, usage);
             }
         }
         // History before the restart is unknown: no recovered root counts as

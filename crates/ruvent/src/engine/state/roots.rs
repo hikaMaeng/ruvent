@@ -1,4 +1,4 @@
-//! Root-channel accounting and the pause record (2.6).
+//! Root-type accounting and the pause record (2.6).
 
 use super::lanes::LaneKey;
 use crate::engine::ops::SessionId;
@@ -35,13 +35,13 @@ pub(super) struct Notified {
     pub stopped: bool,
 }
 
-/// One root channel's share.
+/// One root type's share.
 ///
-/// | key | root channel |
+/// | key | root type |
 /// | --- | --- |
 /// | scope | one engine |
 /// | lifetime | while it holds events or is paused |
-/// | bound | root channels with events |
+/// | bound | root types with events (≤ 65,536) |
 /// | cleared by | the ledger, when it holds nothing and is not paused |
 #[derive(Debug, Default)]
 pub(super) struct Root {

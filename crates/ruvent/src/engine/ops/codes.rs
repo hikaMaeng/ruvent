@@ -97,8 +97,10 @@ pub enum Refusal {
     Malformed,
     /// The connection is closed; nothing was sent or nothing came back. Client side only.
     Closed,
+    /// A `Join` selects lanes another join of this connection selects.
+    Overlap,
 }
 
-coded!(Refusal { Forbidden, Missing, AlreadyClaimed, Malformed, Closed });
+coded!(Refusal { Forbidden, Missing, AlreadyClaimed, Malformed, Closed, Overlap });
 
 impl std::error::Error for Refusal {}

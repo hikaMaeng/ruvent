@@ -2,7 +2,7 @@
 //! and the handles that talk to it.
 //!
 //! The event servers see, from each fan-out, one observation connection
-//! each and one subscription per target however many members want it (4장).
+//! each and one subscription per channel however many members want it (4장).
 //! The hub fans each delivery out to the members whose subscription is in
 //! effect on the server it came from at the moment it handles that delivery.
 //!
@@ -36,7 +36,7 @@ pub use channels::MemberId;
 
 use crate::health::Health;
 use crate::upstream::Upstream;
-use ruvent::{Envelope, Refusal, Target};
+use ruvent::{Channel, Envelope, Refusal};
 use ruvent_client::line::backoff::Reconnect;
 use ruvent_client::observer::{Observer, ObserverConfig};
 use std::fmt;
@@ -67,7 +67,7 @@ impl Default for FanoutConfig {
 pub enum SubscribeError {
     /// An event server refused it.
     Refused(Refusal),
-    /// The member left the target, or was detached, before it took effect.
+    /// The member left the channel, or was detached, before it took effect.
     Left,
     /// The fan-out stopped.
     Stopped,
@@ -157,17 +157,16 @@ pub struct Member {
 
 impl Member {
     /// Subscribes, and returns once the subscription has taken effect on a
-    /// server. A prefix target takes every channel below it at a `.`
-    /// boundary. Whether this member may have it is the caller's to decide
+    /// server. Whether this member may have it is the caller's to decide
     /// first.
-    pub async fn subscribe(&self, target: Target) -> Result<(), SubscribeError> {
+    pub async fn subscribe(&self, channel: Channel) -> Result<(), SubscribeError> {
         let (reply, done) = oneshot::channel();
-        self.fanout.commands.send(Command::Join { member: self.id, target, reply }).await.map_err(|_| SubscribeError::Stopped)?;
+        self.fanout.commands.send(Command::Join { member: self.id, channel, reply }).await.map_err(|_| SubscribeError::Stopped)?;
         done.await.map_err(|_| SubscribeError::Stopped)?
     }
 
-    pub async fn unsubscribe(&self, target: Target) {
-        let _ = self.fanout.commands.send(Command::Leave { member: self.id, target }).await;
+    pub async fn unsubscribe(&self, channel: Channel) {
+        let _ = self.fanout.commands.send(Command::Leave { member: self.id, channel }).await;
     }
 }
 

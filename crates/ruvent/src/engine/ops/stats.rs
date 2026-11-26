@@ -1,7 +1,7 @@
 //! The answer to `Stats` (2.8, B24): values copied out of the ledger when asked.
 //! Nothing is reported periodically.
 
-use crate::names::Name;
+use crate::envelope::Channel;
 
 /// Counters since the engine started. They only grow.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub struct Counters {
     pub stale: u64,
     /// Events removed because they expired.
     pub expired: u64,
-    /// Events moved to an isolation channel.
+    /// Events isolated (B6, B9).
     pub isolated: u64,
     /// Leases that ran out.
     pub reclaimed: u64,
@@ -22,7 +22,7 @@ pub struct Counters {
     pub faults: u64,
     /// Batches that ended with managed memory at or past the limit (net-growth lanes were not assigned).
     pub over_limit: u64,
-    /// Root channels paused, by any rule.
+    /// Root types paused, by any rule.
     pub pauses: u64,
     /// Cached durable payloads released at the high watermark (2.5).
     pub released: u64,
@@ -56,28 +56,28 @@ pub struct Pressure {
     pub disk_limit: Option<u64>,
 }
 
-/// One channel in the top-K by waiting events.
+/// One type in the top-K by waiting events.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelStat {
-    pub channel: Name,
+pub struct TypeStat {
+    pub event_type: u16,
     /// Waiting events (in a lane or held back by a pause).
     pub waiting: u64,
     /// Age in ms of its oldest waiting event (by registration time).
     pub oldest_ms: u64,
 }
 
-/// A (channel, type) with waiting events and no join: nobody will take them.
+/// A (channel, type) with waiting events and no join that selects it: nobody will take them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdleLane {
-    pub channel: Name,
-    pub event_type: Name,
+    pub channel: Channel,
+    pub event_type: u16,
     pub waiting: u64,
 }
 
-/// One root channel in the top-K by share.
+/// One root type in the top-K by share: the type that started the lineages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootStat {
-    pub root: Name,
+    pub root: u16,
     /// Events held for the root, in any state.
     pub events: u64,
     /// The root's memory share: metadata and volatile payloads.
@@ -113,7 +113,7 @@ pub struct Stats {
     pub segments: u64,
     pub draining: bool,
     pub counters: Counters,
-    pub channels: Vec<ChannelStat>,
+    pub types: Vec<TypeStat>,
     pub idle_lanes: Vec<IdleLane>,
     pub roots: Vec<RootStat>,
 }

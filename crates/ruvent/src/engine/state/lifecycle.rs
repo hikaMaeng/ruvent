@@ -19,8 +19,8 @@ impl State {
     /// connection received to disk (2.6), by position.
     pub(super) fn complete(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)>) {
         let Some(index) = self.attempt_for(session, credential, id, token) else { return };
-        let Some(channel) = self.slots.get(index).map(|slot| slot.channel.clone()) else { return };
-        if !self.allowed(credential, Method::Complete, &channel) {
+        let Some(event_type) = self.slots.get(index).map(|slot| slot.fixed.event_type) else { return };
+        if !self.allowed(credential, Method::Complete, event_type) {
             return self.fault(session, FaultKind::Forbidden, "the credential may not complete here");
         }
         if follow_ups.len() > self.config.max_follow_ups {
@@ -76,7 +76,7 @@ impl State {
         for (follow_up, body) in kept {
             match follow_up.kind {
                 Kind::Claimable => {
-                    self.enqueue(follow_up, parent.fixed.root.clone(), body);
+                    self.enqueue(follow_up, parent.fixed.root, body);
                 }
                 Kind::Dispatch => dispatches.push(follow_up),
             }
@@ -170,17 +170,17 @@ impl State {
     /// Takes an attempt off its join and its group.
     fn unclaim(&mut self, index: Index, attempt: &Attempt) {
         let Some(slot) = self.slots.get(index) else { return };
-        let (len, group, channel, lane) = (slot.len(), slot.fixed.group, slot.channel.clone(), slot.lane());
+        let (len, group, channel, lane, event_type) = (slot.len(), slot.fixed.group, slot.channel, slot.lane(), slot.fixed.event_type);
         if let Some(join_id) = &attempt.join {
             if let Some(join) = self.joins.get_mut(join_id) {
                 join.claimed = join.claimed.saturating_sub(1);
                 join.claimed_bytes = join.claimed_bytes.saturating_sub(len);
                 join.attempts.remove(&index);
-                self.to_fill.push(join_id.clone());
+                self.to_fill.push(*join_id);
             }
         }
         if let Some(group) = group {
-            if self.config.channels.settings(&channel).serialize_group {
+            if self.config.types.settings(event_type).serialize_group {
                 let key = (channel, group);
                 if let Some(count) = self.groups.get_mut(&key) {
                     *count = count.saturating_sub(1);
@@ -194,38 +194,44 @@ impl State {
     }
 
     fn should_isolate(&self, index: Index) -> bool {
-        self.slots.get(index).is_some_and(|slot| self.config.channels.settings(&slot.channel).isolate_after.is_some_and(|limit| slot.failures >= limit))
+        self.slots.get(index).is_some_and(|slot| self.config.types.settings(slot.fixed.event_type).isolate_after.is_some_and(|limit| slot.failures >= limit))
     }
 
-    /// Moves the event to `isolated.<channel>` in one step, with its failure
-    /// count, root and durability, and the channel's keep time as its expiry (B6).
+    /// Isolates the event in place (B6): it keeps its channel, type, root and
+    /// durability, gets its type's keep time as its expiry, and waits in its
+    /// isolated lane, where only joins that ask for isolated events take it.
+    /// The channel's subscribers get its notice with the isolated bit set, so
+    /// whoever waits on the channel learns the work gave up. An event that is
+    /// already isolated goes back to its isolated lane with its new failure
+    /// count and its expiry unchanged.
     fn isolate(&mut self, index: Index) {
         let Some(slot) = self.slots.get(index) else { return };
-        let channel = self.config.channels.isolated(&slot.channel);
-        let keep = super::millis(self.config.channels.settings(&slot.channel).isolated_keep);
-        let channel = self.names.intern(&channel);
-        let expires = Some(self.now.saturating_add(keep));
+        let again = slot.isolated;
+        let keep = super::millis(self.config.types.settings(slot.fixed.event_type).isolated_keep);
+        let expires = if again { slot.expires } else { Some(self.now.saturating_add(keep)) };
         let generation = self.slots.generation(index);
         let Some(slot) = self.slots.get_mut(index) else { return };
-        slot.channel = channel.clone();
+        slot.isolated = true;
         slot.expires = expires;
         let (key, failures, durable) = (slot.fixed.key, slot.failures, slot.fixed.durable);
-        if let Some(at) = expires {
+        if let (false, Some(at)) = (again, expires) {
             self.wheel.expire_at(at, index, generation);
         }
         if durable {
-            self.record_for(index, Record::Isolate { key, channel, failures, expires });
+            self.record_for(index, Record::Isolate { key, failures, expires });
         }
-        self.counters.isolated += 1;
+        if !again {
+            self.counters.isolated += 1;
+        }
         self.wait(index);
     }
 
-    /// An expired event is removed (or isolated, if its channel says so) and
-    /// counted; nobody is told (B9).
+    /// An expired event is removed (or isolated, if its type says so and it
+    /// is not isolated yet) and counted; nobody is told (B9).
     pub(super) fn expire(&mut self, index: Index) {
         let Some(slot) = self.slots.get(index) else { return };
-        let settings = self.config.channels.settings(&slot.channel);
-        if settings.isolate_expired && !slot.channel.starts_with(self.config.channels.isolation_prefix.as_str()) {
+        let settings = self.config.types.settings(slot.fixed.event_type);
+        if settings.isolate_expired && !slot.isolated {
             self.take_out(index);
             return self.isolate(index);
         }
@@ -240,7 +246,7 @@ impl State {
     /// attempt — leaving it in the arena with no place.
     fn take_out(&mut self, index: Index) {
         let Some(slot) = self.slots.get(index) else { return };
-        let (place, lane, key, root) = (slot.place.clone(), slot.lane(), slot.fixed.key, slot.fixed.root.clone());
+        let (place, lane, key, root) = (slot.place.clone(), slot.lane(), slot.fixed.key, slot.fixed.root);
         match place {
             Place::Waiting => {
                 if let Some(found) = self.lanes.get_mut(&lane) {
@@ -248,7 +254,7 @@ impl State {
                 }
                 self.tidy(&lane);
             }
-            Place::Held => self.unhold(&root, &lane, key),
+            Place::Held => self.unhold(root, &lane, key),
             Place::Delayed { .. } => {}
             Place::Claimed(attempt) => self.unclaim(index, &attempt),
         }
@@ -266,7 +272,7 @@ impl State {
             }
         }
         let usage = self.usage(&slot);
-        self.account_remove(&slot.fixed.root, usage);
+        self.account_remove(slot.fixed.root, usage);
         self.free_payload(slot.at, slot.fixed.durable);
         Some(slot)
     }
@@ -278,19 +284,19 @@ impl State {
         if slot.expires.is_some_and(|at| at <= self.now) {
             return self.expire(index);
         }
-        let (lane, key, channel) = (slot.lane(), slot.fixed.key, slot.channel.clone());
+        let (lane, key, channel) = (slot.lane(), slot.fixed.key, slot.channel);
         let notice = slot.envelope().notice();
         if let Some(slot) = self.slots.get_mut(index) {
             slot.place = Place::Waiting;
         }
         self.lane_mut(&lane).queue.insert(key, index);
         let gate = self.gate_for(index);
-        for session in self.subscribers.of(&channel, false) {
+        for session in self.readers(&channel, false, lane.1) {
             self.send(session, Outbound::Notice(notice.clone()), gate);
         }
         match gate {
             Some(commit) => {
-                if self.awaiting.back() != Some(&(commit, lane.clone())) {
+                if self.awaiting.back() != Some(&(commit, lane)) {
                     self.awaiting.push_back((commit, lane));
                 }
             }
@@ -301,21 +307,22 @@ impl State {
     /// Moves a waiting event to its root's hold lane.
     pub(super) fn hold(&mut self, index: Index) {
         let Some(slot) = self.slots.get(index) else { return };
-        let (lane, key, root) = (slot.lane(), slot.fixed.key, slot.fixed.root.clone());
+        let (lane, key, root) = (slot.lane(), slot.fixed.key, slot.fixed.root);
         if let Some(found) = self.lanes.get_mut(&lane) {
             found.queue.remove(&key);
         }
+        self.tidy(&lane);
         if let Some(slot) = self.slots.get_mut(index) {
             slot.place = Place::Held;
         }
-        self.holds.entry((root.clone(), lane.clone())).or_default().insert(key, index);
+        self.holds.entry((root, lane)).or_default().insert(key, index);
         if let Some(paused) = self.roots.get_mut(&root).and_then(|root| root.paused.as_mut()) {
             paused.holds.insert(lane);
         }
     }
 
-    pub(super) fn unhold(&mut self, root: &Name, lane: &LaneKey, key: WorkKey) {
-        let hold = (root.clone(), lane.clone());
+    pub(super) fn unhold(&mut self, root: u16, lane: &LaneKey, key: WorkKey) {
+        let hold = (root, *lane);
         if let Some(held) = self.holds.get_mut(&hold) {
             held.remove(&key);
             if held.is_empty() {
@@ -326,10 +333,10 @@ impl State {
 
     /// Puts a root's held events back in their lanes, ahead of what came
     /// after them (they keep their work keys).
-    pub(super) fn release_holds(&mut self, root: &Name) {
-        let lanes: Vec<LaneKey> = self.roots.get_mut(root).and_then(|root| root.paused.as_mut()).map(|paused| paused.holds.drain().collect()).unwrap_or_default();
+    pub(super) fn release_holds(&mut self, root: u16) {
+        let lanes: Vec<LaneKey> = self.roots.get_mut(&root).and_then(|root| root.paused.as_mut()).map(|paused| paused.holds.drain().collect()).unwrap_or_default();
         for lane in lanes {
-            let Some(held) = self.holds.remove(&(root.clone(), lane.clone())) else { continue };
+            let Some(held) = self.holds.remove(&(root, lane)) else { continue };
             for (key, index) in held {
                 if let Some(slot) = self.slots.get_mut(index) {
                     slot.place = Place::Waiting;

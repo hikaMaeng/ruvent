@@ -7,7 +7,10 @@
 //! behaviour serves, not the replaced one.
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{connect, Assignment, Bytes, Client, Durability, Engine, EngineConfig, Envelope, EventId, Hello, Inbox, Incoming, Methods, Recovered, SegmentLog, Target, DELETED, DELETE_FAILED};
+use ruvent::{
+    connect, delete_outcome, Assignment, Bytes, Channel, Client, DeleteFailure, Durability, Engine, EngineConfig, Envelope, EventId, Hello, Inbox, Incoming, Methods, Recovered, SegmentLog,
+    SERVER_TYPE,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,8 +21,19 @@ fn scratch(name: &str) -> PathBuf {
     directory.join("journal")
 }
 
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
+}
+
 fn work() -> Envelope {
-    Envelope::claimable("work", "do", Bytes::from_static(b"{}"))
+    Envelope::claimable(ch("work"), 1, Bytes::from_static(b"{}"))
 }
 
 async fn next(inbox: &mut Inbox) -> Incoming {
@@ -58,24 +72,25 @@ async fn roles(engine: &Engine, credential: &str) -> ((Client, Inbox), (Client, 
 async fn deletion_removes_only_a_waiting_event_and_always_announces_its_outcome() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let ((producer, _), (worker, mut assignments), (observer, mut inbox)) = roles(&engine, "svc").await;
-    observer.subscribe(Target::Channel("results".into()), None).await.unwrap();
-    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    observer.subscribe(ch("results"), None).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
     let (_, waiting) = producer.register(work()).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     let claimed = assignment(&mut assignments).await.event.id;
-    let (_, sent) = producer.register(Envelope::dispatch("feed", "x", Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
+    let (_, sent) = producer.register(Envelope::dispatch(ch("feed"), 6, Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
     let (_, second) = producer.register(work()).await.unwrap();
     assert_ne!(second, claimed);
     // The outcome names the deleted id in its payload: the envelope carries no flow id.
-    for (target, announced) in [(claimed, DELETE_FAILED), (sent, DELETE_FAILED)] {
-        producer.delete(target, "results".into(), None).await.unwrap();
+    for (target, failure) in [(claimed, DeleteFailure::Claimed), (sent, DeleteFailure::Missing)] {
+        producer.delete(target, ch("results"), None).await.unwrap();
         let Incoming::Delivery(outcome) = next(&mut inbox).await else { panic!("no outcome event") };
-        assert_eq!((&*outcome.event_type, &outcome.payload[..16], outcome.kind), (announced, &target.0[..], ruvent::Kind::Dispatch));
+        assert_eq!((outcome.event_type, outcome.kind), (SERVER_TYPE, ruvent::Kind::Dispatch));
+        assert_eq!(delete_outcome(&outcome.payload), Some((target, Err(failure))));
     }
     let _ = waiting;
-    producer.delete(second, "results".into(), None).await.unwrap();
+    producer.delete(second, ch("results"), None).await.unwrap();
     let Incoming::Delivery(outcome) = next(&mut inbox).await else { panic!("no outcome event") };
-    assert_eq!((&*outcome.event_type, &outcome.payload[..]), (DELETED, &second.0[..]));
+    assert_eq!((outcome.event_type, delete_outcome(&outcome.payload)), (SERVER_TYPE, Some((second, Ok(())))));
 }
 
 /// > 2. 착수마킹(이벤트 자체에 상태를 직접 변경):가져간 워커정보를 비롯한 착수정보 기록. 착수시에 타임아웃이 일어날 시간을 워커가 마킹함
@@ -92,7 +107,7 @@ async fn a_claim_carries_the_attempt_and_the_time_out_the_worker_chose_and_compl
     assert_eq!(claimed.event.id, id);
     let seq = worker.complete(id, claimed.token, Vec::new()).await.unwrap();
     worker.committed(seq).await.unwrap();
-    assert!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.is_empty(), "completion removed it from the queue");
+    assert!(observer.subscribe(ch("work"), None).await.unwrap().notices.is_empty(), "completion removed it from the queue");
 }
 
 /// > 6. 하지만 등록, 착수, 완료는 멱등을 보장해야한다.
@@ -104,15 +119,15 @@ async fn registration_claim_and_completion_are_idempotent_and_a_reclaimed_event_
     let event = work().with_id(EventId::new_v7());
     producer.register(event.clone()).await.unwrap();
     producer.register_committed(event.clone()).await.unwrap();
-    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 1);
+    assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices.len(), 1);
     // A lease that runs out gives the event back under the same id; the late report has no effect.
-    worker.join("work".into(), Vec::new(), Duration::from_secs(1), false).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(1), false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     let first = assignment(&mut assignments).await;
     tokio::time::advance(Duration::from_secs(2)).await;
     let (other, mut others) = connect(&engine, Hello::worker("svc"), 64).await.unwrap();
-    other.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    other.window("work".into(), 1, 0).await.unwrap();
+    let other_join = other.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    other.window(other_join, 1, 0).await.unwrap();
     let second = assignment(&mut others).await;
     assert_eq!(second.event.id, event.id, "the logical id does not change");
     let late = worker.complete(event.id, first.token, Vec::new()).await.unwrap();
@@ -130,20 +145,20 @@ async fn registration_claim_and_completion_are_idempotent_and_a_reclaimed_event_
 async fn a_failure_is_a_completion_and_what_follows_is_new_events_the_worker_chose() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let ((producer, _), (worker, mut assignments), (observer, mut inbox)) = roles(&engine, "svc").await;
-    observer.subscribe(Target::Channel("failures".into()), None).await.unwrap();
-    observer.subscribe(Target::Channel("retry".into()), None).await.unwrap();
-    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    observer.subscribe(ch("failures"), None).await.unwrap();
+    observer.subscribe(ch("retry"), None).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     let (_, id) = producer.register(work()).await.unwrap();
     let claimed = assignment(&mut assignments).await;
     // The worker failed, and decided: report it, and try again as a new event.
-    let follow_ups = vec![Envelope::dispatch("failures", "work.failed", Bytes::from_static(b"boom")), Envelope::claimable("retry", "do", claimed.event.payload.clone())];
+    let follow_ups = vec![Envelope::dispatch(ch("failures"), 31, Bytes::from_static(b"boom")), Envelope::claimable(ch("retry"), 1, claimed.event.payload.clone())];
     worker.complete(id, claimed.token, follow_ups).await.unwrap();
     let mut seen = [next(&mut inbox).await, next(&mut inbox).await];
     seen.sort_by_key(|incoming| matches!(incoming, Incoming::Notice(_)));
-    assert!(matches!(&seen[0], Incoming::Delivery(event) if &*event.event_type == "work.failed"));
+    assert!(matches!(&seen[0], Incoming::Delivery(event) if event.event_type == 31));
     assert!(matches!(&seen[1], Incoming::Notice(event) if event.failures == 0 && event.id != id));
-    assert!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.is_empty(), "the failed event itself is completed");
+    assert!(observer.subscribe(ch("work"), None).await.unwrap().notices.is_empty(), "the failed event itself is completed");
 }
 
 /// > ID가 같은 이벤트는 등록될 수 없고 ID는 영원히 고유하지 않아도 충분하지만 비용이 저렴한 UUID7 등을 쓰는 것이 성능에 문제가 없다면 사용한다.
@@ -153,14 +168,14 @@ async fn an_active_id_is_not_registered_twice_ids_are_uuidv7_and_a_departed_id_m
     let ((producer, mut producer_inbox), (worker, _), (observer, _)) = roles(&engine, "svc").await;
     let (_, id) = producer.register_committed(work()).await.unwrap();
     assert_eq!(id.0[6] >> 4, 7, "a UUIDv7");
-    producer.register_committed(Envelope::claimable("work", "do", Bytes::from_static(b"other")).with_id(id)).await.unwrap();
+    producer.register_committed(Envelope::claimable(ch("work"), 1, Bytes::from_static(b"other")).with_id(id)).await.unwrap();
     assert!(matches!(next(&mut producer_inbox).await, Incoming::Fault { kind: ruvent::FaultKind::IdConflict, .. }), "other content under an active id is a conflict, told");
-    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 1);
+    assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices.len(), 1);
     let claimed = worker.claim(id, Duration::from_secs(5)).await.unwrap();
     let seq = worker.complete(id, claimed.token, Vec::new()).await.unwrap();
     worker.committed(seq).await.unwrap();
     producer.register_committed(work().with_id(id)).await.unwrap();
-    assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices[0].id, id, "not unique forever: once gone it may be used again");
+    assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices[0].id, id, "not unique forever: once gone it may be used again");
 }
 
 /// > 이벤트에는 발송 전용 이벤트와 워커가 접수할 이벤트가 다르다. 발송전용 이벤트는 발송을 통해 큐에서 제거되어야하기 때문이다. 아니면 언제 큐에서 제거할지 판단하기 어렵다.
@@ -171,10 +186,10 @@ async fn a_dispatch_event_goes_to_whoever_is_connected_at_that_moment_and_is_gon
     let (sender, _) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
     let (early, mut early_inbox) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
     let (late, mut late_inbox) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
-    early.subscribe(Target::Channel("feed".into()), None).await.unwrap();
-    sender.register(Envelope::dispatch("feed", "news", Bytes::new())).await.unwrap();
-    assert!(matches!(next(&mut early_inbox).await, Incoming::Delivery(event) if &*event.event_type == "news"));
-    let backlog = late.subscribe(Target::Channel("feed".into()), None).await.unwrap();
+    early.subscribe(ch("feed"), None).await.unwrap();
+    sender.register(Envelope::dispatch(ch("feed"), 30, Bytes::new())).await.unwrap();
+    assert!(matches!(next(&mut early_inbox).await, Incoming::Delivery(event) if event.event_type == 30));
+    let backlog = late.subscribe(ch("feed"), None).await.unwrap();
     assert!(backlog.notices.is_empty() && quiet(&mut late_inbox).await, "sent once to who was there, kept nowhere");
 }
 
@@ -206,7 +221,7 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
             let (journal, recovered) = SegmentLog::open(&path).unwrap();
             let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
             let (observer, _) = connect(&engine, Hello::observer("svc"), 64).await.unwrap();
-            assert_eq!(observer.subscribe(Target::Channel("work".into()), None).await.unwrap().notices.len(), 3, "crash={crash}: the three unprocessed events, not the completed one");
+            assert_eq!(observer.subscribe(ch("work"), None).await.unwrap().notices.len(), 3, "crash={crash}: the three unprocessed events, not the completed one");
         });
     }
 }
@@ -218,18 +233,18 @@ fn unprocessed_events_come_back_after_a_normal_stop_and_after_a_crash() {
 async fn one_small_envelope_carries_id_channel_failures_and_the_attempt_for_both_kinds() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let ((producer, _), (worker, _), (observer, mut inbox)) = roles(&engine, "svc").await;
-    let (_, id) = producer.register(Envelope::claimable("work", "do", Bytes::new())).await.unwrap();
+    let (_, id) = producer.register(Envelope::claimable(ch("work"), 1, Bytes::new())).await.unwrap();
     let claimed = worker.claim(id, Duration::from_secs(30)).await.unwrap();
-    assert_eq!((claimed.event.id, &*claimed.event.channel, claimed.event.failures), (id, "work", 0));
+    assert_eq!((claimed.event.id, claimed.event.channel, claimed.event.failures), (id, ch("work"), 0));
     assert!(claimed.token.seq < u64::MAX && claimed.until > 0, "the attempt: a token and the time it runs out at");
     let bare = Envelope { principal: None, ..claimed.event.clone() };
-    assert_eq!(codec::size(&bare, Layout::Assigned), 37, "28-byte head, a 5-byte work key, a 4-byte payload length: no names or addresses");
-    observer.subscribe(Target::Channel("feed".into()), None).await.unwrap();
-    producer.register(Envelope::dispatch("feed", "news", Bytes::new())).await.unwrap();
+    assert_eq!(codec::size(&bare, Layout::Assigned), 47, "38-byte head (id, channel id, type, flags, failures), a 5-byte work key, a 4-byte payload length: no names or addresses");
+    observer.subscribe(ch("feed"), None).await.unwrap();
+    producer.register(Envelope::dispatch(ch("feed"), 30, Bytes::new())).await.unwrap();
     let Incoming::Delivery(sent) = next(&mut inbox).await else { panic!() };
-    // The same type, `Envelope`, for a dispatch event; 32 bytes without the server's principal.
+    // The same type, `Envelope`, for a dispatch event; 42 bytes without the server's principal.
     let sent: Envelope = sent;
-    assert_eq!(codec::size(&Envelope { principal: None, ..sent }, Layout::Delivery), 32);
+    assert_eq!(codec::size(&Envelope { principal: None, ..sent }, Layout::Delivery), 42);
 }
 
 /// > 변하지 않는 원칙중에 하나는 이벤트는 반드시 하나의 워커가 가져간다는것이다. 혹은 발송되거나. 만약 둘이상의 워커나 프로세스에 할당되어야하면 이벤트 자체를 여러개 발급해야해.
@@ -259,13 +274,13 @@ async fn any_program_may_open_any_role_and_the_server_never_asks_what_it_is() {
     let ((client, _), (_, _), (_, _)) = roles(&engine, "client").await;
     let ((_, _), (worker, mut assigned), (_, _)) = roles(&engine, "worker").await;
     let ((proxy_producer, _), (proxy_worker, _), (proxy, mut proxied)) = roles(&engine, "proxy").await;
-    proxy.subscribe(Target::Channel("done".into()), None).await.unwrap();
-    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    worker.window("work".into(), 1, 0).await.unwrap();
+    proxy.subscribe(ch("done"), None).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(worker_join, 1, 0).await.unwrap();
     let (_, id) = client.register(work()).await.unwrap();
     let claimed = assignment(&mut assigned).await;
-    worker.complete(id, claimed.token, vec![Envelope::dispatch("done", "ok", Bytes::new())]).await.unwrap();
-    assert!(matches!(next(&mut proxied).await, Incoming::Delivery(event) if &*event.channel == "done"));
+    worker.complete(id, claimed.token, vec![Envelope::dispatch(ch("done"), 32, Bytes::new())]).await.unwrap();
+    assert!(matches!(next(&mut proxied).await, Incoming::Delivery(event) if event.channel == ch("done")));
     // And any of them may do what another did.
     let (_, again) = proxy_producer.register_committed(work()).await.unwrap();
     assert!(proxy_worker.claim(again, Duration::from_secs(30)).await.is_err(), "the worker's open window took it first");
@@ -307,8 +322,8 @@ async fn a_claim_does_not_wait_for_the_disk_even_under_strict() {
 async fn an_open_window_takes_work_as_it_arrives_without_a_request_per_event() {
     let engine = Engine::volatile(EngineConfig::default()).await;
     let ((producer, _), (worker, mut assignments), (observer, _)) = roles(&engine, "svc").await;
-    worker.join("work".into(), Vec::new(), Duration::from_secs(30), false).await.unwrap();
-    worker.window("work".into(), 64, 0).await.unwrap();
+    let worker_join = worker.join(Some(ch("work")), Vec::new(), false, Duration::from_secs(30), false).await.unwrap();
+    worker.window(worker_join, 64, 0).await.unwrap();
     for _ in 0..200 {
         producer.register(work()).await.unwrap();
     }
@@ -337,7 +352,7 @@ async fn registrations_are_not_answered_one_by_one_but_acknowledged_cumulatively
 
 /// > 거절은 안보내. 그런것들은 전부 부하를 일으켜 … 모든 부하를 클라이언트로 옮겨야 서버가 고가용상태가 된다.
 #[tokio::test]
-async fn a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_channel_to_hold() {
+async fn a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_type_to_hold() {
     let memory = ruvent::MemoryConfig { limit: Some(40_000), slot_bytes: 1_000, ..ruvent::MemoryConfig::default() };
     let engine = Engine::volatile(EngineConfig { memory, ..EngineConfig::default() }).await;
     let (producer, mut inbox) = connect(&engine, Hello::producer("svc"), 64).await.unwrap();
@@ -350,8 +365,8 @@ async fn a_full_server_refuses_nothing_and_tells_the_producer_of_the_full_channe
     // The root paused at the end of a batch; the next registration to it is told.
     let (more, _) = producer.register(work()).await.unwrap();
     producer.committed(more).await.unwrap();
-    assert_eq!(next(&mut inbox).await, Incoming::Paused("work".into()), "flow control, not a refusal");
+    assert_eq!(next(&mut inbox).await, Incoming::Paused(1), "flow control by the root type, not a refusal");
     let stats = observer.stats().await.unwrap();
     assert_eq!(stats.waiting, 41, "every registration was applied");
-    assert!(stats.roots.iter().any(|root| root.root.as_str() == "work" && root.paused));
+    assert!(stats.roots.iter().any(|root| root.root == 1 && root.paused));
 }

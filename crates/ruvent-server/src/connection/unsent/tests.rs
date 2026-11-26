@@ -2,7 +2,7 @@ use super::*;
 use ruvent::{Assignment, ByeReason, Bytes, ClaimToken, Envelope, WorkKey};
 
 fn assign(seq: u64) -> Outbound {
-    let mut event = Envelope::claimable("c", "t", Bytes::from_static(b"p"));
+    let mut event = Envelope::claimable(ruvent::Channel::new(), 10, Bytes::from_static(b"p"));
     event.key = Some(WorkKey::default());
     Outbound::Assign(Assignment { event, token: ClaimToken { generation: 1, seq }, lease_ms: 1000, until: 1000, more: false })
 }
@@ -24,9 +24,9 @@ fn a_newer_committed_replaces_the_queued_one() {
     for seq in [3, 7, 5, 9] {
         assert!(!unsent.accept(Outbound::Committed { seq }), "a production connection is never slow");
     }
-    unsent.accept(Outbound::Paused { channel: "a".into() });
+    unsent.accept(Outbound::Paused { event_type: 7 });
     unsent.accept(Outbound::Committed { seq: 12 });
-    assert_eq!(drain(&mut unsent), [Outbound::Committed { seq: 12 }, Outbound::Paused { channel: "a".into() }]);
+    assert_eq!(drain(&mut unsent), [Outbound::Committed { seq: 12 }, Outbound::Paused { event_type: 7 }]);
     // Once written, the next one is queued anew.
     unsent.accept(Outbound::Committed { seq: 13 });
     assert_eq!(drain(&mut unsent), [Outbound::Committed { seq: 13 }]);
@@ -48,7 +48,7 @@ fn a_fault_is_told_once_per_kind_on_one_connection() {
 #[test]
 fn an_observer_past_its_byte_bound_is_slow_and_bytes_count_until_written() {
     let mut unsent = Unsent::new(Role::Observe, 13_000);
-    let event = Envelope::dispatch("c", "t", Bytes::from(vec![0u8; 4000]));
+    let event = Envelope::dispatch(ruvent::Channel::new(), 10, Bytes::from(vec![0u8; 4000]));
     assert!(!unsent.accept(Outbound::Delivery(event.clone())));
     assert!(!unsent.accept(Outbound::Delivery(event.clone())));
     let (_, weight) = unsent.pop().unwrap();
@@ -71,7 +71,7 @@ fn dropping_assignments_returns_their_tokens_and_keeps_the_rest_in_order() {
     unsent.accept(assign(1));
     unsent.accept(Outbound::Committed { seq: 4 });
     unsent.accept(assign(2));
-    unsent.accept(Outbound::Pending { channel: "c".into() });
+    unsent.accept(Outbound::Pending { join: 1 });
     let tokens = unsent.drop_assignments();
     assert_eq!(tokens.iter().map(|token| token.seq).collect::<Vec<_>>(), [1, 2]);
     assert_eq!(unsent.len(), 2);

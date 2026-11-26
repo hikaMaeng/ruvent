@@ -23,7 +23,7 @@ fn an_expired_event_is_never_assigned_and_is_purged_without_any_consumer() {
     h.produce(P, work("nobody").with_id(id(1)).with_expires(Duration::from_millis(100)));
     assert_eq!(h.s.next_due(), None, "no timer for an expiry");
     h.now = 100;
-    h.produce(P, Envelope::dispatch("elsewhere", "t", Bytes::new()));
+    h.produce(P, Envelope::dispatch(ch("elsewhere"), 10, Bytes::new()));
     assert!(h.slot(id(1)).is_none(), "collected by an unrelated batch");
     assert_eq!(h.s.counters.expired, 1);
     // And one that expired before a join is not assigned to it.
@@ -35,13 +35,19 @@ fn an_expired_event_is_never_assigned_and_is_purged_without_any_consumer() {
 }
 
 #[test]
-fn an_expired_event_is_isolated_instead_where_the_channel_says_so() {
+fn an_expired_event_is_isolated_instead_where_its_type_says_so() {
     let mut config = config();
-    config.channels.rules.insert(0, ChannelRule { pattern: Pattern("keep".into()), settings: ChannelSettings { isolate_expired: true, ..ChannelSettings::default() } });
+    config.types.rules.insert(0, rule([1], TypeSettings { isolate_expired: true, isolated_keep: Duration::from_secs(60), ..TypeSettings::default() }));
     let mut h = H::with(config, false).cast();
     h.produce(P, work("keep").with_id(id(1)).with_expires(Duration::from_millis(10)));
     h.advance(10);
-    assert_eq!(h.slot(id(1)).unwrap().channel.as_str(), "isolated.keep");
+    let slot = h.slot(id(1)).expect("isolated, not removed");
+    assert!(slot.isolated && slot.channel == ch("keep"));
+    assert_eq!((slot.expires, h.s.counters.expired, h.s.counters.isolated), (Some(60_010), 0, 1), "the keep time is its new expiry");
+    // Expiring again once isolated removes it.
+    h.advance(60_000);
+    assert!(h.slot(id(1)).is_none());
+    assert_eq!(h.s.counters.expired, 1);
 }
 
 /// Under Strict nothing uncommitted is assigned, noticed, backlogged or
@@ -50,12 +56,12 @@ fn an_expired_event_is_isolated_instead_where_the_channel_says_so() {
 fn under_strict_nothing_uncommitted_is_assigned_noticed_backlogged_or_claimed() {
     let mut h = H::durable(true).cast();
     h.join(W1, "work", 5);
-    h.call(O, Call::Subscribe { req: 1, target: Target::Channel("work".into()), after: None });
+    h.call(O, Call::Subscribe { req: 1, channel: ch("work"), after: None });
     let registered = h.produce(P, work("work").with_id(id(1)));
     assert!(assigned(&registered, W1).is_empty(), "not assigned before its batch is on disk");
     let notice = registered.sends.iter().find(|send| send.session == O).expect("a notice, gated");
     assert_eq!(notice.gate, Some(h.carrying));
-    let backlog = h.call(O, Call::Subscribe { req: 2, target: Target::Channel("work".into()), after: None });
+    let backlog = h.call(O, Call::Subscribe { req: 2, channel: ch("work"), after: None });
     assert!(matches!(sent(&backlog, O).as_slice(), [Outbound::Subscribed { backlog, .. }] if backlog.is_empty()), "not in the backlog");
     h.open(W2 + 10, hello(Role::Work, 30));
     let claimed = h.call(W2 + 10, Call::Claim { req: 3, id: id(1), lease_ms: 1000 });
@@ -70,7 +76,7 @@ fn under_strict_nothing_uncommitted_is_assigned_noticed_backlogged_or_claimed() 
 fn under_scheduled_visibility_does_not_wait_for_the_disk() {
     let mut h = H::durable(false).cast();
     h.join(W1, "work", 5);
-    h.call(O, Call::Subscribe { req: 1, target: Target::Channel("work".into()), after: None });
+    h.call(O, Call::Subscribe { req: 1, channel: ch("work"), after: None });
     let registered = h.produce(P, work("work").with_id(id(1)));
     assert_eq!(assigned(&registered, W1).len(), 1);
     assert!(registered.sends.iter().all(|send| send.gate.is_none()));

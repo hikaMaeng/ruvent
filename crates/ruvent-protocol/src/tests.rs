@@ -1,10 +1,21 @@
 use crate::io::{sniff_v1, v1_bye, Parts, RawRecord, RecordReader, HEADER};
-use crate::records::{Body, Decoder, Encoder, Message, Side, ASSIGN, BYE, DELIVERY, HELLO, NAME_DEF, REGISTER, RESET};
+use crate::records::{Body, Decoder, Encoder, Message, Side, ASSIGN, BYE, DELIVERY, HELLO, NAME_DEF, NOTICE, REGISTER, RESET};
 use crate::{features, ProtocolError, DICTIONARY, MAX_BODY, VERSION};
 use bytes::Bytes;
 use proptest::prelude::*;
 use ruvent::envelope::codec::Malformed;
-use ruvent::{Assignment, ByeReason, Call, ChannelStat, ClaimToken, Counters, Envelope, EventId, FaultKind, Hello, IdleLane, Name, Outbound, Refusal, Role, RootStat, Stats, Target, Welcome, WorkKey};
+use ruvent::{Assignment, ByeReason, Call, Channel, ClaimToken, Counters, Envelope, EventId, FaultKind, Hello, IdleLane, Name, Outbound, Refusal, Role, RootStat, Stats, TypeStat, Welcome, WorkKey};
+
+/// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
+pub fn ch(label: &str) -> Channel {
+    let fnv = |seed: u64| label.bytes().fold(seed, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3));
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&fnv(0xcbf2_9ce4_8422_2325).to_le_bytes());
+    bytes[8..].copy_from_slice(&fnv(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Channel(bytes)
+}
 
 /// Splits bytes into records the way [`RecordReader`] does, without a runtime.
 fn split(bytes: &[u8]) -> Vec<(RawRecord, Bytes)> {
@@ -60,7 +71,7 @@ fn trip(messages: &[Message], side: Side, dictionary: usize) -> Result<Vec<Messa
 }
 
 fn hello(role: Role) -> Message {
-    let hello = Hello { role, credential: Name::new(""), producer: Some([3; 16]), nonce: [4; 16], linger_ms: Some(7_200_000), acks: false, channels: vec!["orders".into(), "jobs".into()] };
+    let hello = Hello { role, credential: Name::new(""), producer: Some([3; 16]), nonce: [4; 16], linger_ms: Some(7_200_000), acks: false, types: vec![17, 0x1234] };
     Message::Hello { version: VERSION, features: features::ALL, token: "secret".into(), hello }
 }
 
@@ -73,7 +84,7 @@ fn id(byte: u8) -> EventId {
 }
 
 fn assigned(byte: u8, payload: &'static [u8]) -> Envelope {
-    let mut event = Envelope::claimable("orders", "create", Bytes::from_static(payload)).with_id(id(byte)).with_delegate("user-r").with_not_before(std::time::Duration::from_millis(9));
+    let mut event = Envelope::claimable(ch("orders"), 17, Bytes::from_static(payload)).with_id(id(byte)).with_delegate("user-r").with_not_before(std::time::Duration::from_millis(9));
     event.key = Some(WorkKey { generation: 2, arrival: 300 });
     event.failures = 3;
     event.principal = Some("svc".into());
@@ -85,26 +96,29 @@ fn every_call() -> Vec<Call> {
     vec![
         Call::Register {
             seq: Some(1),
-            event: Envelope::claimable("orders", "create", Bytes::from_static(b"payload")).with_id(id(1)).with_expires(std::time::Duration::from_secs(5)).with_group([5; 16]),
+            event: Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"payload")).with_id(id(1)).with_expires(std::time::Duration::from_secs(5)).with_group([5; 16]),
         },
-        Call::Register { seq: None, event: Envelope::dispatch("feed", "chunk", Bytes::from(vec![7u8; 5000])) },
-        Call::Delete { seq: 2, id: id(1), result: "results".into(), key: Some(WorkKey { generation: 1, arrival: 9 }) },
-        Call::Delete { seq: 3, id: id(1), result: "results".into(), key: None },
-        Call::Join { req: 1, channel: "orders".into(), types: vec!["create".into(), "cancel".into()], lease_ms: 30_000, dispatch: true },
-        Call::Window { channel: "orders".into(), count: 16, bytes: 1 << 20 },
+        Call::Register { seq: None, event: Envelope::dispatch(ch("feed"), 18, Bytes::from(vec![7u8; 5000])) },
+        Call::Delete { seq: 2, id: id(1), result: ch("results"), key: Some(WorkKey { generation: 1, arrival: 9 }) },
+        Call::Delete { seq: 3, id: id(1), result: ch("results"), key: None },
+        Call::Join { req: 1, channel: Some(ch("orders")), types: vec![17, 23], isolated: false, lease_ms: 30_000, dispatch: true },
+        Call::Join { req: 7, channel: None, types: vec![17, u16::MAX], isolated: true, lease_ms: 1, dispatch: false },
+        Call::Join { req: 8, channel: Some(ch("orders")), types: Vec::new(), isolated: true, lease_ms: 0, dispatch: false },
+        Call::Window { join: 1, count: 16, bytes: 1 << 20 },
         Call::Complete {
             seq: 4,
             id: id(1),
             token,
-            follow_ups: vec![Envelope::claimable("next", "do", Bytes::from_static(b"a")), Envelope::dispatch("feed", "done", Bytes::new())],
+            follow_ups: vec![Envelope::claimable(ch("next"), 1, Bytes::from_static(b"a")), Envelope::dispatch(ch("feed"), 19, Bytes::new())],
             spooled: Vec::new(),
         },
         Call::Complete { seq: 5, id: id(1), token, follow_ups: Vec::new(), spooled: Vec::new() },
         Call::Extend { id: id(1), token },
         Call::Release { id: id(1), token, delay_ms: 1500, failed: true },
         Call::Claim { req: 2, id: id(1), lease_ms: 5000 },
-        Call::Subscribe { req: 3, target: Target::Prefix("chat".into()), after: Some(WorkKey { generation: 1, arrival: 2 }) },
-        Call::Unsubscribe { req: 4, target: Target::Channel("feed".into()) },
+        Call::Subscribe { req: 3, channel: ch("chat"), after: Some(WorkKey { generation: 1, arrival: 2 }) },
+        Call::Subscribe { req: 9, channel: ch("feed"), after: None },
+        Call::Unsubscribe { req: 4, channel: ch("feed") },
         Call::Stats { req: 5 },
         Call::Drain { req: 6 },
     ]
@@ -143,9 +157,9 @@ fn stats() -> Stats {
             segments_removed: 14,
             checkpoints: 15,
         },
-        channels: vec![ChannelStat { channel: "orders".into(), waiting: 9, oldest_ms: 300 }],
-        idle_lanes: vec![IdleLane { channel: "orders".into(), event_type: "typo".into(), waiting: 4 }],
-        roots: vec![RootStat { root: "orders".into(), events: 12, bytes: 4096, disk: 8192, paused: true }],
+        types: vec![TypeStat { event_type: 17, waiting: 9, oldest_ms: 300 }, TypeStat { event_type: u16::MAX, waiting: 1, oldest_ms: 0 }],
+        idle_lanes: vec![IdleLane { channel: ch("orders"), event_type: 38, waiting: 4 }],
+        roots: vec![RootStat { root: 17, events: 12, bytes: 4096, disk: 8192, paused: true }, RootStat { root: 0, events: 1, bytes: 1, disk: 0, paused: false }],
     }
 }
 
@@ -153,22 +167,27 @@ fn every_outbound() -> Vec<Outbound> {
     let assignment = Assignment { event: assigned(1, b"body"), token: ClaimToken { generation: 2, seq: 77 }, lease_ms: 30_000, until: 29_000, more: true };
     let mut notice = assigned(2, b"").notice();
     notice.failures = 0;
+    // An isolated event: its notice and its assignment carry the isolated bit (flag bit 9).
+    let isolated = Envelope { isolated: true, failures: 5, ..notice.clone() };
+    let isolated_assignment = Assignment { event: Envelope { isolated: true, ..assigned(4, b"again") }, ..assignment.clone() };
     vec![
         Outbound::Bye(ByeReason::Superseded),
         Outbound::Fault { kind: FaultKind::SequenceGap, detail: "sequence number skipped ahead" },
         Outbound::Committed { seq: 1 << 33 },
-        Outbound::Paused { channel: "orders".into() },
-        Outbound::Resumed { channel: "orders".into() },
+        Outbound::Paused { event_type: 17 },
+        Outbound::Resumed { event_type: u16::MAX },
         Outbound::Joined { req: 1 },
         Outbound::Refused { req: 2, reason: Refusal::AlreadyClaimed },
-        Outbound::Pending { channel: "orders".into() },
+        Outbound::Pending { join: 1 << 20 },
         Outbound::Assign(assignment.clone()),
+        Outbound::Assign(isolated_assignment),
         Outbound::Claimed { req: 3, assignment: Assignment { more: false, ..assignment } },
-        Outbound::Subscribed { req: 4, target: Target::Channel("orders".into()), backlog: vec![notice.clone(), notice.clone()], more: true },
-        Outbound::Subscribed { req: 5, target: Target::Prefix("chat".into()), backlog: Vec::new(), more: false },
+        Outbound::Subscribed { req: 4, channel: ch("orders"), backlog: vec![notice.clone(), isolated.clone()], more: true },
+        Outbound::Subscribed { req: 5, channel: ch("chat"), backlog: Vec::new(), more: false },
         Outbound::Unsubscribed { req: 6 },
         Outbound::Notice(notice),
-        Outbound::Delivery(Envelope::dispatch("feed", "post", Bytes::from(vec![1u8; 300])).with_id(id(3)).with_delegate("alice")),
+        Outbound::Notice(isolated),
+        Outbound::Delivery(Envelope::dispatch(ch("feed"), 3, Bytes::from(vec![1u8; 300])).with_id(id(3)).with_delegate("alice")),
         Outbound::StatsReply { req: 7, stats: Box::new(stats()) },
         Outbound::Draining { req: 8 },
     ]
@@ -176,26 +195,90 @@ fn every_outbound() -> Vec<Outbound> {
 
 #[test]
 fn a_hello_record_has_these_exact_bytes() {
-    let hello = Hello { role: Role::Observe, credential: Name::new("ignored"), producer: None, nonce: [0xaa; 16], linger_ms: None, acks: true, channels: Vec::new() };
-    let bytes = encode(&[Message::Hello { version: 2, features: 1, token: "ab".into(), hello }], DICTIONARY).unwrap();
+    let hello = Hello { role: Role::Observe, credential: Name::new("ignored"), producer: None, nonce: [0xaa; 16], linger_ms: None, acks: true, types: Vec::new() };
+    let bytes = encode(&[Message::Hello { version: 2, features: 1, token: "ab".into(), hello: hello.clone() }], DICTIONARY).unwrap();
     let mut expected = vec![HELLO, 24, 0, 0, 0, 0, 0, 2, 1, 3, 2, b'a', b'b', 0];
     expected.extend_from_slice(&[0xaa; 16]);
     expected.push(0);
     assert_eq!(bytes, expected);
+    // Declared types: a count, then each as a little-endian u16.
+    let typed = Hello { types: vec![7, 0x1234], ..hello };
+    let bytes = encode(&[Message::Hello { version: 2, features: 1, token: "ab".into(), hello: typed }], DICTIONARY).unwrap();
+    let mut expected = vec![HELLO, 28, 0, 0, 0, 0, 0, 2, 1, 3, 2, b'a', b'b', 0];
+    expected.extend_from_slice(&[0xaa; 16]);
+    expected.extend_from_slice(&[2, 7, 0, 0x34, 0x12]);
+    assert_eq!(bytes, expected);
 }
 
 /// The payload is the record's body, after a head that says how long it is.
+/// The channel is the head's 16 octets and the type its u16: no name is
+/// defined for either.
 #[test]
-fn a_register_carries_its_payload_as_the_body_after_the_names_it_uses() {
-    let event = Envelope::dispatch("c", "t", Bytes::from_static(b"xyz")).with_id(id(0x22));
+fn a_register_carries_its_channel_inline_and_its_payload_as_the_body_with_no_names() {
+    let event = Envelope::dispatch(ch("c"), 10, Bytes::from_static(b"xyz")).with_id(id(0x22));
     let bytes = encode(&[Message::Call(Call::Register { seq: Some(5), event })], DICTIONARY).unwrap();
-    let mut expected = vec![NAME_DEF, 3, 0, 0, 0, 0, 0, 0, 1, b'c'];
-    expected.extend_from_slice(&[NAME_DEF, 3, 0, 0, 0, 0, 0, 1, 1, b't']);
-    expected.extend_from_slice(&[REGISTER, 29, 0, 3, 0, 0, 0, 5]);
+    // seq 1 + head 38 (id 16, channel 16, type 2, flags 2, failures 2).
+    let mut expected = vec![REGISTER, 39, 0, 3, 0, 0, 0, 5];
     expected.extend_from_slice(&[0x22; 16]);
-    expected.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0, 0x01, 0, 0, 0]);
+    expected.extend_from_slice(&ch("c").0);
+    expected.extend_from_slice(&[10, 0, 0x01, 0, 0, 0]);
     expected.extend_from_slice(b"xyz");
     assert_eq!(bytes, expected);
+}
+
+/// Channels and types never enter the dictionary: only the credential and
+/// the end user are names. Every record that names a channel is sent
+/// without a single `NameDef`.
+#[test]
+fn the_dictionary_carries_no_channel_and_no_type() {
+    let calls = vec![
+        Message::Call(Call::Register { seq: Some(1), event: Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"p")) }),
+        Message::Call(Call::Delete { seq: 2, id: id(1), result: ch("results"), key: None }),
+        Message::Call(Call::Join { req: 1, channel: Some(ch("orders")), types: vec![17], isolated: false, lease_ms: 1, dispatch: true }),
+        Message::Call(Call::Subscribe { req: 2, channel: ch("feed"), after: None }),
+        Message::Call(Call::Unsubscribe { req: 3, channel: ch("feed") }),
+    ];
+    let bytes = encode(&calls, DICTIONARY).unwrap();
+    assert!(split(&bytes).iter().all(|(raw, _)| raw.tag != NAME_DEF), "no name was defined");
+    let named = encode(&[Message::Call(Call::Register { seq: Some(1), event: Envelope::claimable(ch("orders"), 17, Bytes::new()).with_delegate("user-r") })], DICTIONARY).unwrap();
+    assert_eq!(split(&named).iter().filter(|(raw, _)| raw.tag == NAME_DEF).count(), 1, "the end user is the one name");
+}
+
+/// A notice written by hand from the layout decodes: the 38-byte head, the
+/// isolated bit (9), then the work key.
+#[test]
+fn a_38_byte_head_with_the_isolated_bit_decodes() {
+    let mut bytes = encode(&[welcome()], DICTIONARY).unwrap();
+    bytes.extend_from_slice(&[NOTICE, 43, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&[0x11; 16]);
+    bytes.extend_from_slice(&ch("orders").0);
+    bytes.extend_from_slice(&[17, 0, 0x00, 0x02, 3, 0]);
+    bytes.extend_from_slice(&[2, 0, 0, 0, 5]);
+    let decoded = decode(&bytes, Side::Client, DICTIONARY).unwrap();
+    let Message::Outbound(Outbound::Notice(notice)) = &decoded[1] else { panic!("{decoded:?}") };
+    assert_eq!((notice.id, notice.channel, notice.event_type, notice.isolated, notice.failures, notice.key), (id(0x11), ch("orders"), 17, true, 3, Some(WorkKey { generation: 2, arrival: 5 })));
+    assert_eq!(notice.kind, ruvent::Kind::Claimable);
+}
+
+/// Only the server sets the isolated bit: a registration carrying it is refused before it is written.
+#[test]
+fn a_request_with_the_isolated_bit_is_refused() {
+    let mut encoder = Encoder::new(DICTIONARY);
+    encoder.push(&hello(Role::Produce)).unwrap();
+    let event = Envelope { isolated: true, ..Envelope::claimable(ch("orders"), 17, Bytes::new()) };
+    assert_eq!(encoder.push(&Message::Call(Call::Register { seq: Some(1), event })), Err(ProtocolError::Malformed(Malformed::Forbidden("isolated"))));
+    let mut bytes = encode(&[hello(Role::Produce)], DICTIONARY).unwrap();
+    bytes.extend_from_slice(&[REGISTER, 39, 0, 0, 0, 0, 0, 1]);
+    bytes.extend_from_slice(&[0; 16]);
+    bytes.extend_from_slice(&ch("orders").0);
+    bytes.extend_from_slice(&[17, 0, 0x00, 0x02, 0, 0]);
+    assert_eq!(decode(&bytes, Side::Server, DICTIONARY), Err(ProtocolError::Malformed(Malformed::Forbidden("isolated"))));
+}
+
+/// Feature bit 5 (prefix subscriptions) is gone with channel names: this build never announces it.
+#[test]
+fn the_prefix_feature_bit_is_reserved() {
+    assert_eq!(features::ALL & (1 << 5), 0);
 }
 
 /// Every record of 2.11 round-trips (property: equal after encode and decode).
@@ -234,11 +317,12 @@ fn an_assignment_carries_the_lease_left_at_the_moment_it_is_written() {
 }
 
 fn arbitrary_event() -> impl Strategy<Value = Envelope> {
-    ("[a-d]{1,3}", "[a-d]{1,2}", proptest::collection::vec(any::<u8>(), 0..600), any::<bool>(), any::<[u8; 16]>(), any::<bool>()).prop_map(|(channel, kind, payload, dispatch, raw, delegate)| {
-        let mut event = if dispatch { Envelope::dispatch(channel.as_str(), kind.as_str(), payload) } else { Envelope::claimable(channel.as_str(), kind.as_str(), payload) };
+    (any::<[u8; 16]>(), any::<u16>(), proptest::collection::vec(any::<u8>(), 0..600), any::<bool>(), any::<[u8; 16]>(), any::<bool>()).prop_map(|(channel, kind, payload, dispatch, raw, delegate)| {
+        let channel = Channel(channel);
+        let mut event = if dispatch { Envelope::dispatch(channel, kind, payload) } else { Envelope::claimable(channel, kind, payload) };
         event.id = EventId(raw);
         if delegate {
-            event = event.with_delegate(format!("user.{kind}"));
+            event = event.with_delegate(format!("user.{}", kind % 8));
         }
         event
     })
@@ -283,7 +367,7 @@ fn a_completion_is_handed_over_only_when_its_last_follow_up_arrived() {
         seq: 1,
         id: id(1),
         token: ClaimToken::default(),
-        follow_ups: vec![Envelope::dispatch("a", "b", Bytes::from_static(b"1")), Envelope::dispatch("a", "c", Bytes::from_static(b"2"))],
+        follow_ups: vec![Envelope::dispatch(ch("a"), 20, Bytes::from_static(b"1")), Envelope::dispatch(ch("a"), 21, Bytes::from_static(b"2"))],
         spooled: Vec::new(),
     };
     let bytes = encode(&[hello(Role::Work), Message::Call(call.clone())], DICTIONARY).unwrap();
@@ -296,7 +380,7 @@ fn a_completion_is_handed_over_only_when_its_last_follow_up_arrived() {
             assert!(decoder.gathering());
         }
     }
-    // hello, 3 names, complete, follow-up, name, follow-up
+    // hello, complete, follow-up, follow-up: no names (the channel and the type are inline)
     assert_eq!(handed.iter().filter(|done| **done).count(), 2, "the hello and the completion: {handed:?}");
     assert!(!decoder.gathering());
 }
@@ -330,9 +414,10 @@ fn unknown_tags_leftover_bytes_bodies_on_bodiless_records_and_forbidden_heads_ar
     assert_eq!(with(&[0x1b, 2, 0, 0, 0, 0, 0, 1, 9]), Err(ProtocolError::Malformed(Malformed::Trailing)));
     assert_eq!(with(&[0x1b, 1, 0, 2, 0, 0, 0, 1, 9, 9]), Err(ProtocolError::UnexpectedBody(0x1b)));
     // A dispatch event with a visibility time.
-    let mut bad = vec![NAME_DEF, 3, 0, 0, 0, 0, 0, 0, 1, b'c', REGISTER, 30, 0, 0, 0, 0, 0, 1];
+    let mut bad = vec![REGISTER, 40, 0, 0, 0, 0, 0, 1];
     bad.extend_from_slice(&[0; 16]);
-    bad.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0, 0, 0, 5]);
+    bad.extend_from_slice(&ch("c").0);
+    bad.extend_from_slice(&[0, 0, 0x41, 0, 0, 0, 5]);
     assert_eq!(with(&bad), Err(ProtocolError::Malformed(Malformed::Forbidden("timing or group on a dispatch event"))));
 }
 
@@ -342,9 +427,9 @@ fn unknown_tags_leftover_bytes_bodies_on_bodiless_records_and_forbidden_heads_ar
 fn a_refused_message_leaves_no_name_definition_behind() {
     let mut encoder = Encoder::new(DICTIONARY);
     encoder.push(&hello(Role::Produce)).unwrap();
-    let bad = Envelope::dispatch("never", "sent", Bytes::new()).with_not_before(std::time::Duration::from_secs(1));
+    let bad = Envelope::dispatch(ch("never"), 22, Bytes::new()).with_delegate("someone").with_not_before(std::time::Duration::from_secs(1));
     assert!(encoder.push(&Message::Call(Call::Register { seq: Some(1), event: bad })).is_err());
-    let good = Message::Call(Call::Register { seq: Some(1), event: Envelope::dispatch("never", "sent", Bytes::new()) });
+    let good = Message::Call(Call::Register { seq: Some(1), event: Envelope::dispatch(ch("never"), 22, Bytes::new()).with_delegate("someone") });
     encoder.push(&good).unwrap();
     let decoded = decode(&concat(encoder.take()), Side::Server, DICTIONARY).unwrap();
     assert_eq!(decoded[1], good);
@@ -352,7 +437,8 @@ fn a_refused_message_leaves_no_name_definition_behind() {
 
 #[test]
 fn after_a_reset_an_old_number_is_never_read_as_a_new_name() {
-    let names: Vec<Message> = (0..6).map(|index| Message::Outbound(Outbound::Paused { channel: format!("channel-{index}").into() })).collect();
+    let names: Vec<Message> =
+        (0..6).map(|index| Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, Bytes::new()).with_id(id(index)).with_delegate(format!("user-{index}"))))).collect();
     let bytes = encode(&std::iter::once(welcome()).chain(names.clone()).collect::<Vec<_>>(), 2).unwrap();
     assert!(split(&bytes).iter().filter(|(raw, _)| raw.tag == RESET).count() >= 2);
     assert_eq!(decode(&bytes, Side::Client, 2).unwrap()[1..], names[..]);
@@ -360,7 +446,7 @@ fn after_a_reset_an_old_number_is_never_read_as_a_new_name() {
 
 #[test]
 fn the_receiver_holds_the_same_bound() {
-    let names: Vec<Message> = (0..3).map(|index| Message::Outbound(Outbound::Paused { channel: format!("c{index}").into() })).collect();
+    let names: Vec<Message> = (0..3).map(|index| Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, Bytes::new()).with_delegate(format!("u{index}"))))).collect();
     let bytes = encode(&std::iter::once(welcome()).chain(names).collect::<Vec<_>>(), 8).unwrap();
     assert_eq!(decode(&bytes, Side::Client, 2), Err(ProtocolError::Dictionary("more definitions than the bound")));
 }
@@ -372,14 +458,14 @@ fn a_large_body_is_its_own_shared_vector_entry_and_a_small_one_is_inlined() {
     let large = Bytes::from(vec![5u8; 4096]);
     let small = Bytes::from_static(b"tiny");
     let mut encoder = Encoder::new(DICTIONARY);
-    encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch("c", "t", large.clone())))).unwrap();
+    encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, large.clone())))).unwrap();
     assert!(encoder.shares(&large), "the large payload is an entry of its own, not copied");
     let mut encoder = Encoder::new(DICTIONARY);
-    encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch("c", "t", small.clone())))).unwrap();
+    encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, small.clone())))).unwrap();
     assert!(!encoder.shares(&small), "a small payload is copied next to its head");
     let mut encoder = Encoder::new(DICTIONARY);
     for payload in [small, large] {
-        encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch("c", "t", payload)))).unwrap();
+        encoder.push(&Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, payload)))).unwrap();
     }
     let gathered = encoder.len() as u64;
     let parts = encoder.take();
@@ -407,8 +493,8 @@ async fn records_are_read_head_first_and_each_body_into_its_own_buffer() {
     let big = Bytes::from((0..10_000u32).map(|n| n as u8).collect::<Vec<u8>>());
     let messages = [
         welcome(),
-        Message::Outbound(Outbound::Delivery(Envelope::dispatch("c", "t", Bytes::from_static(b"small")))),
-        Message::Outbound(Outbound::Delivery(Envelope::dispatch("c", "t", big.clone()))),
+        Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, Bytes::from_static(b"small")))),
+        Message::Outbound(Outbound::Delivery(Envelope::dispatch(ch("c"), 10, big.clone()))),
         Message::Outbound(Outbound::Committed { seq: 3 }),
     ];
     let bytes = encode(&messages, DICTIONARY).unwrap();

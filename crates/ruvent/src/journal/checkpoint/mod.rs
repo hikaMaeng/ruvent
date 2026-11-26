@@ -8,7 +8,7 @@
 //!    1 Head      start serial v, uptime u64, generation v, commit v
 //!    2 Name      number v, length v, UTF-8              (dictionary)
 //!    3 Producer  number v, producer id 16, seq v
-//!    4 Entry     root name v, head, serial v, standing, location?
+//!    4 Entry     root type v, head, serial v, standing, location?
 //!    5 End       entries v, producers v
 //! standing = 0 waiting | 1 delayed, until v | 2 claimed, token generation v, token seq v, lease ms v, credential name v
 //! location? = 0 | 1 location (as in a segment)
@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"rvckpt\0\x04";
+const MAGIC: &[u8; 8] = b"rvckpt\0\x05";
 const HEAD: u8 = 1;
 const NAME: u8 = 2;
 const PRODUCER: u8 = 3;
@@ -87,7 +87,6 @@ impl CheckpointFile {
     }
 
     fn entry(&mut self, entry: &Entry, out: &mut Vec<u8>, count: &mut u64) -> io::Result<()> {
-        let root = self.name(&entry.root, out, count);
         let numbers: Vec<u32> = entry.event.names(crate::envelope::codec::Layout::Journal).map(|name| self.name(name, out, count)).collect();
         let credential = match &entry.standing {
             Standing::Claimed { credential, .. } => Some(self.name(credential, out, count)),
@@ -95,7 +94,7 @@ impl CheckpointFile {
         };
         let mut lookup = numbers.into_iter();
         out.put_u8(ENTRY);
-        put_varint(out, u64::from(root));
+        put_varint(out, u64::from(entry.root));
         put_head(&entry.event, &mut |_| lookup.next().unwrap_or_default(), out)?;
         put_varint(out, entry.serial);
         match &entry.standing {
@@ -214,7 +213,7 @@ impl CheckpointReader {
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic).map_err(|_| damaged(&path, "shorter than its header"))?;
         if &magic != MAGIC {
-            return Err(invalid(format!("{}: not a ruvent checkpoint of format 4 (format 3 and older are refused, not migrated); it was left untouched", path.display())));
+            return Err(invalid(format!("{}: not a ruvent checkpoint of format 5 (format 4 and older are refused, not migrated); it was left untouched", path.display())));
         }
         Ok(CheckpointReader { path, file: BufReader::new(file), left: left - 8, names: HashMap::new(), buffered: VecDeque::new(), counted: (0, 0), ended: false })
     }
@@ -263,7 +262,7 @@ impl CheckpointReader {
                     self.buffered.push_back(Replay::Producer(ProducerEntry { number: stream.varint32()?, id: stream.id16()?, seq: stream.varint()? }));
                 }
                 ENTRY => {
-                    let root = stream.name(&self.names)?;
+                    let root = stream.type16()?;
                     let event = stream.head(&self.names)?;
                     let serial = stream.varint()?;
                     let standing = match stream.u8()? {

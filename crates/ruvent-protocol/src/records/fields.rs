@@ -1,11 +1,10 @@
 //! The field encodings inside a record's head, and the record header.
 
-use crate::dictionary::{Incoming, Outgoing};
 use crate::error::ProtocolError;
 use crate::io::HEADER;
 use bytes::{BufMut, BytesMut};
 use ruvent::envelope::codec::{self, Malformed, Reader};
-use ruvent::{ClaimToken, Name, Target, WorkKey};
+use ruvent::{Channel, ClaimToken, WorkKey};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -42,10 +41,6 @@ pub(crate) fn put_text(out: &mut impl BufMut, text: &str) {
     out.put_slice(text.as_bytes());
 }
 
-pub(crate) fn put_name(out: &mut impl BufMut, dictionary: &Outgoing, name: &Name) {
-    put_varint(out, u64::from(dictionary.number(name)));
-}
-
 pub(crate) fn put_token(out: &mut impl BufMut, token: ClaimToken) {
     put_varint(out, u64::from(token.generation));
     put_varint(out, token.seq);
@@ -62,16 +57,9 @@ pub(crate) fn put_key(out: &mut impl BufMut, key: Option<WorkKey>) {
     }
 }
 
-pub(crate) const CHANNEL: u8 = 1;
-pub(crate) const PREFIX: u8 = 2;
-
-pub(crate) fn put_target(out: &mut impl BufMut, dictionary: &Outgoing, target: &Target) {
-    let (kind, name) = match target {
-        Target::Channel(name) => (CHANNEL, name),
-        Target::Prefix(name) => (PREFIX, name),
-    };
-    out.put_u8(kind);
-    put_name(out, dictionary, name);
+/// A channel: its 16 octets. The server checks that it is a UUIDv7.
+pub(crate) fn put_channel(out: &mut impl BufMut, channel: &Channel) {
+    out.put_slice(&channel.0);
 }
 
 pub(crate) fn text(reader: &mut Reader<'_>) -> Result<String, ProtocolError> {
@@ -103,19 +91,8 @@ pub(crate) fn key(reader: &mut Reader<'_>) -> Result<Option<WorkKey>, ProtocolEr
     }
 }
 
-pub(crate) fn name(reader: &mut Reader<'_>, dictionary: &Incoming) -> Result<Name, ProtocolError> {
-    let number = reader.varint32()?;
-    dictionary.get(number).ok_or(ProtocolError::Malformed(Malformed::UnknownName(number)))
-}
-
-pub(crate) fn target(reader: &mut Reader<'_>, dictionary: &Incoming) -> Result<Target, ProtocolError> {
-    let kind = reader.u8()?;
-    let name = name(reader, dictionary)?;
-    match kind {
-        CHANNEL => Ok(Target::Channel(name)),
-        PREFIX => Ok(Target::Prefix(name)),
-        other => Err(ProtocolError::UnknownCode(other)),
-    }
+pub(crate) fn channel(reader: &mut Reader<'_>) -> Result<Channel, ProtocolError> {
+    Ok(Channel(reader.bytes16()?))
 }
 
 /// The longest fault detail sent; longer ones are cut at a character boundary.

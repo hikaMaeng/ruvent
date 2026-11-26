@@ -116,37 +116,40 @@ pub(crate) fn names_of(message: &Message) -> Vec<&Name> {
         Message::Hello { .. } | Message::Welcome { .. } => {}
         Message::Call(call) => match call {
             Call::Register { event, .. } => names.extend(event.names(Layout::Request)),
-            Call::Delete { result, .. } => names.push(result),
-            Call::Join { channel, types, .. } => {
-                names.push(channel);
-                names.extend(types);
-            }
-            Call::Window { channel, .. } => names.push(channel),
             Call::Complete { follow_ups, .. } => {
                 for event in follow_ups {
                     names.extend(event.names(Layout::Request));
                 }
             }
-            Call::Subscribe { target, .. } | Call::Unsubscribe { target, .. } => names.push(target.name()),
-            Call::Extend { .. } | Call::Release { .. } | Call::Claim { .. } | Call::Stats { .. } | Call::Drain { .. } => {}
+            Call::Delete { .. }
+            | Call::Join { .. }
+            | Call::Window { .. }
+            | Call::Extend { .. }
+            | Call::Release { .. }
+            | Call::Claim { .. }
+            | Call::Subscribe { .. }
+            | Call::Unsubscribe { .. }
+            | Call::Stats { .. }
+            | Call::Drain { .. } => {}
         },
         Message::Outbound(outbound) => match outbound {
-            Outbound::Paused { channel } | Outbound::Resumed { channel } | Outbound::Pending { channel } => names.push(channel),
             Outbound::Assign(assignment) | Outbound::Claimed { assignment, .. } => names.extend(assignment.event.names(Layout::Assigned)),
-            Outbound::Subscribed { target, backlog, .. } => {
-                names.push(target.name());
+            Outbound::Subscribed { backlog, .. } => {
                 for event in backlog {
                     names.extend(event.names(Layout::Notice));
                 }
             }
             Outbound::Notice(event) => names.extend(event.names(Layout::Notice)),
             Outbound::Delivery(event) => names.extend(event.names(Layout::Delivery)),
-            Outbound::StatsReply { stats, .. } => stats::names(stats, &mut names),
             Outbound::Welcome(_)
+            | Outbound::StatsReply { .. }
+            | Outbound::Paused { .. }
+            | Outbound::Resumed { .. }
             | Outbound::Bye(_)
             | Outbound::Fault { .. }
             | Outbound::Committed { .. }
             | Outbound::Joined { .. }
+            | Outbound::Pending { .. }
             | Outbound::Refused { .. }
             | Outbound::Unsubscribed { .. }
             | Outbound::Draining { .. } => {}

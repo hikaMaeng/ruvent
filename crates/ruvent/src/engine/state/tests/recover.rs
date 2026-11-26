@@ -7,7 +7,7 @@ use crate::journal::{End, Part, Recovered, Replay};
 fn restarted(records: Vec<Record>, uptime: u64) -> H {
     let mut s = State::new(&config(), Box::new(V7));
     s.recover(records, uptime, 0, true).unwrap();
-    let mut h = H { s, now: uptime, durable: 1, carrying: 2, records: Vec::new(), log: Vec::new(), written: 0, firsts: HashMap::new(), seqs: HashMap::new() };
+    let mut h = H { s, now: uptime, durable: 1, carrying: 2, records: Vec::new(), log: Vec::new(), written: 0, firsts: HashMap::new(), seqs: HashMap::new(), joined: HashMap::new() };
     h.open(W1, hello(Role::Work, 2));
     h
 }
@@ -28,9 +28,9 @@ fn a_restart_restores_claims_with_token_lease_and_credential_and_counts_no_failu
     assert_eq!((attempt.token, attempt.lease_ms, attempt.until, attempt.credential.as_str(), slot.failures), (assignment.token, 30_000, 40_000, "svc", 0));
     assert!(attempt.join.is_none(), "no join until the worker extends it");
     // The worker reconnects, extends what it holds, then opens its window (2.9).
-    after.call(W1, Call::Join { req: 1, channel: "work".into(), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    after.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 30_000, dispatch: false });
     after.call(W1, Call::Extend { id: id(1), token: assignment.token });
-    let opened = after.call(W1, Call::Window { channel: "work".into(), count: 1, bytes: 0 });
+    let opened = after.call(W1, Call::Window { join: 1, count: 1, bytes: 0 });
     assert!(assigned(&opened, W1).is_empty(), "the extended attempt fills its window of one");
     let completed = after.complete(W1, &assignment, Vec::new());
     assert!(after.slot(id(1)).is_none(), "the original worker's completion is accepted");
@@ -72,18 +72,18 @@ fn the_producer_table_survives_a_restart_and_resume_is_the_last_journaled_sequen
     assert!(after.slot(id(4)).is_some() && faults(&next, P).is_empty());
 }
 
-/// Volatile channels write nothing; a persistent parent with a volatile
+/// Volatile types write nothing; a persistent parent with a volatile
 /// follow-up and the reverse come back as the table says (2.5).
 #[test]
-fn volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says() {
+fn volatile_types_write_nothing_and_mixed_lineages_restart_as_the_table_says() {
     let mut h = H::durable(false).cast();
-    h.produce(P, work("scratch.x").with_id(id(1)));
+    h.produce(P, volatile("scratch.x").with_id(id(1)));
     assert!(!h.records.iter().any(|record| matches!(record, Record::Register { .. })), "a volatile registration is not journaled");
     h.join(W1, "work", 2);
     h.join(W2, "scratch.y", 2);
     let parent = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
-    h.complete(W1, &parent, vec![work("scratch.y").with_id(id(3))]);
-    let volatile_parent = assigned(&h.produce(P, work("scratch.y").with_id(id(4))), W2).remove(0);
+    h.complete(W1, &parent, vec![volatile("scratch.y").with_id(id(3))]);
+    let volatile_parent = assigned(&h.produce(P, volatile("scratch.y").with_id(id(4))), W2).remove(0);
     h.complete(W2, &volatile_parent, vec![work("work").with_id(id(5))]);
     let after = restarted(h.records.clone(), 0);
     let held = |id| after.slot(id).is_some();
@@ -97,16 +97,16 @@ fn volatile_channels_write_nothing_and_mixed_lineages_restart_as_the_table_says(
 #[test]
 fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
     let mut h = H::durable(false).cast();
-    h.call(W1, Call::Join { req: 1, channel: "work".into(), types: Vec::new(), lease_ms: 15, dispatch: false });
+    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), isolated: false, lease_ms: 15, dispatch: false });
     for step in 0..40u8 {
         h.now = u64::from(step) * 10;
         h.produce(P, work("work").with_id(id(step + 1)).with_expires(Duration::from_secs(600)));
         if step % 3 == 0 {
-            h.call(W1, Call::Window { channel: "work".into(), count: 2, bytes: 0 });
+            h.call(W1, Call::Window { join: 1, count: 2, bytes: 0 });
         }
         if step % 5 == 0 {
             let seq = h.next_seq(P);
-            h.call(P, Call::Delete { seq, id: id(step / 2 + 1), result: "out".into(), key: None });
+            h.call(P, Call::Delete { seq, id: id(step / 2 + 1), result: ch("out"), key: None });
         }
         if step % 7 == 0 {
             if let Some(token) = h.slot(id(step + 1)).and_then(|slot| slot.attempt()).map(|attempt| attempt.token) {
@@ -115,8 +115,8 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
         }
     }
     let view = |state: &State| {
-        let mut slots: Vec<(WorkKey, String, u16, bool, Option<u64>)> =
-            state.slots.iter().map(|(_, slot)| (slot.fixed.key, slot.channel.to_string(), slot.failures, slot.attempt().is_some(), slot.expires)).collect();
+        let mut slots: Vec<(WorkKey, Channel, u16, bool, Option<u64>, bool)> =
+            state.slots.iter().map(|(_, slot)| (slot.fixed.key, slot.channel, slot.failures, slot.attempt().is_some(), slot.expires, slot.isolated)).collect();
         slots.sort();
         slots
     };
@@ -134,6 +134,46 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
     folded.recover_from(Recovered::from_replay(items, End { uptime: h.now, serial, commit: 0 }), true).unwrap();
     assert_eq!(view(&replayed.s), view(&folded));
     assert_eq!(view(&replayed.s), view(&h.s), "and both are the ledger as it was");
+}
+
+/// Isolation is journaled in place: replaying the records, or a checkpoint
+/// of the ledger, gives back the isolated bit, the failure count, the keep
+/// expiry and the root, and the event waits for isolated joins only (B6).
+#[test]
+fn an_isolated_event_comes_back_isolated_from_the_records_and_from_a_checkpoint() {
+    let mut h = H::durable(false).cast();
+    h.join(W1, "work", 1);
+    let mut current = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
+    for round in 1..=5 {
+        let effects = h.call(W1, Call::Release { id: id(1), token: current.token, delay_ms: 0, failed: true });
+        if round < 5 {
+            current = assigned(&effects, W1).remove(0);
+        }
+    }
+    assert!(h.records.iter().any(|record| matches!(record, Record::Isolate { failures: 5, expires: Some(_), .. })), "{:?}", h.records);
+    let expected = |slot: &Slot| (slot.isolated, slot.failures, slot.expires, slot.fixed.root, slot.channel);
+    let before = expected(h.slot(id(1)).unwrap());
+    let mut replayed = restarted(h.records.clone(), h.now);
+    assert_eq!(expected(replayed.slot(id(1)).unwrap()), before);
+    let plain = replayed.join(W1, "work", 1);
+    assert!(assigned(&plain, W1).is_empty(), "a plain join does not take it after the restart");
+    let taken = replayed.call(W1, Call::Join { req: 9, channel: None, types: vec![1], isolated: true, lease_ms: 1000, dispatch: false });
+    assert_eq!(sent(&taken, W1), [Outbound::Joined { req: 9 }]);
+    let opened = replayed.call(W1, Call::Window { join: 9, count: 1, bytes: 0 });
+    assert!(assigned(&opened, W1).iter().any(|assignment| assignment.event.id == id(1) && assignment.event.isolated));
+    let serial = h.s.serial();
+    let (head, parts) = h.s.full_checkpoint(serial, h.durable);
+    let mut items = vec![Replay::Head(head)];
+    for part in parts {
+        match part {
+            Part::Producers(producers) => items.extend(producers.into_iter().map(Replay::Producer)),
+            Part::Entries(entries) => items.extend(entries.into_iter().map(Replay::Entry)),
+        }
+    }
+    let mut folded = State::new(&config(), Box::new(V7));
+    folded.recover_from(Recovered::from_replay(items, End { uptime: h.now, serial, commit: 0 }), true).unwrap();
+    let index = folded.slots.by_id(&id(1)).unwrap();
+    assert_eq!(expected(folded.slots.get(index).unwrap()), before, "the checkpoint entry carries the isolated bit");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //!
 //! The rules: producer sequences and cumulative commit acknowledgement,
 //! windows and round-robin assignment, leases, delays and expiries,
-//! isolation at a failure threshold, Strict visibility, root-channel pause.
+//! isolation at a failure threshold, Strict visibility, root-type pause.
 //! How often and how long to retry is the workers' business (0.3).
 //!
 //! This is a plain state machine: calls go in, [`Effects`] come out. It owns
@@ -15,20 +15,20 @@
 //! | state | key | scope | lifetime | bound | cleared by |
 //! | --- | --- | --- | --- | --- | --- |
 //! | ledger metadata | slot (`Slots`, id → slot) | server | registration ~ completion, deletion, expiry | managed memory (root pause) | ledger |
-//! | waiting order | (channel, type) → work key (`Lane`) | server | while waiting | as the metadata | ledger |
-//! | root accounting | root → events, bytes, ended lineages, share at pause (`Root`) | server | while it holds events or is paused | roots with events | ledger |
+//! | waiting order | (channel, type, isolated) → work key (`Lane`) | server | while waiting | as the metadata | ledger |
+//! | root accounting | root type → events, bytes, ended lineages, share at pause (`Root`) | server | while it holds events or is paused | root types with events (≤ 65,536) | ledger |
 //! | drained roots | root (`drained`) | server | emptied after draining ~ refilled | `pause::DRAINED` | ledger (cleared whole at the bound) |
 //! | pause-notice record | (production connection, root) → bytes since (`Paused::notified`) | server | `Paused` ~ `Resumed`, close | connections writing to paused roots | ledger |
-//! | net-growth counters | (channel, type) → recent parents and follow-ups (`Growth`) | server | while the lane has members or events | lanes × four counters | ledger |
-//! | hold lanes | (root, channel, type) → work key (`holds`) | server | while the root is paused | the root's waiting events | ledger (released first when the share comes down) |
-//! | groups being assigned | (channel, group) → attempts (`groups`) | server | assignment ~ completion, release, reclaim | the channel's attempts | ledger; only on `serialize_group` channels |
+//! | net-growth counters | (channel, type, isolated) → recent parents and follow-ups (`Growth`) | server | while the lane has members or events | lanes × four counters | ledger |
+//! | hold lanes | (root type, lane) → work key (`holds`) | server | while the root is paused | the root's waiting events | ledger (released first when the share comes down) |
+//! | groups being assigned | (channel, group) → attempts (`groups`) | server | assignment ~ completion, release, reclaim | the channel's attempts | ledger; only for `serialize_group` types |
 //! | uptime | server | server, in every journal batch | from the first start | 8 bytes | ledger |
 //! | producer table | producer id (`Producers`) | server, journaled | first connection ~ last close + linger | `max_entries` × entry bytes | ledger |
 //! | unacknowledged commits | producer (`Producers::acks`, `Producer::waits`) | ledger | apply ~ `Committed` | connected producers | ledger (landing batch and batch end) |
-//! | joins and windows | (work connection, channel) → window, held, signal bit (`Join`) | server | `Join` ~ close | the window | ledger |
+//! | joins and windows | (work connection, `Join` req) → selection, window, held, signal bit (`Join`) | server | `Join` ~ close | the window | ledger |
 //! | timing wheel | (time, slot, generation) (`Wheel`) | server | assignment, delay, expiry ~ due | claimed + delayed + expiring | ledger |
-//! | subscriptions | channel or prefix → connections (`Subscribers`) | server | subscribe ~ unsubscribe, close | subscriptions | ledger |
-//! | isolated events | logical id, on `isolated.<channel>` | server | isolation ~ completion, deletion, keep time | counted to the original root | workers, expiry |
+//! | subscriptions | channel → connections (`Subscribers`) | server | subscribe ~ unsubscribe, close | subscriptions | ledger |
+//! | isolated events | in place: `Slot::isolated`, their own lane (channel, type, isolated) | server | isolation ~ completion, deletion, keep time | counted to their root | isolated joins, expiry |
 //! | drain mark | server | server | `Drain` ~ stop | 1 | operator |
 //! | body cache | slot (`Slot::payload`; release order in `cache`) | server | registration or read-ahead ~ released at the watermark, or the event leaves | managed memory: released past the high watermark | ledger (`release_cache`) |
 //! | unlocated registrations | serial → slot (`unlocated`) | ledger | durable registration ~ its write lands | registrations in flight | ledger (`wrote`) |
@@ -56,9 +56,10 @@ mod wheel;
 
 pub use disk::Warm;
 
+use super::config::Grant;
 use super::config::{EngineConfig, Grants, Method};
-use super::ops::{ByeReason, Call, Counters, FaultKind, Hello, Outbound, Refusal, Role, SessionId, Target, Welcome};
-use crate::envelope::{ClaimToken, Envelope, EventId, GroupId, ProducerId, WorkKey};
+use super::ops::{ByeReason, Call, Counters, FaultKind, Hello, Outbound, Refusal, Role, SessionId, Welcome};
+use crate::envelope::{Channel, ClaimToken, Envelope, EventId, GroupId, ProducerId, WorkKey};
 use crate::journal::{Location, Record};
 use crate::names::{Name, Names};
 use lanes::{Join, Lane, LaneKey};
@@ -126,29 +127,32 @@ struct Session {
     credential: Name,
     producer: Option<ProducerId>,
     acks: bool,
-    targets: HashSet<Target>,
-    joins: Vec<Name>,
+    /// Its subscriptions.
+    channels: HashSet<Channel>,
+    /// Its credential's grant, for what it may read. `None`: no grants are configured.
+    grant: Option<Grant>,
+    /// Its joins, by the `req` of their `Join`.
+    joins: Vec<u32>,
     /// Fault kinds already told on this connection (2.7).
     faults: u8,
 }
 
 /// Who receives what on a channel.
 ///
-/// | key | channel (exact), prefix, channel (dispatch joins) |
+/// | key | channel (subscriptions), channel (dispatch joins) |
 /// | --- | --- |
 /// | lifetime | subscribe or join ~ unsubscribe or close |
 /// | bound | subscriptions + dispatch joins |
 /// | cleared by | `State::unsubscribe_from`, `State::close` |
 #[derive(Default)]
 struct Subscribers {
-    exact: HashMap<Name, Vec<SessionId>>,
-    prefix: HashMap<Name, Vec<SessionId>>,
-    dispatch: HashMap<Name, Vec<SessionId>>,
+    exact: HashMap<Channel, Vec<SessionId>>,
+    dispatch: HashMap<Channel, Vec<SessionId>>,
 }
 
-fn remove_from(map: &mut HashMap<Name, Vec<SessionId>>, name: &Name, session: SessionId) {
+fn remove_from<K: std::hash::Hash + Eq, V: PartialEq>(map: &mut HashMap<K, Vec<V>>, name: &K, item: V) {
     if let Some(list) = map.get_mut(name) {
-        list.retain(|held| *held != session);
+        list.retain(|held| *held != item);
         if list.is_empty() {
             map.remove(name);
         }
@@ -156,35 +160,21 @@ fn remove_from(map: &mut HashMap<Name, Vec<SessionId>>, name: &Name, session: Se
 }
 
 impl Subscribers {
-    fn add(&mut self, target: &Target, session: SessionId) {
-        let (map, name) = match target {
-            Target::Channel(name) => (&mut self.exact, name),
-            Target::Prefix(name) => (&mut self.prefix, name),
-        };
-        let list = map.entry(name.clone()).or_default();
+    fn add(&mut self, channel: Channel, session: SessionId) {
+        let list = self.exact.entry(channel).or_default();
         if !list.contains(&session) {
             list.push(session);
         }
     }
 
-    fn remove(&mut self, target: &Target, session: SessionId) {
-        match target {
-            Target::Channel(name) => remove_from(&mut self.exact, name, session),
-            Target::Prefix(name) => remove_from(&mut self.prefix, name, session),
-        }
+    fn remove(&mut self, channel: &Channel, session: SessionId) {
+        remove_from(&mut self.exact, channel, session);
     }
 
-    /// Subscribers of `channel`: exact, and every prefix at a `.` boundary.
-    /// With `dispatch`, also the joins that take the channel's dispatch events.
-    fn of(&self, channel: &str, dispatch: bool) -> Vec<SessionId> {
+    /// Subscribers of `channel`; with `dispatch`, also the joins that take
+    /// the channel's dispatch events.
+    fn of(&self, channel: &Channel, dispatch: bool) -> Vec<SessionId> {
         let mut found: Vec<SessionId> = self.exact.get(channel).cloned().unwrap_or_default();
-        if !self.prefix.is_empty() {
-            for (at, _) in channel.match_indices('.') {
-                if let Some(list) = self.prefix.get(&channel[..at]) {
-                    found.extend(list);
-                }
-            }
-        }
         if dispatch {
             if let Some(list) = self.dispatch.get(channel) {
                 found.extend(list);
@@ -219,26 +209,37 @@ pub struct State {
     slots: Slots,
     lanes: HashMap<LaneKey, Lane>,
     /// Hold lanes: events of a paused root skipped in net-growth lanes.
-    holds: HashMap<(Name, LaneKey), BTreeMap<WorkKey, Index>>,
+    holds: HashMap<(u16, LaneKey), BTreeMap<WorkKey, Index>>,
     wheel: Wheel,
-    /// Groups with an attempt out, on `serialize_group` channels.
-    groups: HashMap<(Name, GroupId), u32>,
+    /// Groups with an attempt out, for `serialize_group` types.
+    groups: HashMap<(Channel, GroupId), u32>,
     producers: Producers,
-    roots: HashMap<Name, Root>,
+    /// By root type: the type of the event that started the lineage.
+    roots: HashMap<u16, Root>,
     /// Roots that are paused, for the per-batch resume check.
-    paused: BTreeSet<Name>,
+    paused: BTreeSet<u16>,
     /// Roots that grew in this batch, for the early-pause and max-backlog checks.
-    grown: Vec<Name>,
+    grown: Vec<u16>,
     /// Roots that emptied after a lineage of theirs ended: refilled, they do
     /// not count as never drained. Bound `pause::DRAINED`; cleared whole past it.
-    drained: HashSet<Name>,
+    drained: HashSet<u16>,
     /// Bytes counted for every slot.
     slot_bytes: u64,
     over_limit: bool,
     sessions: HashMap<SessionId, Session>,
     joins: HashMap<JoinId, Join>,
-    /// Joins by channel, in join order.
-    channel_joins: HashMap<Name, Vec<JoinId>>,
+    /// Joins with a channel, by channel, in join order.
+    channel_joins: HashMap<Channel, Vec<JoinId>>,
+    /// Joins without a channel, by each of their types, in join order.
+    ///
+    /// | key | type | scope | one engine | lifetime | while such a join selects it |
+    /// | bound | joins × their types | cleared by | `State::part` and a replacing `Join` |
+    type_joins: HashMap<u16, Vec<JoinId>>,
+    /// The lanes there are, by type: where a join without a channel looks.
+    ///
+    /// | key | type | scope | one engine | lifetime | while a lane of that type exists |
+    /// | bound | the lanes | cleared by | `State::tidy` |
+    typed_lanes: HashMap<u16, HashSet<LaneKey>>,
     next_order: u64,
     subscribers: Subscribers,
     /// Lanes that got events still waiting for the disk (Strict): offered when it lands.
@@ -288,6 +289,8 @@ impl State {
             sessions: HashMap::new(),
             joins: HashMap::new(),
             channel_joins: HashMap::new(),
+            type_joins: HashMap::new(),
+            typed_lanes: HashMap::new(),
             next_order: 0,
             subscribers: Subscribers::default(),
             awaiting: VecDeque::new(),
@@ -427,8 +430,26 @@ impl State {
         }
     }
 
-    fn allowed(&self, credential: &Name, method: Method, channel: &str) -> bool {
-        allowed(&self.config.grants, credential, method, channel)
+    fn allowed(&self, credential: &Name, method: Method, event_type: u16) -> bool {
+        allowed(&self.config.grants, credential, method, event_type)
+    }
+
+    /// Whether the credential holds `method` at all, whatever the type: for
+    /// calls whose event is not there to take a type from.
+    fn has_method(&self, credential: &Name, method: Method) -> bool {
+        match &self.config.grants {
+            None => true,
+            Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.methods.contains(&method)),
+        }
+    }
+
+    /// The connections an event of `event_type` on `channel` goes to: the
+    /// channel's subscribers (and with `dispatch`, its dispatch joins) whose
+    /// credential reads the type.
+    fn readers(&self, channel: &Channel, dispatch: bool, event_type: u16) -> Vec<SessionId> {
+        let mut found = self.subscribers.of(channel, dispatch);
+        found.retain(|session| self.sessions.get(session).is_some_and(|open| open.grant.as_ref().is_none_or(|grant| grant.reads(event_type))));
+        found
     }
 
     fn may_delegate(&self, credential: &Name) -> bool {
@@ -468,7 +489,9 @@ impl State {
     /// Opens a connection. Its first message is `Welcome`, or `Bye`.
     pub fn open(&mut self, session: SessionId, hello: Hello) {
         let credential = self.names.adopt(&hello.credential);
-        self.sessions.insert(session, Session { role: hello.role, credential: credential.clone(), producer: None, acks: hello.acks, targets: HashSet::new(), joins: Vec::new(), faults: 0 });
+        let grant =
+            self.config.grants.as_ref().map(|grants| grants.get(credential.as_str()).cloned().unwrap_or_else(|| Grant { methods: Vec::new(), types: crate::types::TypeSet::none(), delegate: false }));
+        self.sessions.insert(session, Session { role: hello.role, credential: credential.clone(), producer: None, acks: hello.acks, channels: HashSet::new(), grant, joins: Vec::new(), faults: 0 });
         let mut resume = 0;
         let mut superseded = false;
         let mut gate = None;
@@ -479,7 +502,7 @@ impl State {
             if hello.role == Role::Produce && self.draining {
                 return self.close_session(session, Some(ByeReason::Draining));
             }
-            let writes = |method| hello.channels.iter().all(|channel| self.allowed(&credential, method, channel));
+            let writes = |method| hello.types.iter().all(|kind| self.allowed(&credential, method, *kind));
             if hello.role == Role::Produce && !(writes(Method::RegisterClaimable) || writes(Method::RegisterDispatch)) {
                 return self.close_session(session, Some(ByeReason::Forbidden));
             }
@@ -521,11 +544,11 @@ impl State {
     /// reconnect grace (2.4).
     pub fn close(&mut self, session: SessionId, unwritten: &[ClaimToken]) {
         let Some(gone) = self.sessions.remove(&session) else { return };
-        for target in &gone.targets {
-            self.subscribers.remove(target, session);
+        for channel in &gone.channels {
+            self.subscribers.remove(channel, session);
         }
-        for channel in gone.joins {
-            self.part(session, channel, unwritten);
+        for join in gone.joins {
+            self.part(session, join, unwritten);
         }
         if let Some(id) = gone.producer {
             self.producers.detach(&id, session, self.now);
@@ -580,20 +603,19 @@ impl State {
         let before = self.effects.records.len();
         match call {
             Call::Register { event, .. } => self.register(session, role, &credential, event),
-            Call::Delete { id, result, key, .. } => self.delete(session, &credential, id, &result, key),
-            Call::Join { req, channel, types, lease_ms, dispatch } => self.join(session, &credential, req, &channel, types, lease_ms, dispatch),
-            Call::Window { channel, count, bytes } => self.window(session, &channel, count, bytes),
+            Call::Delete { id, result, key, .. } => self.delete(session, &credential, id, result, key),
+            Call::Join { req, channel, types, isolated, lease_ms, dispatch } => self.join(session, &credential, req, channel, types, isolated, lease_ms, dispatch),
+            Call::Window { join, count, bytes } => self.window(session, join, count, bytes),
             Call::Complete { id, token, follow_ups, spooled, .. } => self.complete(session, &credential, id, token, follow_ups, spooled),
             Call::Extend { id, token } => self.extend(session, &credential, id, token),
             Call::Release { id, token, delay_ms, failed } => self.give_back(session, &credential, id, token, delay_ms, failed),
             Call::Claim { req, id, lease_ms } => self.claim(session, &credential, req, id, lease_ms),
-            Call::Subscribe { req, target, after } => self.subscribe(session, &credential, req, target, after),
-            Call::Unsubscribe { req, target } => {
-                let target = self.adopt_target(target);
+            Call::Subscribe { req, channel, after } => self.subscribe(session, &credential, req, channel, after),
+            Call::Unsubscribe { req, channel } => {
                 if let Some(open) = self.sessions.get_mut(&session) {
-                    open.targets.remove(&target);
+                    open.channels.remove(&channel);
                 }
-                self.subscribers.remove(&target, session);
+                self.subscribers.remove(&channel, session);
                 self.send(session, Outbound::Unsubscribed { req }, None);
             }
             Call::Stats { req } => self.stats(session, &credential, req),
@@ -606,13 +628,6 @@ impl State {
             }
         }
         self.settle();
-    }
-
-    fn adopt_target(&mut self, target: Target) -> Target {
-        match target {
-            Target::Channel(name) => Target::Channel(self.names.adopt(&name)),
-            Target::Prefix(name) => Target::Prefix(self.names.adopt(&name)),
-        }
     }
 
     /// Puts the producers' sequences in this batch and tells them `Committed`
@@ -678,10 +693,10 @@ fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn allowed(grants: &Option<Grants>, credential: &Name, method: Method, channel: &str) -> bool {
+fn allowed(grants: &Option<Grants>, credential: &Name, method: Method, event_type: u16) -> bool {
     match grants {
         None => true,
-        Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.allows(method, channel)),
+        Some(grants) => grants.get(credential.as_str()).is_some_and(|grant| grant.allows(method, event_type)),
     }
 }
 

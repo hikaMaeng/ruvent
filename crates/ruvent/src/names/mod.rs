@@ -1,7 +1,8 @@
-//! Interned names: channels, event types, service credentials.
+//! Interned names: service credentials and the end users a proxy registers for.
 //!
-//! Inside the server an event holds its channel and type as a shared
-//! [`Name`] handle, not as a number. A handle keeps its text alive for as long
+//! Channels are ids and types are numbers; the names left are the
+//! credential and the delegate. Inside the server an event holds them as a
+//! shared [`Name`] handle, not as a number. A handle keeps its text alive for as long
 //! as anything holds it — a queue entry, a send buffer, the journal writer —
 //! so a name can never change meaning under a reader that is still behind.
 //!
@@ -159,19 +160,6 @@ impl Names {
 
     pub fn is_empty(&self) -> bool {
         self.set.is_empty()
-    }
-}
-
-/// A channel pattern: an exact name, or a prefix ending in `*`, or `*` for every channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pattern(pub String);
-
-impl Pattern {
-    pub fn matches(&self, channel: &str) -> bool {
-        match self.0.strip_suffix('*') {
-            Some(prefix) => channel.starts_with(prefix),
-            None => self.0 == channel,
-        }
     }
 }
 
