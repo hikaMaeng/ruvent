@@ -7,7 +7,7 @@ use super::wheel::Due;
 use super::State;
 use crate::engine::config::Method;
 use crate::engine::ops::{FaultKind, Outbound, SessionId};
-use crate::envelope::{ClaimToken, Digest, Envelope, EventId, Kind};
+use crate::envelope::{Digest, Envelope, EventId, Kind, WorkerId};
 use crate::journal::{Location, Record, Spooled};
 use crate::names::Name;
 use std::collections::HashMap;
@@ -17,8 +17,8 @@ impl State {
     /// event goes and every follow-up is registered in the same step, or
     /// nothing happens. `spooled` gives the follow-ups whose payload the
     /// connection received to disk (2.6), by position.
-    pub(super) fn complete(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)>) {
-        let Some(index) = self.attempt_for(session, id, token) else { return };
+    pub(super) fn complete(&mut self, session: SessionId, credential: &Name, id: EventId, worker: WorkerId, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)>) {
+        let Some(index) = self.attempt_for(session, id, worker) else { return };
         if !self.allowed(credential, Method::Complete) {
             return self.fault(session, FaultKind::Forbidden, "the credential may not complete");
         }
@@ -81,10 +81,11 @@ impl State {
         }
     }
 
-    /// `Release`: the worker gives the event back, visible again after
-    /// `delay_ms`. Only `failed` counts against the event (2.4).
-    pub(super) fn give_back(&mut self, session: SessionId, credential: &Name, id: EventId, token: ClaimToken, delay_ms: u64, failed: bool) {
-        let Some(index) = self.attempt_for(session, id, token) else { return };
+    /// `Release`: the worker uuid leaves the event, which waits again (after
+    /// `delay_ms`); with `failed`, a failure report, its failure count rises
+    /// first. Another worker may then claim it.
+    pub(super) fn give_back(&mut self, session: SessionId, credential: &Name, id: EventId, worker: WorkerId, delay_ms: u64, failed: bool) {
+        let Some(index) = self.attempt_for(session, id, worker) else { return };
         if !self.allowed(credential, Method::Complete) {
             return self.fault(session, FaultKind::Forbidden, "the credential may not release");
         }
@@ -112,8 +113,8 @@ impl State {
 
     /// A closed connection's assignment that was never fully written goes back
     /// at once, its failure count unchanged (2.4).
-    pub(super) fn release_unwritten(&mut self, index: Index, token: ClaimToken) {
-        if self.slots.get(index).and_then(|slot| slot.attempt()).map(|attempt| attempt.token) != Some(token) {
+    pub(super) fn release_unwritten(&mut self, index: Index) {
+        if self.slots.get(index).and_then(|slot| slot.attempt()).is_none() {
             return;
         }
         if self.end_attempt(index).is_none() {
@@ -223,7 +224,7 @@ impl State {
             let Some(slot) = self.slots.current(entry.index, entry.generation) else { continue };
             let now = self.now;
             let reclaim = match (entry.due, &slot.place) {
-                (Due::Lease(token), Place::Claimed(attempt)) if attempt.token == token && attempt.until <= now => Some(true),
+                (Due::Lease, Place::Claimed(attempt)) if attempt.until <= now => Some(true),
                 (Due::Visible, Place::Delayed { until }) if *until <= now => Some(false),
                 _ => None,
             };

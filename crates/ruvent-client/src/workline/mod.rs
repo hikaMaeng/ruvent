@@ -10,7 +10,7 @@
 
 use crate::buffer::Unacked;
 use crate::line::Line;
-use ruvent::{Call, ClaimToken, Envelope, EventId, Link, Welcome};
+use ruvent::{Call, Envelope, EventId, Link, Welcome, WorkerId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,13 +19,14 @@ use std::time::Duration;
 #[derive(Clone)]
 pub(crate) struct Completion {
     pub id: EventId,
-    pub token: ClaimToken,
+    /// The worker uuid the event was claimed under.
+    pub worker: WorkerId,
     pub follow_ups: Vec<Envelope>,
 }
 
 impl Completion {
     fn call(&self, seq: u64) -> Call {
-        Call::Complete { seq, id: self.id, token: self.token, follow_ups: self.follow_ups.clone(), spooled: Vec::new() }
+        Call::Complete { seq, id: self.id, worker: self.worker, follow_ups: self.follow_ups.clone(), spooled: Vec::new() }
     }
 
     fn bytes(&self) -> u64 {
@@ -62,7 +63,7 @@ impl WorkLine {
     }
 
     /// Welcomed: drop what the server applied, send the rest again (2.9
-    /// "서버 재기동": completions kept through a restart go out under their token).
+    /// "서버 재기동": completions kept through a restart go out under their event and worker uuid).
     pub(crate) async fn up(&mut self, epoch: u64, link: Arc<dyn Link>, welcome: &Welcome) {
         let _ = self.buffer.resume(welcome.resume);
         let resend: Vec<Call> = self.buffer.iter().map(|entry| entry.item.call(entry.seq)).collect();
@@ -94,14 +95,14 @@ impl WorkLine {
         }
     }
 
-    /// Joins `channel` (`None`: every channel) for `types`; the answer names `index`.
-    pub(crate) async fn join(&mut self, index: usize, selection: crate::worker::Selection, lease: Duration, dispatch: bool) {
+    /// Joins `channel` (`None`: every channel) for `types` as `worker`; the answer names `index`.
+    pub(crate) async fn join(&mut self, index: usize, worker: WorkerId, selection: crate::worker::Selection, lease: Duration, dispatch: bool) {
         let crate::worker::Selection { channel, types } = selection;
         let req = self.next_req;
         self.next_req = self.next_req.wrapping_add(1).max(1);
         let Some(live) = &mut self.live else { return };
         live.asked.insert(req, index);
-        let _ = live.link.send(Call::Join { req, channel, types, lease_ms: millis(lease), dispatch }).await;
+        let _ = live.link.send(Call::Join { req, worker, channel, types, lease_ms: millis(lease), dispatch }).await;
     }
 
     /// The service index a `Joined` or `Refused` answers. With `joined`, the

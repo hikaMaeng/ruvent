@@ -1,10 +1,10 @@
 use crate::io::{sniff_v1, v1_bye, Parts, RawRecord, RecordReader, HEADER};
-use crate::records::{Body, Decoder, Encoder, Message, Side, ASSIGN, BYE, DELIVERY, HELLO, REGISTER};
+use crate::records::{Body, Decoder, Encoder, Message, Side, ASSIGN, BYE, DELIVERY, EXTEND, HELLO, REGISTER};
 use crate::{features, ProtocolError, MAX_BODY, VERSION};
 use bytes::Bytes;
 use proptest::prelude::*;
 use ruvent::envelope::codec::Malformed;
-use ruvent::{Assignment, ByeReason, Call, Channel, ClaimMark, ClaimToken, Counters, Envelope, EventId, FaultKind, Hello, IdleLane, Name, Outbound, Refusal, Role, Stats, TypeStat, Welcome, WorkKey};
+use ruvent::{Assignment, ByeReason, Call, Channel, Counters, Envelope, EventId, FaultKind, Hello, IdleLane, Name, Outbound, Refusal, Role, Stats, TypeStat, Welcome, WorkKey, WorkerId};
 
 /// A test channel: a UUIDv7-shaped id derived from a label, the same every time.
 pub fn ch(label: &str) -> Channel {
@@ -83,40 +83,39 @@ fn id(byte: u8) -> EventId {
     EventId([byte; 16])
 }
 
-fn claim(seq: u64) -> ClaimMark {
-    ClaimMark { worker: [0x77; 16], token: ClaimToken { generation: 2, seq }, lease_ms: 30_000 }
-}
+/// The worker uuid the tests' claims name.
+const WORKER: WorkerId = [0x77; 16];
 
 fn assigned(byte: u8, payload: &'static [u8]) -> Envelope {
     let mut event = Envelope::claimable(ch("orders"), 17, Bytes::from_static(payload)).with_id(id(byte)).with_not_before(std::time::Duration::from_millis(9));
     event.key = Some(WorkKey { generation: 2, arrival: 300 });
     event.failures = 3;
-    event.claim = Some(claim(77));
+    event.worker = Some(WORKER);
     event
 }
 
 fn every_call() -> Vec<Call> {
-    let token = ClaimToken { generation: 2, seq: 1 << 40 };
+    let worker = WORKER;
     vec![
         Call::Register { seq: Some(1), event: Envelope::claimable(ch("orders"), 17, Bytes::from_static(b"payload")).with_id(id(1)).with_not_before(std::time::Duration::from_secs(5)) },
         Call::Register { seq: None, event: Envelope::dispatch(ch("feed"), 18, Bytes::from(vec![7u8; 5000])) },
         Call::Delete { seq: 2, id: id(1), result: ch("results"), key: Some(WorkKey { generation: 1, arrival: 9 }) },
         Call::Delete { seq: 3, id: id(1), result: ch("results"), key: None },
-        Call::Join { req: 1, channel: Some(ch("orders")), types: vec![17, 23], lease_ms: 30_000, dispatch: true },
-        Call::Join { req: 7, channel: None, types: vec![17, u16::MAX], lease_ms: 1, dispatch: false },
-        Call::Join { req: 8, channel: Some(ch("orders")), types: Vec::new(), lease_ms: 0, dispatch: false },
+        Call::Join { req: 1, worker, channel: Some(ch("orders")), types: vec![17, 23], lease_ms: 30_000, dispatch: true },
+        Call::Join { req: 7, worker: [0xff; 16], channel: None, types: vec![17, u16::MAX], lease_ms: 1, dispatch: false },
+        Call::Join { req: 8, worker: [1; 16], channel: Some(ch("orders")), types: Vec::new(), lease_ms: 0, dispatch: false },
         Call::Window { join: 1, count: 16, bytes: 1 << 20 },
         Call::Complete {
             seq: 4,
             id: id(1),
-            token,
+            worker,
             follow_ups: vec![Envelope::claimable(ch("next"), 1, Bytes::from_static(b"a")), Envelope::dispatch(ch("feed"), 19, Bytes::new())],
             spooled: Vec::new(),
         },
-        Call::Complete { seq: 5, id: id(1), token, follow_ups: Vec::new(), spooled: Vec::new() },
-        Call::Extend { id: id(1), token },
-        Call::Release { id: id(1), token, delay_ms: 1500, failed: true },
-        Call::Claim { req: 2, id: id(1), lease_ms: 5000 },
+        Call::Complete { seq: 5, id: id(1), worker, follow_ups: Vec::new(), spooled: Vec::new() },
+        Call::Extend { id: id(1), worker },
+        Call::Release { id: id(1), worker, delay_ms: 1500, failed: true },
+        Call::Claim { req: 2, id: id(1), worker, lease_ms: 5000 },
         Call::Subscribe { req: 3, channel: ch("chat"), after: Some(WorkKey { generation: 1, arrival: 2 }) },
         Call::Subscribe { req: 9, channel: ch("feed"), after: None },
         Call::Unsubscribe { req: 4, channel: ch("feed") },
@@ -148,15 +147,12 @@ fn stats() -> Stats {
 }
 
 fn every_outbound() -> Vec<Outbound> {
-    let assignment = Assignment { event: assigned(1, b"body"), until: 29_000, more: true };
+    let assignment = Assignment { event: assigned(1, b"body"), lease_ms: 30_000, until: 29_000, more: true };
     let mut notice = assigned(2, b"").notice();
     notice.failures = 0;
     let failed = Envelope { failures: 5, ..notice.clone() };
-    // A claim mark with a large token and no `not_before`.
-    let other = Assignment {
-        event: Envelope { not_before: None, claim: Some(ClaimMark { worker: [1; 16], token: ClaimToken { generation: u32::MAX, seq: 1 << 50 }, lease_ms: 0 }), ..assigned(4, b"again") },
-        ..assignment.clone()
-    };
+    // Another worker uuid, a large lease and no `not_before`.
+    let other = Assignment { event: Envelope { not_before: None, worker: Some([1; 16]), ..assigned(4, b"again") }, lease_ms: 1 << 40, ..assignment.clone() };
     vec![
         Outbound::Bye(ByeReason::Superseded),
         Outbound::Fault { kind: FaultKind::SequenceGap, detail: "sequence number skipped ahead" },
@@ -226,23 +222,22 @@ fn no_record_defines_a_name_and_the_retired_tags_are_unknown() {
     }
 }
 
-/// An assignment written by hand from the layout decodes: its head (remaining
-/// lease, more), the 38-byte event head, the work key, `not_before` (flag
-/// bit 1) and the claim mark (flag bit 2: worker, token, lease). The same
-/// event head is refused where a claim mark does not belong.
+/// An assignment written by hand from the layout decodes: its head (lease,
+/// remaining lease, more), the 38-byte event head, the work key,
+/// `not_before` (flag bit 1) and the worker uuid (flag bit 2, 16 octets: no
+/// token). The same event head is refused where a worker does not belong.
 #[test]
-fn a_38_byte_head_with_not_before_and_a_claim_mark_decodes_only_as_an_assignment() {
+fn a_38_byte_head_with_not_before_and_a_worker_decodes_only_as_an_assignment() {
     let mut head = Vec::new();
     head.extend_from_slice(&[0x11; 16]);
     head.extend_from_slice(&ch("orders").0);
     head.extend_from_slice(&[17, 0, 0x06, 0x00, 3, 0]);
     assert_eq!(head.len(), 38);
-    let mut assign = vec![5, 1];
+    let mut assign = vec![7, 5, 1];
     assign.extend_from_slice(&head);
     assign.extend_from_slice(&[2, 0, 0, 0, 44]);
     assign.push(9);
     assign.extend_from_slice(&[0x77; 16]);
-    assign.extend_from_slice(&[2, 0, 0, 0, 5, 7]);
     let mut bytes = encode(&[welcome()]).unwrap();
     bytes.extend_from_slice(&[ASSIGN, assign.len() as u8, 0, 2, 0, 0, 0]);
     bytes.extend_from_slice(&assign);
@@ -251,17 +246,17 @@ fn a_38_byte_head_with_not_before_and_a_claim_mark_decodes_only_as_an_assignment
     let Message::Outbound(Outbound::Assign(assignment)) = &decoded[1] else { panic!("{decoded:?}") };
     let event = &assignment.event;
     assert_eq!((event.id, event.channel, event.event_type, event.failures, event.key, event.not_before), (id(0x11), ch("orders"), 17, 3, Some(WorkKey { generation: 2, arrival: 44 }), Some(9)));
-    assert_eq!(event.claim, Some(ClaimMark { worker: [0x77; 16], token: ClaimToken { generation: 2, seq: 5 }, lease_ms: 7 }));
-    assert_eq!((assignment.token(), assignment.lease_ms(), assignment.until, assignment.more), (ClaimToken { generation: 2, seq: 5 }, 7, 5, true));
+    assert_eq!(event.worker, Some([0x77; 16]));
+    assert_eq!((assignment.lease_ms, assignment.until, assignment.more), (7, 5, true));
     assert_eq!(&event.payload[..], b"hi");
-    // In a registration: the claim mark is a field it does not carry.
+    // In a registration: the worker is a field it does not carry.
     let mut bytes = encode(&[hello(Role::Produce)]).unwrap();
     bytes.extend_from_slice(&[REGISTER, 39, 0, 0, 0, 0, 0, 1]);
     let mut request = head.clone();
     request[36] = 0;
     bytes.extend_from_slice(&request);
     assert_eq!(decode(&bytes, Side::Server), Err(ProtocolError::Malformed(Malformed::Forbidden("a field this record does not carry"))));
-    // In a delivery: neither `not_before` nor a claim mark.
+    // In a delivery: neither `not_before` nor a worker.
     let mut delivery = head.clone();
     delivery[36] = 0;
     delivery[34] = 0x06;
@@ -271,17 +266,39 @@ fn a_38_byte_head_with_not_before_and_a_claim_mark_decodes_only_as_an_assignment
     assert_eq!(decode(&bytes, Side::Client), Err(ProtocolError::Malformed(Malformed::Forbidden("a field this record does not carry"))));
 }
 
-/// An assignment without a claim mark is refused before it is written, and a
-/// request's claim mark is never written (only the server sets one).
+/// An assignment without a worker uuid is refused before it is written, and
+/// a request's worker is never written (only the server sets one).
 #[test]
-fn an_assignment_needs_a_claim_mark_and_a_request_never_carries_one() {
+fn an_assignment_needs_a_worker_and_a_request_never_carries_one() {
     let mut encoder = Encoder::new();
     encoder.push(&welcome()).unwrap();
-    let bare = Assignment { event: Envelope { claim: None, ..assigned(1, b"p") }, until: 1, more: false };
-    assert_eq!(encoder.push(&Message::Outbound(Outbound::Assign(bare))), Err(ProtocolError::Malformed(Malformed::Missing("claim mark"))));
-    let marked = Envelope { claim: Some(claim(1)), ..Envelope::claimable(ch("orders"), 17, Bytes::new()) };
+    let bare = Assignment { event: Envelope { worker: None, ..assigned(1, b"p") }, lease_ms: 1, until: 1, more: false };
+    assert_eq!(encoder.push(&Message::Outbound(Outbound::Assign(bare))), Err(ProtocolError::Malformed(Malformed::Missing("worker"))));
+    let marked = Envelope { worker: Some(WORKER), ..Envelope::claimable(ch("orders"), 17, Bytes::new()) };
     let decoded = trip(&[Message::Call(Call::Register { seq: Some(1), event: marked.clone() })], Side::Server).unwrap();
-    assert_eq!(decoded, [Message::Call(Call::Register { seq: Some(1), event: Envelope { claim: None, ..marked } })]);
+    assert_eq!(decoded, [Message::Call(Call::Register { seq: Some(1), event: Envelope { worker: None, ..marked } })]);
+}
+
+/// A claim request carries the worker uuid, and so does every report on a
+/// claim: the event id and that uuid, 16 octets each, with no token.
+#[test]
+fn claim_requests_and_reports_carry_the_worker_uuid() {
+    let worker: WorkerId = [0x42; 16];
+    let calls = [
+        Message::Call(Call::Join { req: 1, worker, channel: Some(ch("orders")), types: Vec::new(), lease_ms: 30_000, dispatch: false }),
+        Message::Call(Call::Claim { req: 2, id: id(1), worker, lease_ms: 5000 }),
+        Message::Call(Call::Extend { id: id(1), worker }),
+        Message::Call(Call::Release { id: id(1), worker, delay_ms: 0, failed: true }),
+    ];
+    let mut bytes = encode(&[hello(Role::Work)]).unwrap();
+    let start = bytes.len();
+    bytes.extend_from_slice(&encode(&calls[2..3]).unwrap());
+    // Extend: tag, head 32 (id 16, worker 16), no body.
+    assert_eq!(&bytes[start..start + 7], &[EXTEND, 32, 0, 0, 0, 0, 0]);
+    assert_eq!(&bytes[start + 7 + 16..start + 7 + 32], &worker);
+    for call in calls {
+        assert_eq!(trip(std::slice::from_ref(&call), Side::Server).unwrap(), [call]);
+    }
 }
 
 /// Feature bits of what version 5 dropped — pause (1), prefix subscriptions
@@ -318,7 +335,7 @@ fn an_engine_welcome_is_sent_with_this_version_and_the_encoders_features() {
 /// An assignment carries the lease left when the server starts writing it.
 #[test]
 fn an_assignment_carries_the_lease_left_at_the_moment_it_is_written() {
-    let assignment = Assignment { event: assigned(1, b"p"), until: 50_000, more: false };
+    let assignment = Assignment { event: assigned(1, b"p"), lease_ms: 60_000, until: 50_000, more: false };
     let mut encoder = Encoder::new();
     encoder.push(&Message::Outbound(Outbound::Welcome(Welcome { server_id: [0; 16], generation: 1, credential: "s".into(), resume: 0, superseded: false }))).unwrap();
     encoder.set_now(45_500);
@@ -349,7 +366,7 @@ proptest! {
         for (index, event) in events.iter().enumerate() {
             calls.push(Message::Call(Call::Register { seq: Some(index as u64 + 1), event: event.clone() }));
         }
-        calls.push(Message::Call(Call::Complete { seq: 99, id: id(1), token: ClaimToken::default(), follow_ups: events.iter().take(2).cloned().collect(), spooled: Vec::new() }));
+        calls.push(Message::Call(Call::Complete { seq: 99, id: id(1), worker: WORKER, follow_ups: events.iter().take(2).cloned().collect(), spooled: Vec::new() }));
         prop_assert_eq!(trip(&calls, Side::Server).unwrap(), calls);
     }
 
@@ -378,7 +395,7 @@ fn a_completion_is_handed_over_only_when_its_last_follow_up_arrived() {
     let call = Call::Complete {
         seq: 1,
         id: id(1),
-        token: ClaimToken::default(),
+        worker: WORKER,
         follow_ups: vec![Envelope::dispatch(ch("a"), 20, Bytes::from_static(b"1")), Envelope::dispatch(ch("a"), 21, Bytes::from_static(b"2"))],
         spooled: Vec::new(),
     };
@@ -430,7 +447,7 @@ fn unknown_tags_leftover_bytes_bodies_on_bodiless_records_and_forbidden_heads_ar
     bad.extend_from_slice(&[0; 16]);
     bad.extend_from_slice(&ch("c").0);
     bad.extend_from_slice(&[0, 0, 0x03, 0, 0, 0, 5]);
-    assert_eq!(with(&bad), Err(ProtocolError::Malformed(Malformed::Forbidden("not_before or a claim mark on a dispatch event"))));
+    assert_eq!(with(&bad), Err(ProtocolError::Malformed(Malformed::Forbidden("not_before or a worker on a dispatch event"))));
     // A reserved flag bit (3).
     let mut reserved = vec![REGISTER, 39, 0, 0, 0, 0, 0, 1];
     reserved.extend_from_slice(&[0; 16]);

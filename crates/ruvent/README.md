@@ -6,8 +6,8 @@
 | 모듈 | 내용 |
 | --- | --- |
 | `names` | 공유 이름 핸들 `Name`, 서버 사전 `Names`(쓸어내기로 크기 상한). 연결의 자격 이름에만 쓴다. 엔벨롭에는 이름이 없다 |
-| `envelope` | 단일 엔벨롭 `Envelope`(머리 38 B: id 16 · 채널 16 · 타입 u16 · flags u16 · 실패 u16, 선택 블록 `not_before`와 착수 마크 `ClaimMark`), 채널 `Channel`(UUIDv7만 받는다), `EventId`·`WorkKey`·`ClaimToken`·`Digest`, 서버 타입 `SERVER_TYPE`(0). `envelope::codec`이 바이트 배치와 레코드 종류별 규칙(`Layout`)을 정한다 |
-| `journal` | 형식 6 레코드 집합 `Record`, 쓰기 묶음 `Batch`, `Journal` 계약과 곁의 부품(`Checkpoints`, `Chores`, `Bodies`, `Spool`), 세그먼트 컨테이너 `SegmentLog`(형식 5 이하는 거부), 스트리밍 복구 `Recovered`/`Source`/`Replay`, `Volatile` |
+| `envelope` | 단일 엔벨롭 `Envelope`(머리 38 B: id 16 · 채널 16 · 타입 u16 · flags u16 · 실패 u16, 선택 블록 `not_before`와 착수한 워커 uuid `worker`), 채널 `Channel`(UUIDv7만 받는다), `EventId`·`WorkKey`·`WorkerId`·`Digest`, 서버 타입 `SERVER_TYPE`(0). `envelope::codec`이 바이트 배치와 레코드 종류별 규칙(`Layout`)을 정한다 |
+| `journal` | 형식 7 레코드 집합 `Record`, 쓰기 묶음 `Batch`, `Journal` 계약과 곁의 부품(`Checkpoints`, `Chores`, `Bodies`, `Spool`), 세그먼트 컨테이너 `SegmentLog`(형식 6 이하는 거부), 스트리밍 복구 `Recovered`/`Source`/`Replay`, `Volatile` |
 | `snapshot` | 운영 스냅샷 수집기와 파일 형식 2(`snapshot::read`). 타입 목록으로 고른다 |
 | `engine` | 단일 작성자 엔진 태스크(`Engine`), 장부(`engine::state`), 설정(`EngineConfig`), 연산 값(`Call`, `Outbound`, `Hello`, `Assignment`, `Stats`, 코드 표 `ByeReason`·`FaultKind`·`Refusal`, 삭제 결과 `delete_outcome`) |
 | `methods` | 연산 계약 `Methods`, 그 유일한 구현 `Client`, 응답 분배 `Demux`, 인프로세스 연결 `connect` |
@@ -18,8 +18,9 @@
   계층도 접두사도 패턴도 없고, 버전 7·RFC 변형이 아니면 거절한다. 그래서 요청마다 새 채널이어도 사전 항목도 설정도 남지 않는다.
 * **타입**은 u16이다. 서버가 착수용 이벤트를 워커에게 배정할 때 쓴다(`Join`). 스냅샷도 타입으로 고른다.
   0은 서버 것(삭제 결과)이라 생산자가 등록할 수 없다. 무엇을 뜻하는지는 프로젝트가 번호를 매긴다.
-* **착수 마크**는 배정된 이벤트의 엔벨롭에 든다: 착수한 워커의 uuid(작업 연결의 producer id), 표지, lease.
-  완료·연장·반환은 그 워커가 그 표지로 해야 한다. **실패 횟수**는 재시도 횟수이고 서버는 세기만 한다.
+* **착수**는 엔벨롭의 워커 uuid(`worker`)가 있느냐 없느냐다. 다른 표지는 없다(계획 9.16). 착수 요청(`Join`, `Claim`)은
+  워커 uuid를 실어야 하고(nil이면 거절), 완료·연장·반환은 이벤트 id와 워커 uuid가 둘 다 맞아야 처리한다. 실패 보고
+  (`Release{실패}`)는 워커 uuid를 지우고 실패 횟수를 올려 다른 워커가 착수하게 한다. **실패 횟수**는 재시도 횟수이고 서버는 세기만 한다.
 * **페이로드**는 임의 바이트다. 서버는 읽지 않는다. 서버가 하지 않는 일(격리, 만료, 순서, 정지, 위임)은 워커와 프록시가 한다.
 
 ## 연결 역할
@@ -29,13 +30,13 @@
 | 역할 | 보내는 것 | 받는 것 |
 | --- | --- | --- |
 | 생산 | `Register{seq}`, `Delete{seq}` | 누적 `Committed`, `Fault` |
-| 작업 | `Join`(채널, 타입 집합, 또는 둘), `Window{join}`, `Complete{seq}`, `Extend`, `Release`, `Claim{id}`, 발송용 `Register` | `Assign`(착수 마크 포함), `Pending{join}`, `Committed`, 참여한 채널의 발송(발송 포함일 때) |
+| 작업 | `Join{워커 uuid}`(채널, 타입 집합, 또는 둘), `Window{join}`, `Complete{seq, id, 워커}`, `Extend{id, 워커}`, `Release{id, 워커}`, `Claim{id, 워커}`, 발송용 `Register` | `Assign`(워커 uuid, lease 포함), `Pending{join}`, `Committed`, 참여한 채널의 발송(발송 포함일 때) |
 | 관찰 | `Subscribe{channel}`, `Unsubscribe`, `Stats`, `Drain` | `Notice`, `Delivery`, `StatsReply` |
 
 ## 최소 사용
 
 ```rust
-use ruvent::{connect, Bytes, Channel, Engine, EngineConfig, Envelope, Hello, Incoming, Methods};
+use ruvent::{connect, Bytes, Channel, Engine, EngineConfig, Envelope, EventId, Hello, Incoming, Methods, WorkerId};
 use std::time::Duration;
 
 const CALL: u16 = 1;
@@ -44,13 +45,14 @@ const CALL: u16 = 1;
 let engine = Engine::volatile(EngineConfig::default()).await;
 let (producer, _) = connect(&engine, Hello::producer("svc"), 1024).await.unwrap();
 let (worker, mut inbox) = connect(&engine, Hello::worker("svc"), 1024).await.unwrap();
-// 타입 참여: 어느 채널이든 타입 CALL의 일을 받는다.
-let join = worker.join(None, vec![CALL], Duration::from_secs(30), false).await.unwrap();
+// 타입 참여: 어느 채널이든 타입 CALL의 일을 이 워커 uuid로 받는다(nil이면 거절).
+let me: WorkerId = EventId::new_v7().0;
+let join = worker.join(me, None, vec![CALL], Duration::from_secs(30), false).await.unwrap();
 worker.window(join, 16, 0).await.unwrap();
 let request = Channel::new(); // 요청 하나의 스트림
 producer.register_committed(Envelope::claimable(request, CALL, Bytes::from_static(b"{}"))).await.unwrap();
 if let Some(Incoming::Assign(assignment)) = inbox.recv().await {
-    let seq = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+    let seq = worker.complete(assignment.event.id, me, Vec::new()).await.unwrap();
     worker.committed(seq).await.unwrap();
 }
 # }

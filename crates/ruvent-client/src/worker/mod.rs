@@ -35,7 +35,7 @@
 //! | reconnection back-off | server | line | disconnection ~ welcome | servers | SDK ([`crate::line`]) |
 //! | execution slots | slot | worker service | the service's | P ([`Service::slots`]) | none |
 //! | per-server window book | (server, channel) → window, in flight, starving | worker service | `Join` ~ the server leaves | servers × channels | SDK ([`windows::Book`]) |
-//! | runs in flight | (server, token) → run, extension due, lease end, run limit | worker | `Assign` ~ completion, release or run limit | P per service | SDK (run end, shutdown) |
+//! | runs in flight | (server, event id) → run, extension due, lease end, run limit | worker | `Assign` ~ completion, release or run limit | P per service | SDK (run end, shutdown) |
 
 mod context;
 mod extend;
@@ -58,7 +58,7 @@ use crate::servers::{Server, ServerList};
 use crate::workline::{Completion, WorkLine};
 use handler::HandlerFn;
 use parking_lot::Mutex;
-use ruvent::{Assignment, ByeReason, Call, ClaimToken, Envelope, EventId, Hello, Name, Outbound, Refusal};
+use ruvent::{Assignment, ByeReason, Call, Envelope, EventId, Hello, Name, Outbound, Refusal, WorkerId};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -106,11 +106,12 @@ pub struct WorkerStats {
     pub restarts: u64,
 }
 
-/// One run's name: the server that assigned it and the attempt.
+/// One run's name: the server that assigned it and the event. (The claim is
+/// the event and this worker's uuid; there is one run per claim.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RunKey {
     pub server: Server,
-    pub token: ClaimToken,
+    pub id: EventId,
 }
 
 /// How a run ended.
@@ -183,10 +184,13 @@ impl Builder {
         let (messages, message_rx) = mpsc::channel(1024);
         let mut hello = Hello::worker(&self.config.credential);
         hello.acks = true;
+        // The worker's uuid: every claim names it. One per worker, on every server.
+        let worker = hello.producer.unwrap_or_else(|| EventId::new_v7().0);
         let actor = Actor {
             shared: shared.clone(),
             connector: self.connector,
             hello,
+            worker,
             services: self.services,
             producer: self.producer,
             config: self.config,
@@ -281,6 +285,8 @@ struct Actor {
     shared: Arc<Shared>,
     connector: Arc<dyn Connector>,
     hello: Hello,
+    /// The worker uuid its joins and claims name (its work connections' producer id).
+    worker: WorkerId,
     services: Vec<Service>,
     producer: Option<Producer>,
     config: WorkerConfig,
@@ -374,7 +380,7 @@ impl Actor {
                 let Some(line) = self.lines.get_mut(&server) else { return };
                 line.up(epoch, link, &welcome).await;
                 for (index, selection, lease) in services {
-                    line.join(index, selection, lease, false).await;
+                    line.join(index, self.worker, selection, lease, false).await;
                 }
             }
             Event::Message { server, epoch, message, .. } => {
@@ -440,7 +446,7 @@ impl Actor {
         let mut extends = Vec::new();
         for (key, run) in self.runs.iter_mut() {
             if key.server == *server && run.service == index {
-                extends.push(Call::Extend { id: run.id, token: key.token });
+                extends.push(Call::Extend { id: key.id, worker: self.worker });
                 run.extend_at = extend::due(now, run.lease, run.lease);
                 run.lease_end = now + run.lease;
             }
@@ -455,8 +461,7 @@ impl Actor {
     }
 
     async fn assigned(&mut self, server: Server, assignment: Assignment) {
-        let (token, lease_ms) = (assignment.token(), assignment.lease_ms());
-        let Assignment { event, until, more } = assignment;
+        let Assignment { event, lease_ms, until, more } = assignment;
         let id = event.id;
         let index = self.service(&event);
         let arrival = match index {
@@ -477,7 +482,7 @@ impl Actor {
             }
             self.shared.counters.overflow.fetch_add(1, Ordering::Relaxed);
             if let Some(line) = self.lines.get(&server) {
-                line.tell(Call::Release { id, token, delay_ms: 0, failed: false }).await;
+                line.tell(Call::Release { id, worker: self.worker, delay_ms: 0, failed: false }).await;
             }
             return;
         };
@@ -485,8 +490,8 @@ impl Actor {
         let lease = Duration::from_millis(lease_ms);
         let now = Instant::now();
         let left = Duration::from_millis(until);
-        let key = RunKey { server, token };
-        let context = Context::new(event, token, key.clone(), self.messages.clone(), self.producer.clone());
+        let key = RunKey { server, id };
+        let context = Context::new(event, key.clone(), self.messages.clone(), self.producer.clone());
         let abort = run::spawn(handler, context, service.run_limit, service.retry_delay, key.clone(), self.messages.clone());
         self.shared.counters.runs.fetch_add(1, Ordering::Relaxed);
         self.runs.insert(key, Running { service: index, id, lease, extend_at: extend::due(now, left, lease), lease_end: now + left, abort: AbortGuard(abort) });
@@ -514,13 +519,13 @@ impl Actor {
                 match end {
                     End::Complete(follow_ups) => {
                         self.shared.counters.completed.fetch_add(1, Ordering::Relaxed);
-                        line.complete(Completion { id: run.id, token: key.token, follow_ups }).await;
+                        line.complete(Completion { id: run.id, worker: self.worker, follow_ups }).await;
                     }
                     End::Release { delay, failed } => {
                         let counter = if failed { &self.shared.counters.released_failed } else { &self.shared.counters.released_later };
                         counter.fetch_add(1, Ordering::Relaxed);
                         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                        line.tell(Call::Release { id: run.id, token: key.token, delay_ms, failed }).await;
+                        line.tell(Call::Release { id: run.id, worker: self.worker, delay_ms, failed }).await;
                     }
                 }
             }
@@ -547,7 +552,7 @@ impl Actor {
             if run.lease_end <= now {
                 reopen.push((run.service, key.server.clone()));
             }
-            calls.push((key.server.clone(), Call::Extend { id: run.id, token: key.token }));
+            calls.push((key.server.clone(), Call::Extend { id: run.id, worker: self.worker }));
             run.extend_at = extend::due(now, run.lease, run.lease);
             run.lease_end = now + run.lease;
         }
@@ -597,7 +602,7 @@ impl Actor {
             drop(run.abort);
             self.shared.counters.released_later.fetch_add(1, Ordering::Relaxed);
             if let Some(line) = self.lines.get(&key.server) {
-                line.tell(Call::Release { id: run.id, token: key.token, delay_ms: 0, failed: false }).await;
+                line.tell(Call::Release { id: run.id, worker: self.worker, delay_ms: 0, failed: false }).await;
             }
         }
     }

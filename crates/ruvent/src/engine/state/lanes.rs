@@ -1,7 +1,7 @@
 //! Lanes and joins.
 
 use super::slots::{Index, JoinId};
-use crate::envelope::{Channel, WorkKey};
+use crate::envelope::{Channel, WorkKey, WorkerId};
 use std::collections::{BTreeMap, HashSet};
 
 /// A lane's key: (channel, type). Waiting order is per lane, because workers
@@ -62,6 +62,8 @@ pub(super) struct Join {
     pub channel: Option<Channel>,
     /// Empty: every type.
     pub types: Vec<u16>,
+    /// The worker uuid its assignments are claimed under (its `Join` said it).
+    pub worker: WorkerId,
     pub lease_ms: u64,
     /// The window: assignments and payload bytes (`0`: no byte bound) held at once.
     pub count: u32,

@@ -18,7 +18,7 @@ async fn under_strict_nothing_uncommitted_is_visible_while_the_disk_is_held() {
     let (observer, mut watched) = observer(&engine).await;
     let (worker, mut assignments) = worker(&engine).await;
     observer.subscribe(ch("work"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let (seq, id) = producer.register(work("work")).await.unwrap();
     let (late, _) = observer_and_backlog(&engine).await;
@@ -27,7 +27,7 @@ async fn under_strict_nothing_uncommitted_is_visible_while_the_disk_is_held() {
         let engine = engine.clone();
         async move {
             let (claimer, _) = crate::support::worker(&engine).await;
-            claimer.claim(id, Duration::from_secs(30)).await
+            claimer.claim(id, CLAIMER, Duration::from_secs(30)).await
         }
     });
     assert!(stays_quiet(&mut watched).await, "no notice");
@@ -61,12 +61,12 @@ async fn under_strict_one_connection_receives_in_processing_order() {
     observer.subscribe(ch("feed"), None).await.unwrap();
     let (producer, _) = producer(&engine).await;
     let (worker, mut assignments) = worker(&engine).await;
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(30), false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     producer.register(work("work")).await.unwrap();
     gate.release(1);
     let assignment = next_assignment(&mut assignments).await;
-    worker.complete(assignment.event.id, assignment.token(), vec![Envelope::dispatch(ch("feed"), 33, Bytes::new())]).await.unwrap();
+    worker.complete(assignment.event.id, WORKER, vec![Envelope::dispatch(ch("feed"), 33, Bytes::new())]).await.unwrap();
     // A round trip on another connection: the completion is applied before B
     // is. (Not on the observer: its answer would queue behind A.)
     let (barrier, _) = crate::support::observer(&engine).await;
@@ -119,7 +119,7 @@ async fn a_connection_that_does_not_read_is_cut_off_and_the_others_carry_on() {
 }
 
 /// What was waiting comes back in order after a restart; what was claimed
-/// stays claimed under its token, and the worker's completion is accepted:
+/// stays claimed under its worker uuid, and the worker's completion is accepted:
 /// nothing is assigned again, no failure is counted (2.4, M8-6).
 #[tokio::test]
 async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_workers_completion() {
@@ -136,7 +136,7 @@ async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_worke
             ids.push(id);
         }
         let (worker, mut assignments) = connect(&engine, hello.clone(), 64).await.unwrap();
-        let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+        let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
         worker.window(worker_join, 1, 0).await.unwrap();
         let assignment = next_assignment(&mut assignments).await;
         drop(worker);
@@ -149,9 +149,9 @@ async fn a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_worke
     let backlog = observer.subscribe(ch("work"), None).await.unwrap();
     assert_eq!(backlog.notices.iter().map(|notice| notice.id).collect::<Vec<_>>(), ids[1..], "the claimed one is not waiting");
     let (worker, mut assignments) = connect(&engine, hello, 64).await.unwrap();
-    let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
-    worker.extend(assignment.event.id, assignment.token()).await.unwrap();
-    let done = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+    let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+    worker.extend(assignment.event.id, WORKER).await.unwrap();
+    let done = worker.complete(assignment.event.id, WORKER, Vec::new()).await.unwrap();
     worker.committed(done).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let next = next_assignment(&mut assignments).await;
@@ -198,12 +198,12 @@ async fn checkpoints_let_empty_segments_go_and_the_log_restarts_from_what_is_lef
         let engine = Engine::start(config.clone(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let (worker, mut assignments) = worker(&engine).await;
-        let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+        let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
         worker.window(worker_join, 1, 0).await.unwrap();
         for _ in 0..200 {
             producer.register(work("work")).await.unwrap();
             let assignment = next_assignment(&mut assignments).await;
-            let seq = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+            let seq = worker.complete(assignment.event.id, WORKER, Vec::new()).await.unwrap();
             worker.committed(seq).await.unwrap();
         }
         producer.register_committed(work("kept")).await.unwrap();
@@ -323,19 +323,19 @@ async fn failures_are_counted_and_the_server_never_acts_on_them_across_a_restart
         let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let (worker, mut assignments) = worker(&engine).await;
-        let worker_join = worker.join(None, vec![1], Duration::from_secs(30), false).await.unwrap();
+        let worker_join = worker.join(WORKER, None, vec![1], Duration::from_secs(30), false).await.unwrap();
         worker.window(worker_join, 1, 0).await.unwrap();
         let (seq, id) = producer.register(work("request")).await.unwrap();
         producer.committed(seq).await.unwrap();
         for expected in 0..8u16 {
             let assignment = next_assignment(&mut assignments).await;
             assert_eq!((assignment.event.id, assignment.event.channel, assignment.event.failures), (id, ch("request"), expected), "back again, counted");
-            worker.release(id, assignment.token(), Duration::ZERO, true).await.unwrap();
+            worker.release(id, WORKER, Duration::ZERO, true).await.unwrap();
         }
         let back = next_assignment(&mut assignments).await;
         assert_eq!(back.event.failures, 8);
         worker.window(worker_join, 0, 0).await.unwrap();
-        worker.release(id, back.token(), Duration::ZERO, false).await.unwrap();
+        worker.release(id, WORKER, Duration::ZERO, false).await.unwrap();
         let (observer, _) = observer(&engine).await;
         let backlog = observer.subscribe(ch("request"), None).await.unwrap();
         assert!(backlog.notices.len() == 1 && backlog.notices[0].failures == 8, "waiting again, not set aside: {backlog:?}");
@@ -346,57 +346,53 @@ async fn failures_are_counted_and_the_server_never_acts_on_them_across_a_restart
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
     let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
     let (worker, mut assignments) = worker(&engine).await;
-    let worker_join = worker.join(None, vec![1], Duration::from_secs(30), false).await.unwrap();
+    let worker_join = worker.join(WORKER, None, vec![1], Duration::from_secs(30), false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     let assignment = next_assignment(&mut assignments).await;
     assert_eq!((assignment.event.id, assignment.event.failures), (id, 8), "the count came back from the journal");
-    let done = worker.complete(id, assignment.token(), Vec::new()).await.unwrap();
+    let done = worker.complete(id, WORKER, Vec::new()).await.unwrap();
     worker.committed(done).await.unwrap();
 }
 
-/// The claim mark names the worker: its work connection's producer id. A
-/// completion from another worker's connection is refused, before and after
-/// a restart; the claim and its worker come back from the journal, and the
-/// worker that holds it completes it.
+/// The claim names the worker by the uuid its claim request carried. A
+/// report naming another uuid matches no claim and is counted stale, before
+/// and after a restart; the claim and its worker uuid come back from the
+/// journal, and the worker that holds it completes it.
 #[tokio::test]
-async fn the_claim_mark_names_the_worker_and_only_that_worker_completes_across_a_restart() {
-    let path = scratch("claim-mark").join("journal");
-    let owner = Hello::worker("svc");
-    let owner_id = owner.producer.unwrap();
-    let (id, assignment) = {
+async fn the_claim_names_the_worker_uuid_and_only_that_uuid_completes_across_a_restart() {
+    let path = scratch("claim-worker").join("journal");
+    let id = {
         let (journal, recovered) = SegmentLog::open(&path).unwrap();
         let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let (seq, id) = producer.register(work("work")).await.unwrap();
         producer.committed(seq).await.unwrap();
-        let (worker, _) = connect(&engine, owner.clone(), 64).await.unwrap();
-        let assignment = worker.claim(id, Duration::from_secs(60)).await.unwrap();
-        let mark = assignment.event.claim.expect("a claim mark");
-        assert_eq!((mark.worker, mark.token, mark.lease_ms), (owner_id, assignment.token(), 60_000));
-        let (other, mut told) = worker_with_fault_inbox(&engine).await;
-        other.complete(id, assignment.token(), Vec::new()).await.unwrap();
-        assert!(matches!(next_event(&mut told).await, Some(Incoming::Fault { kind: ruvent::FaultKind::Forbidden, .. })), "another worker may not complete it");
-        assert_eq!(other.claim(id, Duration::from_secs(1)).await.err(), Some(Refusal::AlreadyClaimed), "still held");
-        drop((producer, worker, other));
+        let (worker, _) = worker(&engine).await;
+        let assignment = worker.claim(id, WORKER, Duration::from_secs(60)).await.unwrap();
+        assert_eq!((assignment.event.worker, assignment.lease_ms), (Some(WORKER), 60_000));
+        let (other, _) = crate::support::worker(&engine).await;
+        let (observer, _) = observer(&engine).await;
+        other.complete(id, OTHER, Vec::new()).await.unwrap();
+        let stats = observer.stats().await.unwrap();
+        assert_eq!((stats.claimed, stats.counters.stale), (1, 1), "another worker's uuid completes nothing");
+        assert_eq!(other.claim(id, OTHER, Duration::from_secs(1)).await.err(), Some(Refusal::AlreadyClaimed), "still held");
+        drop((producer, worker, other, observer));
         engine.shutdown().await.unwrap();
-        (id, assignment)
+        id
     };
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
     let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
-    let (other, mut told) = worker_with_fault_inbox(&engine).await;
-    other.complete(id, assignment.token(), Vec::new()).await.unwrap();
-    assert!(matches!(next_event(&mut told).await, Some(Incoming::Fault { kind: ruvent::FaultKind::Forbidden, .. })), "the restarted server still knows whose it is");
-    assert_eq!(other.claim(id, Duration::from_secs(1)).await.err(), Some(Refusal::AlreadyClaimed));
-    let (worker, _) = connect(&engine, owner, 64).await.unwrap();
-    worker.extend(id, assignment.token()).await.unwrap();
-    let done = worker.complete(id, assignment.token(), Vec::new()).await.unwrap();
-    worker.committed(done).await.unwrap();
     let (observer, _) = observer(&engine).await;
+    let (other, _) = worker(&engine).await;
+    other.release(id, OTHER, Duration::ZERO, true).await.unwrap();
+    let stats = observer.stats().await.unwrap();
+    assert_eq!((stats.claimed, stats.counters.stale), (1, 1), "the restarted server still knows whose it is");
+    assert_eq!(other.claim(id, OTHER, Duration::from_secs(1)).await.err(), Some(Refusal::AlreadyClaimed));
+    // A new connection of the same worker names the same uuid: it is that worker's claim.
+    let (worker, _) = worker(&engine).await;
+    worker.extend(id, WORKER).await.unwrap();
+    let done = worker.complete(id, WORKER, Vec::new()).await.unwrap();
+    worker.committed(done).await.unwrap();
     let stats = observer.stats().await.unwrap();
     assert_eq!((stats.waiting, stats.claimed), (0, 0), "completed by its worker");
-}
-
-/// A work connection of another worker (its own producer id), with its inbox.
-async fn worker_with_fault_inbox(engine: &Engine) -> (ruvent::Client, ruvent::Inbox) {
-    connect(engine, Hello::worker("svc"), 64).await.unwrap()
 }

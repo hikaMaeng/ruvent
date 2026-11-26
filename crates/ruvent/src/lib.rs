@@ -31,7 +31,7 @@ pub use bytes::Bytes;
 pub use engine::config::{Durability, EngineConfig, Grant, Grants, MemoryConfig, Method, ProducerConfig, StorageConfig};
 pub use engine::ops::{delete_outcome, Assignment, ByeReason, Call, Counters, DeleteFailure, FaultKind, Hello, IdleLane, Outbound, Pressure, Refusal, Role, SessionId, Stats, TypeStat, Welcome};
 pub use engine::{Closed, Engine, EngineError, Session};
-pub use envelope::{Channel, ClaimMark, ClaimToken, Digest, Envelope, EventId, Kind, ProducerId, WorkKey, SERVER_TYPE};
+pub use envelope::{Channel, Digest, Envelope, EventId, Kind, ProducerId, WorkKey, WorkerId, SERVER_TYPE};
 pub use journal::{
     Batch, Bodies, CheckpointHead, Checkpoints, Chores, End, Entry, Journal, Lane, Location, Part, Parts, ProducerEntry, Record, Recovered, Replay, SegmentLog, SegmentState, Source, Spool,
     SpoolWrite, Spooled, Standing, Volatile, Written,

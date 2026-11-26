@@ -1,6 +1,6 @@
 //! The event slots: a dense arena, an id index and slot generations.
 
-use crate::envelope::{Channel, ClaimMark, ClaimToken, Digest, Envelope, EventId, Kind, ProducerId, WorkKey};
+use crate::envelope::{Channel, Digest, Envelope, EventId, Kind, WorkKey, WorkerId};
 use crate::journal::Location;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -12,16 +12,16 @@ pub(super) type Index = u32;
 /// A join: (work connection, the `req` of its `Join`).
 pub(super) type JoinId = (crate::engine::ops::SessionId, u32);
 
-/// One attempt of a claimed event.
+/// The claim of a claimed event: who holds it and until when. (The event
+/// and the worker name it; there is no other token.)
 #[derive(Clone, Debug)]
 pub(super) struct Attempt {
-    pub token: ClaimToken,
     pub lease_ms: u64,
     /// Absolute uptime at which the lease runs out.
     pub until: u64,
-    /// The worker that holds it: its work connection's producer id (its
-    /// uuid). Completion, extension and release must come from it.
-    pub worker: ProducerId,
+    /// The uuid of the worker that claimed it, as its claim request said.
+    /// A completion, an extension or a failure report must name it.
+    pub worker: WorkerId,
     /// The join it counts against. `None` after its connection closed or a
     /// restart, until an `Extend` moves it to a join.
     pub join: Option<JoinId>,
@@ -103,7 +103,7 @@ impl Slot {
             failures: self.failures,
             key: Some(fixed.key),
             not_before: fixed.not_before,
-            claim: self.attempt().map(|attempt| ClaimMark { worker: attempt.worker, token: attempt.token, lease_ms: attempt.lease_ms }),
+            worker: self.attempt().map(|attempt| attempt.worker),
             payload: self.payload.clone(),
         }
     }

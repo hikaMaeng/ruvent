@@ -44,9 +44,9 @@ const TYPED: u32 = 10;
 /// Joins channels `a` and `b` (req 1, 2) and type 3 on every channel.
 fn join_all(h: &mut H, session: SessionId) {
     for (at, channel) in CHANNELS[..2].iter().enumerate() {
-        h.call(session, Call::Join { req: at as u32 + 1, channel: Some(ch(channel)), types: Vec::new(), lease_ms: 50, dispatch: false });
+        h.call(session, Call::Join { req: at as u32 + 1, worker: wid(session), channel: Some(ch(channel)), types: Vec::new(), lease_ms: 50, dispatch: false });
     }
-    h.call(session, Call::Join { req: TYPED, channel: None, types: vec![3], lease_ms: 50, dispatch: false });
+    h.call(session, Call::Join { req: TYPED, worker: wid(session), channel: None, types: vec![3], lease_ms: 50, dispatch: false });
 }
 
 fn check(state: &State) -> Result<(), TestCaseError> {
@@ -70,15 +70,15 @@ fn check(state: &State) -> Result<(), TestCaseError> {
             Place::Waiting => waiting += 1,
             Place::Delayed { .. } => {}
             Place::Claimed(attempt) => {
-                prop_assert!(attempt.worker == [2; 16] || attempt.worker == [3; 16], "an attempt names the worker that took it");
+                prop_assert!(attempt.worker == wid(W1) || attempt.worker == wid(W2), "an attempt names the worker that took it");
                 if let Some(join) = &attempt.join {
                     let entry = joins.entry(*join).or_default();
                     entry.0 += 1;
                     entry.1 += slot.len();
                     prop_assert!(state.joins.get(join).is_some_and(|found| found.attempts.contains(&index)));
-                    prop_assert_eq!(state.worker_of(join.0), Some(attempt.worker), "an attempt counts against a join of its own worker");
+                    prop_assert_eq!(state.joins.get(join).map(|found| found.worker), Some(attempt.worker), "an attempt counts against a join of its own worker");
                 }
-                prop_assert_eq!(slot.envelope().claim.map(|claim| claim.worker), Some(attempt.worker), "the claim mark is the attempt's");
+                prop_assert_eq!(slot.envelope().worker, Some(attempt.worker), "the envelope's worker is the claim's");
             }
         }
         prop_assert_eq!(state.slots.by_id(&slot.fixed.id), Some(index));
@@ -103,7 +103,7 @@ proptest! {
         }
         let mut ids: Vec<EventId> = Vec::new();
         for step in steps {
-            let attempt = |h: &H, at: u8| ids.get(at as usize).and_then(|id| h.slot(*id).and_then(|slot| slot.attempt().map(|attempt| (*id, attempt.token, attempt.join))));
+            let attempt = |h: &H, at: u8| ids.get(at as usize).and_then(|id| h.slot(*id).and_then(|slot| slot.attempt().map(|attempt| (*id, attempt.worker, attempt.join))));
             match step {
                 Step::Register(channel) => {
                     let event = Envelope::claimable(ch(CHANNELS[channel as usize]), TYPES[channel as usize], Bytes::from_static(b"p")).with_id(EventId::new_v7());
@@ -116,21 +116,22 @@ proptest! {
                     }
                 }
                 Step::Complete(at, follow) => {
-                    if let Some((id, token, join)) = attempt(&h, at) {
+                    if let Some((id, worker, join)) = attempt(&h, at) {
                         let session = join.map_or(W1, |join| join.0);
                         let follow_ups = if follow { vec![work("a"), Envelope::dispatch(ch("feed"), 10, Bytes::new())] } else { Vec::new() };
                         let seq = h.next_seq(session);
-                        h.call(session, Call::Complete { seq, id, token, follow_ups, spooled: Vec::new() });
+                        h.call(session, Call::Complete { seq, id, worker, follow_ups, spooled: Vec::new() });
                     }
                 }
                 Step::Release(at, failed, delay) => {
-                    if let Some((id, token, join)) = attempt(&h, at) {
-                        h.call(join.map_or(W1, |join| join.0), Call::Release { id, token, delay_ms: delay, failed });
+                    if let Some((id, worker, join)) = attempt(&h, at) {
+                        h.call(join.map_or(W1, |join| join.0), Call::Release { id, worker, delay_ms: delay, failed });
                     }
                 }
                 Step::Extend(at) => {
-                    if let Some((id, token, _)) = attempt(&h, at) {
-                        h.call(W2, Call::Extend { id, token });
+                    // W2's uuid: matches only when W2 holds it (otherwise stale).
+                    if let Some((id, _, _)) = attempt(&h, at) {
+                        h.call(W2, Call::Extend { id, worker: wid(W2) });
                     }
                 }
                 Step::Delete(at) => {
@@ -141,12 +142,12 @@ proptest! {
                 }
                 Step::Claim(at) => {
                     if let Some(id) = ids.get(at as usize).copied() {
-                        h.call(W1, Call::Claim { req: 2, id, lease_ms: 30 });
+                        h.call(W1, Call::Claim { req: 2, worker: wid(W1), id, lease_ms: 30 });
                     }
                 }
                 Step::Close(worker) => {
                     let session = workers[worker as usize];
-                    let unwritten: Vec<ClaimToken> = h.s.slots.iter().filter_map(|(_, slot)| slot.attempt().filter(|attempt| attempt.join.as_ref().is_some_and(|join| join.0 == session)).map(|attempt| attempt.token)).step_by(2).collect();
+                    let unwritten: Vec<EventId> = h.s.slots.iter().filter_map(|(_, slot)| slot.attempt().filter(|attempt| attempt.join.as_ref().is_some_and(|join| join.0 == session)).map(|_| slot.fixed.id)).step_by(2).collect();
                     h.close(session, &unwritten);
                     h.open(session, hello(Role::Work, session as u8));
                     join_all(&mut h, session);

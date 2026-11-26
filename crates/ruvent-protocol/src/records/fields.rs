@@ -4,7 +4,7 @@ use crate::error::ProtocolError;
 use crate::io::HEADER;
 use bytes::{BufMut, BytesMut};
 use ruvent::envelope::codec::{self, Malformed, Reader};
-use ruvent::{Channel, ClaimToken, WorkKey};
+use ruvent::{Channel, WorkKey, WorkerId};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -41,9 +41,8 @@ pub(crate) fn put_text(out: &mut impl BufMut, text: &str) {
     out.put_slice(text.as_bytes());
 }
 
-pub(crate) fn put_token(out: &mut impl BufMut, token: ClaimToken) {
-    put_varint(out, u64::from(token.generation));
-    put_varint(out, token.seq);
+pub(crate) fn put_worker(out: &mut impl BufMut, worker: &WorkerId) {
+    out.put_slice(worker);
 }
 
 pub(crate) fn put_key(out: &mut impl BufMut, key: Option<WorkKey>) {
@@ -79,8 +78,8 @@ pub(crate) fn varint32(reader: &mut Reader<'_>) -> Result<u32, ProtocolError> {
     Ok(reader.varint32()?)
 }
 
-pub(crate) fn token(reader: &mut Reader<'_>) -> Result<ClaimToken, ProtocolError> {
-    Ok(ClaimToken { generation: reader.varint32()?, seq: reader.varint()? })
+pub(crate) fn worker(reader: &mut Reader<'_>) -> Result<WorkerId, ProtocolError> {
+    Ok(reader.id()?.0)
 }
 
 pub(crate) fn key(reader: &mut Reader<'_>) -> Result<Option<WorkKey>, ProtocolError> {

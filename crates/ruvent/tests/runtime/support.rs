@@ -1,6 +1,6 @@
 //! Journals that can be held, failed or watched, and small helpers.
 
-use ruvent::{async_trait, connect, Batch, Bytes, Channel, Client, Engine, Envelope, Hello, Inbox, Incoming, Journal, Written};
+use ruvent::{async_trait, connect, Batch, Bytes, Channel, Client, Engine, Envelope, Hello, Inbox, Incoming, Journal, WorkerId, Written};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -86,6 +86,12 @@ pub async fn worker(engine: &Engine) -> (Client, Inbox) {
 pub async fn observer(engine: &Engine) -> (Client, Inbox) {
     connect(engine, Hello::observer("svc"), 64).await.unwrap()
 }
+
+/// Each test worker's uuid: what its claims name (never nil).
+pub const WORKER: WorkerId = [0x5A; 16];
+pub const OTHER: WorkerId = [0x5B; 16];
+pub const CLAIMER: WorkerId = [0x5C; 16];
+pub const TAKER: WorkerId = [0x5D; 16];
 
 /// How long "nothing arrives" is watched for. Only for asserting absence.
 pub const QUIET: Duration = Duration::from_millis(80);

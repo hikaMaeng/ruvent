@@ -1,0 +1,58 @@
+cargo xtask verify — 개편 계획 v5.1(착수 = (이벤트 id, 워커 uuid), 착수 표지·착수 마크 제거, wire v6, 저널 형식 7) 구현 뒤 (2026-11-26)
+host: MINGW64_NT-10.0-26300 / rustc 1.96.0 / HEAD fa50dc2 + 작업 트리
+
+── format : cargo fmt --all -- --check
+gate name=format status=ok seconds=0.7
+── lint : cargo clippy --workspace --all-targets -- -D warnings
+gate name=lint status=ok seconds=6.9
+── api docs : cargo doc --workspace --no-deps
+gate name=api docs status=ok seconds=9.9
+── static : cargo test -p ruvent --test static
+     Running tests\static\main.rs (target\debug\deps\static-59f4426eaba09e81.exe)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+gate name=static status=ok seconds=5.4
+── state machine : cargo test -p ruvent --lib
+     Running unittests src\lib.rs (target\debug\deps\ruvent-982b375ed5451917.exe)
+test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+gate name=state machine status=ok seconds=5.2
+── runtime : cargo test -p ruvent --test runtime
+     Running tests\runtime\main.rs (target\debug\deps\runtime-56c6872cfc85e560.exe)
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+gate name=runtime status=ok seconds=3.7
+── acceptance : cargo test -p ruvent --test acceptance
+     Running tests\acceptance\main.rs (target\debug\deps\acceptance-95a8dd94e1a3a1d3.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+gate name=acceptance status=ok seconds=2.3
+── protocol : cargo test -p ruvent-protocol
+     Running unittests src\lib.rs (target\debug\deps\ruvent_protocol-ef52b805e85bfb6f.exe)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+gate name=protocol status=ok seconds=5.8
+── server : cargo test -p ruvent-server
+     Running unittests src\lib.rs (target\debug\deps\ruvent_server-93db782ff70e3483.exe)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src\main.rs (target\debug\deps\ruvent_server-2ada7a991a7f5556.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\remote.rs (target\debug\deps\remote-c279b371caf9be17.exe)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.67s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+gate name=server status=ok seconds=10.0
+── client and workers : cargo test -p ruvent-client
+     Running unittests src\lib.rs (target\debug\deps\ruvent_client-8651047267568059.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\producer.rs (target\debug\deps\producer-621ac70d6595fa11.exe)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+     Running tests\worker.rs (target\debug\deps\worker-45ba198332b56cbc.exe)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.96s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+gate name=client and workers status=ok seconds=13.4
+── proxy : cargo test -p ruvent-proxy
+     Running unittests src\lib.rs (target\debug\deps\ruvent_proxy-ee13b264c5f449a9.exe)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\acceptance.rs (target\debug\deps\acceptance-202834bf8407012f.exe)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\fanout.rs (target\debug\deps\fanout-58faac5cbbc6e0a1.exe)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+gate name=proxy status=ok seconds=9.9
+verify status=ok

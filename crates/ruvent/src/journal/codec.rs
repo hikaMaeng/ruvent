@@ -1,4 +1,4 @@
-//! Journal format 6 in a segment: the frames of the log lane, and the pieces
+//! Journal format 7 in a segment: the frames of the log lane, and the pieces
 //! the checkpoint file shares with them.
 //!
 //! ```text
@@ -12,7 +12,7 @@
 //! item = [tag u8] then
 //!    1 Register      head, body length v, body
 //!    2 Body          length v, body
-//!    3 Claim         key, token generation v, token seq v, lease ms v, worker 16
+//!    3 Claim         key, lease ms v, worker 16
 //!    4 Remove        key
 //!    5 Reclaim       key, failures v
 //!    6 Release       key, failures v, visible u8 (0 none, 1 then uptime v)
@@ -41,7 +41,7 @@
 
 use super::{Batch, Lane, Location, Record, Replay};
 use crate::envelope::codec::{self as body, put_varint, Layout, Malformed, Reader};
-use crate::envelope::{ClaimToken, Envelope, ProducerId, WorkKey};
+use crate::envelope::{Envelope, ProducerId, WorkKey};
 use bytes::{BufMut, Bytes};
 use crc32fast::Hasher;
 use std::collections::{HashMap, HashSet};
@@ -52,7 +52,7 @@ pub const HEADER: u64 = 8;
 /// A frame appended to the log lane.
 pub const APPEND: u8 = 1;
 /// `"rvseg\0"`, the format, then the lane.
-pub const SEGMENT_MAGIC: &[u8; 7] = b"rvseg\0\x06";
+pub const SEGMENT_MAGIC: &[u8; 7] = b"rvseg\0\x07";
 /// Magic + lane + number + first serial.
 pub const SEGMENT_HEADER: u64 = 20;
 
@@ -171,7 +171,7 @@ pub fn put_location(out: &mut Vec<u8>, at: &Location) {
 /// The envelope's head in the journal layout, without the payload: its
 /// trailing payload length (always zero here) is left out.
 pub fn put_head(event: &Envelope, out: &mut Vec<u8>) -> io::Result<()> {
-    let bare = Envelope { payload: Bytes::new(), claim: None, ..event.clone() };
+    let bare = Envelope { payload: Bytes::new(), worker: None, ..event.clone() };
     let mut head = Vec::with_capacity(64);
     body::encode(&bare, Layout::Journal, &mut head).map_err(|error| invalid(error.to_string()))?;
     head.truncate(head.len().saturating_sub(4));
@@ -229,14 +229,12 @@ pub fn encode_frame(batch: &Batch, dictionary: &mut Dictionary, known: &mut Hash
                 put_varint(&mut out.bytes, payload.len() as u64);
                 out.body(payload);
             }
-            Record::Claim { key, token, lease_ms, worker } => {
+            Record::Claim { key, lease_ms, worker } => {
                 if removed.get(key).is_some_and(|removal| *removal > at) {
                     out.bytes.put_u8(GAP);
                 } else {
                     out.bytes.put_u8(CLAIM);
                     put_key(&mut out.bytes, *key);
-                    put_varint(&mut out.bytes, u64::from(token.generation));
-                    put_varint(&mut out.bytes, token.seq);
                     put_varint(&mut out.bytes, *lease_ms);
                     out.bytes.put_slice(worker);
                 }
@@ -620,10 +618,9 @@ fn decode_items<R: Read>(stream: &mut Stream<R>, segment: u32, _defined: &mut De
             }
             CLAIM => {
                 let key = stream.key()?;
-                let token = ClaimToken { generation: stream.varint32()?, seq: stream.varint()? };
                 let lease_ms = stream.varint()?;
                 let worker = stream.id16()?;
-                Some(Record::Claim { key, token, lease_ms, worker })
+                Some(Record::Claim { key, lease_ms, worker })
             }
             REMOVE => Some(Record::Remove(stream.key()?)),
             RECLAIM => Some(Record::Reclaim { key: stream.key()?, failures: stream.failures()? }),

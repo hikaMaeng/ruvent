@@ -29,7 +29,7 @@ pub mod ops;
 pub mod state;
 mod storage;
 
-use crate::envelope::ClaimToken;
+use crate::envelope::EventId as Unwritten;
 use crate::journal::{Batch, Journal, Record, Recovered, Spool, Written};
 use crate::snapshot::{Collector, SnapshotStats};
 use bytes::Bytes;
@@ -71,7 +71,7 @@ impl std::error::Error for Closed {}
 
 pub(crate) enum Op {
     Open { session: SessionId, hello: Hello, out: mpsc::Sender<Outbound> },
-    Close { session: SessionId, unwritten: Vec<ClaimToken> },
+    Close { session: SessionId, unwritten: Vec<Unwritten> },
     Call { session: SessionId, call: Call },
     Drain,
     Shutdown { done: oneshot::Sender<()> },
@@ -122,12 +122,12 @@ impl Session {
         self.ops.send(Op::Call { session: self.id, call }).await.map_err(|_| Closed)
     }
 
-    /// Closes the connection. `unwritten` are the tokens of assignments the
+    /// Closes the connection. `unwritten` are the event ids of assignments the
     /// connection owner had not finished writing to the socket: they go back
     /// to waiting at once (2.4). Assignments the engine still held for the
     /// connection (waiting for the disk or a payload read) count as unwritten
     /// on their own.
-    pub async fn close(mut self, unwritten: Vec<ClaimToken>) {
+    pub async fn close(mut self, unwritten: Vec<Unwritten>) {
         self.closed = true;
         let _ = self.ops.send(Op::Close { session: self.id, unwritten }).await;
     }
@@ -422,11 +422,11 @@ struct Conn {
     out: mpsc::Sender<Outbound>,
 }
 
-/// The tokens of the assignments in held sends: never written to the socket.
-fn tokens(held: VecDeque<Held>) -> Vec<ClaimToken> {
+/// The event ids of the assignments in held sends: never written to the socket.
+fn unwritten(held: VecDeque<Held>) -> Vec<Unwritten> {
     held.into_iter()
         .filter_map(|held| match held.message {
-            Some(Outbound::Assign(assignment)) | Some(Outbound::Claimed { assignment, .. }) => Some(assignment.token()),
+            Some(Outbound::Assign(assignment)) | Some(Outbound::Claimed { assignment, .. }) => Some(assignment.event.id),
             _ => None,
         })
         .collect()
@@ -608,11 +608,11 @@ impl Core {
         self.route(effects);
     }
 
-    /// Drops a connection's ends and held sends; returns the tokens of the
+    /// Drops a connection's ends and held sends; returns the event ids of the
     /// assignments it never got.
-    fn forget(&mut self, session: SessionId) -> Vec<ClaimToken> {
+    fn forget(&mut self, session: SessionId) -> Vec<Unwritten> {
         self.conns.remove(&session);
-        self.held.remove(&session).map(tokens).unwrap_or_default()
+        self.held.remove(&session).map(unwritten).unwrap_or_default()
     }
 
     /// Hands one message to a connection without waiting. A full or closed

@@ -5,14 +5,13 @@
 //! completion or a deletion costs nothing here.
 
 use super::slots::Index;
-use crate::envelope::ClaimToken;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Due {
-    /// The lease of this attempt runs out.
-    Lease(ClaimToken),
+    /// A lease runs out (checked against the claim's own end when due).
+    Lease,
     /// A delayed event becomes visible.
     Visible,
 }

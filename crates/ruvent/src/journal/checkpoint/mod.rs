@@ -10,7 +10,7 @@
 //!    3 Producer  number v, producer id 16, seq v
 //!    4 Entry     head, serial v, standing, location?
 //!    5 End       entries v, producers v
-//! standing = 0 waiting | 1 delayed, until v | 2 claimed, token generation v, token seq v, lease ms v, worker 16
+//! standing = 0 waiting | 1 delayed, until v | 2 claimed, lease ms v, worker 16
 //! location? = 0 | 1 location (as in a segment)
 //! ```
 //!
@@ -23,14 +23,13 @@ use super::codec::{invalid, put_head, put_location, Cut, Stream, HEADER};
 use super::segment::{sync_directory, CHECKPOINT, CHECKPOINT_TEMP};
 use super::{CheckpointHead, Checkpoints, Entry, Part, ProducerEntry, Replay, Standing};
 use crate::envelope::codec::put_varint;
-use crate::envelope::ClaimToken;
 use bytes::BufMut;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"rvckpt\0\x06";
+const MAGIC: &[u8; 8] = b"rvckpt\0\x07";
 const HEAD: u8 = 1;
 const PRODUCER: u8 = 3;
 const ENTRY: u8 = 4;
@@ -79,10 +78,8 @@ impl CheckpointFile {
                 out.put_u8(1);
                 put_varint(out, *until);
             }
-            Standing::Claimed { token, lease_ms, worker } => {
+            Standing::Claimed { lease_ms, worker } => {
                 out.put_u8(2);
-                put_varint(out, u64::from(token.generation));
-                put_varint(out, token.seq);
                 put_varint(out, *lease_ms);
                 out.put_slice(worker);
             }
@@ -187,7 +184,7 @@ impl CheckpointReader {
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic).map_err(|_| damaged(&path, "shorter than its header"))?;
         if &magic != MAGIC {
-            return Err(invalid(format!("{}: not a ruvent checkpoint of format 6 (format 5 and older are refused, not migrated); it was left untouched", path.display())));
+            return Err(invalid(format!("{}: not a ruvent checkpoint of format 7 (format 6 and older are refused, not migrated); it was left untouched", path.display())));
         }
         Ok(CheckpointReader { path, file: BufReader::new(file), left: left - 8, buffered: VecDeque::new(), counted: (0, 0), ended: false })
     }
@@ -240,10 +237,7 @@ impl CheckpointReader {
                     let standing = match stream.u8()? {
                         0 => Standing::Waiting,
                         1 => Standing::Delayed { until: stream.varint()? },
-                        2 => {
-                            let token = ClaimToken { generation: stream.varint32()?, seq: stream.varint()? };
-                            Standing::Claimed { token, lease_ms: stream.varint()?, worker: stream.id16()? }
-                        }
+                        2 => Standing::Claimed { lease_ms: stream.varint()?, worker: stream.id16()? },
                         _ => return Err(Cut::Malformed("unknown standing")),
                     };
                     let at = match stream.u8()? {

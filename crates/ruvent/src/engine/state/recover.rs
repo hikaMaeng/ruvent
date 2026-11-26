@@ -45,7 +45,7 @@ impl State {
     /// generation.
     ///
     /// The clock carries on from where the log ended. A claimed event stays
-    /// claimed (2.4): its token, lease length and worker come back, the
+    /// claimed (2.4): its worker and lease length come back, the
     /// lease is re-armed at its full length from now, and its failure count
     /// does not change — a restart is not a closed connection. `not_before`
     /// is absolute and keeps its remaining time.
@@ -100,7 +100,7 @@ impl State {
                 let place = match standing {
                     Standing::Waiting => Place::Waiting,
                     Standing::Delayed { until } => Place::Delayed { until },
-                    Standing::Claimed { token, lease_ms, worker } => Place::Claimed(Attempt { token, lease_ms, until: 0, worker, join: None }),
+                    Standing::Claimed { lease_ms, worker } => Place::Claimed(Attempt { lease_ms, until: 0, worker, join: None }),
                 };
                 let key = event.key;
                 if let (Some(key), Some(index)) = (key, self.rebuild(event, at, serial, place)) {
@@ -139,9 +139,9 @@ impl State {
                 }
             }
             Record::Body { .. } => {}
-            Record::Claim { key, token, lease_ms, worker } => {
+            Record::Claim { key, lease_ms, worker } => {
                 if let Some(slot) = newer(self, &key).and_then(|index| self.slots.get_mut(index)) {
-                    slot.place = Place::Claimed(Attempt { token, lease_ms, until: 0, worker, join: None });
+                    slot.place = Place::Claimed(Attempt { lease_ms, until: 0, worker, join: None });
                     slot.serial = serial;
                 }
             }
@@ -193,7 +193,6 @@ impl State {
         self.serial = end.serial;
         self.generation = replayer.generation.checked_add(1).ok_or("the generation counter is exhausted; the server cannot start")?;
         self.arrival = 0;
-        self.claim_seq = 0;
 
         let indices: Vec<Index> = replayer.keys.into_values().collect();
         for index in indices {
@@ -207,7 +206,7 @@ impl State {
             let due = match &mut slot.place {
                 Place::Claimed(attempt) => {
                     attempt.until = uptime.saturating_add(attempt.lease_ms);
-                    Some((attempt.until, Due::Lease(attempt.token)))
+                    Some((attempt.until, Due::Lease))
                 }
                 Place::Delayed { until } => Some((*until, Due::Visible)),
                 Place::Waiting => None,

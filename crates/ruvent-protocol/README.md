@@ -1,6 +1,6 @@
 # ruvent-protocol
 
-이벤트 서버와 접속자 사이의 이진 와이어 형식, wire v5(계획 2.2, 2.11, 9.14, 9.15)다. v4와는 엔벨롭에 이름과 정책 필드(`principal`, `delegate`, `expires`, `group`, 격리 비트)가 없고 배정의 착수 마크(워커 uuid, 표지, lease)가 엔벨롭에 든 것, 그래서 이름 사전(`NameDef`, `DictReset`)이 없어진 것, `Paused`·`Resumed`와 `Hello`의 타입 선언과 `Join`의 격리 여부가 없어진 것이 다르다. v4 이하 상대는 `Hello`에서 거절한다. 서버([`ruvent-server`](../ruvent-server/README.md))와
+이벤트 서버와 접속자 사이의 이진 와이어 형식, wire v6(계획 2.2, 2.11, 9.14, 9.15, 9.16)다. v5와는 착수 표지가 없고 착수를 (이벤트 id, 워커 uuid)로 이름 짓는 것이 다르다: `Join`·`Claim`이 워커 uuid를 싣고, `Complete`·`Extend`·`Release`가 이벤트 id와 워커 uuid를 싣고, 배정은 엔벨롭에 워커 uuid만 싣고 lease 길이를 머리에 싣는다. v5는 v4와 엔벨롭에 이름과 정책 필드(`principal`, `delegate`, `expires`, `group`, 격리 비트)가 없고 배정의 착수 마크(워커 uuid, 표지, lease)가 엔벨롭에 든 것, 그래서 이름 사전(`NameDef`, `DictReset`)이 없어진 것, `Paused`·`Resumed`와 `Hello`의 타입 선언과 `Join`의 격리 여부가 없어진 것이 다르다. v5 이하 상대는 `Hello`에서 거절한다. 서버([`ruvent-server`](../ruvent-server/README.md))와
 원격 연결([`ruvent-client`](../ruvent-client/README.md)의 `remote`)이 함께 쓴다. 이벤트의 머리는
 `ruvent::envelope::codec`의 레이아웃에서 본문 블록을 뺀 것이다(`encode_head`).
 

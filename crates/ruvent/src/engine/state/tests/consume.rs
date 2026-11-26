@@ -1,4 +1,4 @@
-//! Joins, windows, assignment and its claim mark, leases, release, failure counts, explicit claims (2.4).
+//! Joins, windows, assignment and the worker uuid it is claimed under, leases, release, failure counts, explicit claims (2.4).
 
 use super::*;
 
@@ -21,24 +21,22 @@ fn a_window_receives_assignments_round_robin_in_join_order() {
 }
 
 /// Assignment, claim and delivery are one step: the payload goes with it,
-/// and the envelope carries the claim mark — the worker's uuid (its work
-/// connection's producer id), the token and the lease (plan 9.15).
+/// and the envelope carries the uuid of the worker that claimed it — its
+/// presence is the claim; there is no token (plan 9.15).
 #[test]
-fn an_assignment_carries_the_whole_event_and_its_claim_mark() {
+fn an_assignment_carries_the_whole_event_and_the_worker_uuid() {
     let mut h = H::volatile().cast();
     h.join(W1, "work", 1);
     h.now = 5_000;
     let effects = h.produce(P, work("work").with_id(id(7)));
     let [assignment] = assigned(&effects, W1).try_into().unwrap();
     assert_eq!((assignment.event.id, assignment.event.payload.as_ref()), (id(7), &b"p"[..]));
-    assert_eq!((assignment.lease_ms(), assignment.until), (30_000, 35_000), "the lease runs from the assignment");
-    let claim = assignment.event.claim.expect("an assignment carries its claim mark");
-    assert_eq!(claim.worker, [2; 16], "the worker's uuid is W1's producer id");
-    assert_eq!((claim.token, claim.lease_ms), (assignment.token(), 30_000));
+    assert_eq!((assignment.lease_ms, assignment.until), (30_000, 35_000), "the lease runs from the assignment");
+    assert_eq!(assignment.event.worker, Some(wid(W1)), "the worker uuid its join named");
     let attempt = h.slot(id(7)).unwrap().attempt().unwrap().clone();
-    assert_eq!((attempt.worker, attempt.token), (claim.worker, claim.token), "the ledger holds the same mark");
+    assert_eq!((attempt.worker, attempt.lease_ms), (wid(W1), 30_000), "the ledger holds the same worker");
     assert!(assignment.event.key.is_some());
-    assert!(h.slot(id(7)).unwrap().envelope().notice().claim.is_none(), "a notice carries no claim mark");
+    assert!(h.slot(id(7)).unwrap().envelope().notice().worker.is_none(), "a notice carries no worker");
 }
 
 /// The server counts failures and acts on no count: what to do after so
@@ -46,7 +44,7 @@ fn an_assignment_carries_the_whole_event_and_its_claim_mark() {
 #[test]
 fn failures_keep_counting_and_the_server_never_acts_on_them() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
     h.call(W1, Call::Window { join: 1, count: 1, bytes: 0 });
     h.produce(P, work("work").with_id(id(1)));
     for round in 1..=7u16 {
@@ -58,8 +56,8 @@ fn failures_keep_counting_and_the_server_never_acts_on_them() {
     assert_eq!((slot.failures, slot.channel, slot.fixed.event_type), (7, ch("work"), 1), "seven reclaims, the same event where it was");
     let assignment = assigned(&h.advance(0), W1);
     assert!(assignment.is_empty() || assignment[0].event.failures == 7);
-    let attempt = h.slot(id(1)).unwrap().attempt().cloned().expect("still assigned like any other event");
-    let released = h.call(W1, Call::Release { id: id(1), token: attempt.token, delay_ms: 0, failed: true });
+    h.slot(id(1)).unwrap().attempt().expect("still assigned like any other event");
+    let released = h.call(W1, Call::Release { id: id(1), worker: wid(W1), delay_ms: 0, failed: true });
     assert!(faults(&released, W1).is_empty());
     assert_eq!(h.slot(id(1)).unwrap().failures, 8, "a failed release counts one more");
     assert!(h.slot(id(1)).is_some(), "nothing removes it but a completion or a deletion");
@@ -68,7 +66,7 @@ fn failures_keep_counting_and_the_server_never_acts_on_them() {
 #[test]
 fn types_are_lanes_and_an_unsupported_type_does_not_block_the_rest() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: vec![20], lease_ms: 1000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: vec![20], lease_ms: 1000, dispatch: false });
     h.call(W1, Call::Window { join: 1, count: 5, bytes: 0 });
     h.produce(P, Envelope::claimable(ch("work"), 37, Bytes::new()).with_id(id(1)));
     let effects = h.produce(P, Envelope::claimable(ch("work"), 20, Bytes::new()).with_id(id(2)));
@@ -81,7 +79,7 @@ fn types_are_lanes_and_an_unsupported_type_does_not_block_the_rest() {
 #[test]
 fn a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
     for byte in 1..=3 {
         h.produce(P, work("work").with_id(id(byte)));
     }
@@ -94,7 +92,7 @@ fn a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window() 
     assert_eq!(sent(&again, W1), [Outbound::Pending { join: 1 }], "said while full with work waiting");
     let second = h.produce(P, work("work").with_id(id(5)));
     assert!(sent(&second, W1).is_empty(), "at most one per window");
-    h.call(W1, Call::Join { req: 2, channel: Some(ch("late")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    h.call(W1, Call::Join { req: 2, worker: wid(W1), channel: Some(ch("late")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
     h.produce(P, work("late").with_id(id(6)));
     let zero = h.call(W1, Call::Window { join: 2, count: 0, bytes: 0 });
     assert_eq!(sent(&zero, W1), [Outbound::Pending { join: 2 }], "a window of 0 said after the work arrived hears it");
@@ -103,7 +101,7 @@ fn a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window() 
 #[test]
 fn a_window_of_zero_refuses_and_a_join_holding_nothing_takes_one_event_over_its_byte_bound() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
     let big = Envelope::claimable(ch("work"), 1, Bytes::from(vec![0; 100]));
     let none = h.produce(P, big.clone().with_id(id(1)));
     assert!(assigned(&none, W1).is_empty(), "no window, no work");
@@ -114,13 +112,14 @@ fn a_window_of_zero_refuses_and_a_join_holding_nothing_takes_one_event_over_its_
 }
 
 /// The lease runs from the assignment; when it runs out the event waits again
-/// with one more failure, the same id and a new token, and the window closes (2.4).
+/// with one more failure and the same id, unclaimed, and the window closes (2.4).
 #[test]
 fn a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
     h.call(W1, Call::Window { join: 1, count: 1, bytes: 0 });
     let first = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
+    assert_eq!(first.event.worker, Some(wid(W1)));
     assert_eq!(h.s.next_due(), Some(1000), "the wheel wakes at the lease end");
     h.advance(999);
     assert!(h.slot(id(1)).unwrap().attempt().is_some());
@@ -130,7 +129,7 @@ fn a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window() {
     assert_eq!(h.s.joins[&(W1, 1)].count, 0, "the window is closed");
     let again = assigned(&h.join(W2, "work", 1), W2);
     assert_eq!(again[0].event.id, id(1));
-    assert!(again[0].token() > first.token(), "a new attempt, a new token");
+    assert_eq!(again[0].event.worker, Some(wid(W2)), "claimed again, under the new worker's uuid");
     assert_eq!(again[0].event.failures, 1);
 }
 
@@ -138,7 +137,7 @@ fn a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window() {
 #[test]
 fn a_late_completion_before_the_reclaim_is_accepted_and_after_it_is_dropped() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
     h.call(W1, Call::Window { join: 1, count: 2, bytes: 0 });
     let first = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let second = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
@@ -152,24 +151,26 @@ fn a_late_completion_before_the_reclaim_is_accepted_and_after_it_is_dropped() {
     assert_eq!(h.s.counters.stale, 1);
 }
 
-/// The claim mark names the worker: another worker with the right token —
-/// under the same credential — may not complete, extend or release (plan 9.15).
+/// A claim is the event and the worker uuid, and both must match: a report
+/// naming the event with another worker's uuid — under the same credential —
+/// matches no claim. It is counted stale and changes nothing (plan 9.15).
 #[test]
-fn another_worker_with_the_right_token_may_not_complete_extend_or_release() {
+fn a_report_naming_another_worker_is_stale_and_changes_nothing() {
     let mut h = H::volatile().cast();
     h.join(W1, "work", 1);
     let assignment = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let before = h.slot(id(1)).unwrap().attempt().unwrap().clone();
     let seq = h.next_seq(W2);
-    let completed = h.call(W2, Call::Complete { seq, id: id(1), token: assignment.token(), follow_ups: Vec::new(), spooled: Vec::new() });
-    assert_eq!(faults(&completed, W2), [FaultKind::Forbidden], "W2 shares W1's credential but not its uuid");
+    let completed = h.call(W2, Call::Complete { seq, id: id(1), worker: wid(W2), follow_ups: Vec::new(), spooled: Vec::new() });
+    assert!(faults(&completed, W2).is_empty(), "late or stale: counted, not told");
     h.now = 5_000;
-    h.call(W2, Call::Extend { id: id(1), token: assignment.token() });
-    h.call(W2, Call::Release { id: id(1), token: assignment.token(), delay_ms: 0, failed: true });
+    h.call(W2, Call::Extend { id: id(1), worker: wid(W2) });
+    h.call(W2, Call::Release { id: id(1), worker: wid(W2), delay_ms: 0, failed: true });
     let after = h.slot(id(1)).expect("still held");
     let attempt = after.attempt().expect("still W1's attempt");
-    assert_eq!((attempt.worker, attempt.token, attempt.until), (before.worker, before.token, before.until), "neither extended nor released");
+    assert_eq!((attempt.worker, attempt.until), (before.worker, before.until), "neither extended nor released");
     assert_eq!(after.failures, 0);
+    assert_eq!(h.s.counters.stale, 3, "the completion, the extension and the release");
     let done = h.complete(W1, &assignment, Vec::new());
     assert!(faults(&done, W1).is_empty());
     assert!(h.slot(id(1)).is_none(), "its own worker completes it");
@@ -184,7 +185,7 @@ fn a_closed_connection_returns_unwritten_assignments_at_once_and_pulls_written_o
     let unwritten = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let written = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
     h.now = 100;
-    h.close(W1, &[unwritten.token()]);
+    h.close(W1, &[unwritten.event.id]);
     let back = h.slot(id(1)).unwrap();
     assert!(matches!(back.place, Place::Waiting) && back.failures == 0, "back at once, failure count unchanged");
     let pulled = h.slot(id(2)).unwrap().attempt().unwrap().until;
@@ -194,17 +195,18 @@ fn a_closed_connection_returns_unwritten_assignments_at_once_and_pulls_written_o
     assert!(h.slot(id(2)).unwrap().attempt().is_none(), "due at the grace");
 }
 
-/// `Extend` re-arms the lease and moves the attempt to the extending connection's join (2.4).
+/// `Extend` re-arms the lease and moves the attempt to the extending
+/// connection's join of the same worker uuid (2.4).
 #[test]
 fn extend_moves_the_attempt_to_the_extending_connections_join() {
     let mut h = H::volatile().cast();
     h.join(W1, "work", 1);
-    let assignment = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
+    assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     h.close(W1, &[]);
     h.open(W1 + 10, hello(Role::Work, 2));
-    h.join(W1 + 10, "work", 1);
+    h.join_as(W1 + 10, wid(W1), "work", 1);
     h.now = 2_000;
-    h.call(W1 + 10, Call::Extend { id: id(1), token: assignment.token() });
+    h.call(W1 + 10, Call::Extend { id: id(1), worker: wid(W1) });
     let attempt = h.slot(id(1)).unwrap().attempt().unwrap().clone();
     assert_eq!(attempt.until, 32_000, "re-armed at its length from now");
     assert_eq!(attempt.join, Some(h.join_id(W1 + 10, "work")));
@@ -219,10 +221,11 @@ fn release_keeps_or_raises_the_failure_count_and_a_delay_hides_the_event() {
     let mut h = H::volatile().cast();
     h.join(W1, "work", 1);
     let first = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
-    let again = h.call(W1, Call::Release { id: id(1), token: first.token(), delay_ms: 0, failed: false });
+    let again = h.call(W1, Call::Release { id: id(1), worker: wid(W1), delay_ms: 0, failed: false });
     let second = assigned(&again, W1).remove(0);
+    assert_eq!((first.event.worker, second.event.worker), (Some(wid(W1)), Some(wid(W1))), "claimed again by the same worker");
     assert_eq!(second.event.failures, 0, "not this event's fault");
-    let hidden = h.call(W1, Call::Release { id: id(1), token: second.token(), delay_ms: 500, failed: true });
+    let hidden = h.call(W1, Call::Release { id: id(1), worker: wid(W1), delay_ms: 500, failed: true });
     assert!(assigned(&hidden, W1).is_empty(), "delayed");
     assert_eq!(h.slot(id(1)).unwrap().failures, 1);
     assert_eq!(h.s.next_due(), Some(500));
@@ -236,7 +239,7 @@ fn an_explicit_claim_takes_a_waiting_event_and_refuses_claimed_delayed_or_missin
     let mut h = H::volatile().cast();
     h.produce(P, work("work").with_id(id(1)));
     h.produce(P, work("work").with_id(id(2)).with_not_before(Duration::from_secs(5)));
-    let claim = |h: &mut H, id| h.call(W1, Call::Claim { req: 9, id, lease_ms: 1000 });
+    let claim = |h: &mut H, id| h.call(W1, Call::Claim { req: 9, worker: wid(W1), id, lease_ms: 1000 });
     let taken = claim(&mut h, id(1));
     assert!(matches!(sent(&taken, W1).as_slice(), [Outbound::Claimed { req: 9, assignment }] if assignment.event.id == id(1) && assignment.until == 1000));
     assert_eq!(sent(&claim(&mut h, id(1)), W1), [Outbound::Refused { req: 9, reason: Refusal::AlreadyClaimed }]);
@@ -252,7 +255,7 @@ fn a_join_needs_the_claim_method_and_nothing_narrower() {
     grants.insert("svc".into(), Grant { methods: vec![crate::engine::config::Method::Claim] });
     let mut h = H::with(EngineConfig { grants: Some(grants), ..config() }, false);
     h.open(W1, hello(Role::Work, 2));
-    let join = |h: &mut H, req, channel: Option<Channel>, types: Vec<u16>| sent(&h.call(W1, Call::Join { req, channel, types, lease_ms: 1000, dispatch: false }), W1);
+    let join = |h: &mut H, req, channel: Option<Channel>, types: Vec<u16>| sent(&h.call(W1, Call::Join { req, worker: wid(W1), channel, types, lease_ms: 1000, dispatch: false }), W1);
     assert_eq!(join(&mut h, 3, Some(ch("any")), vec![1]), [Outbound::Joined { req: 3 }], "a type of a channel");
     assert_eq!(join(&mut h, 4, None, vec![9_999]), [Outbound::Joined { req: 4 }], "any type on every channel");
     let mut grants = Grants::new();
@@ -266,7 +269,7 @@ fn a_join_needs_the_claim_method_and_nothing_narrower() {
 #[test]
 fn a_join_name_in_use_is_refused_for_another_selection_and_leaves_nothing_behind() {
     let mut h = H::volatile().cast();
-    let join = |h: &mut H, req, types: Vec<u16>| sent(&h.call(W1, Call::Join { req, channel: None, types, lease_ms: 1000, dispatch: false }), W1);
+    let join = |h: &mut H, req, types: Vec<u16>| sent(&h.call(W1, Call::Join { req, worker: wid(W1), channel: None, types, lease_ms: 1000, dispatch: false }), W1);
     assert_eq!(join(&mut h, 7, vec![1]), [Outbound::Joined { req: 7 }]);
     assert_eq!(join(&mut h, 7, vec![2]), [Outbound::Refused { req: 7, reason: Refusal::Malformed }], "name 7 holds another selection");
     assert_eq!(join(&mut h, 7, vec![1]), [Outbound::Joined { req: 7 }], "the same selection under its own name changes its terms");
@@ -280,7 +283,7 @@ fn a_join_name_in_use_is_refused_for_another_selection_and_leaves_nothing_behind
 #[test]
 fn a_join_without_a_valid_selection_is_malformed() {
     let mut h = H::volatile().cast();
-    let join = |h: &mut H, req, channel: Option<Channel>, types: Vec<u16>, dispatch| sent(&h.call(W1, Call::Join { req, channel, types, lease_ms: 1000, dispatch }), W1);
+    let join = |h: &mut H, req, channel: Option<Channel>, types: Vec<u16>, dispatch| sent(&h.call(W1, Call::Join { req, worker: wid(W1), channel, types, lease_ms: 1000, dispatch }), W1);
     assert_eq!(join(&mut h, 1, None, Vec::new(), false), [Outbound::Refused { req: 1, reason: Refusal::Malformed }], "neither a channel nor a type");
     assert_eq!(join(&mut h, 2, None, vec![1], true), [Outbound::Refused { req: 2, reason: Refusal::Malformed }], "dispatch needs a channel");
     assert_eq!(join(&mut h, 3, Some(Channel([7; 16])), vec![1], false), [Outbound::Refused { req: 3, reason: Refusal::Malformed }], "not a UUIDv7");
@@ -326,4 +329,72 @@ fn a_completion_with_more_follow_ups_than_allowed_is_refused() {
     let effects = h.complete(W1, &first, (0..3).map(|_| work("x")).collect());
     assert_eq!(faults(&effects, W1), [FaultKind::Malformed]);
     assert!(h.slot(id(1)).is_some());
+}
+
+/// A claim request without a worker uuid is impossible: a nil uuid in `Join`
+/// or `Claim` is refused, `Malformed`, and nothing is claimed (plan 9.15).
+#[test]
+fn a_join_or_claim_without_a_worker_uuid_is_refused() {
+    let mut h = H::volatile().cast();
+    h.produce(P, work("work").with_id(id(1)));
+    let joined = h.call(W1, Call::Join { req: 1, worker: [0; 16], channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
+    assert_eq!(sent(&joined, W1), [Outbound::Refused { req: 1, reason: Refusal::Malformed }]);
+    assert!(h.s.sessions[&W1].joins.is_empty(), "no join was made");
+    let claimed = h.call(W1, Call::Claim { req: 2, id: id(1), worker: [0; 16], lease_ms: 1000 });
+    assert_eq!(sent(&claimed, W1), [Outbound::Refused { req: 2, reason: Refusal::Malformed }]);
+    assert!(h.slot(id(1)).unwrap().attempt().is_none(), "still waiting, unclaimed");
+}
+
+/// Every report on a claim names the worker uuid: a nil one in `Complete`,
+/// `Extend` or `Release` is a fault, `Malformed`, and the claim stands. (A
+/// connection is told a fault kind once; each one is counted.)
+#[test]
+fn a_report_without_a_worker_uuid_is_malformed() {
+    let mut h = H::volatile().cast();
+    h.join(W1, "work", 1);
+    h.produce(P, work("work").with_id(id(1)));
+    let seq = h.next_seq(W1);
+    let completed = h.call(W1, Call::Complete { seq, id: id(1), worker: [0; 16], follow_ups: Vec::new(), spooled: Vec::new() });
+    assert_eq!(faults(&completed, W1), [FaultKind::Malformed]);
+    let extended = h.call(W1, Call::Extend { id: id(1), worker: [0; 16] });
+    assert!(faults(&extended, W1).is_empty(), "told once per connection");
+    let released = h.call(W2, Call::Release { id: id(1), worker: [0; 16], delay_ms: 0, failed: true });
+    assert_eq!(faults(&released, W2), [FaultKind::Malformed]);
+    h.call(W2, Call::Extend { id: id(1), worker: [0; 16] });
+    assert_eq!((h.s.counters.faults, h.s.counters.stale), (4, 0), "each one a fault, none stale");
+    let slot = h.slot(id(1)).unwrap();
+    assert_eq!((slot.attempt().map(|attempt| attempt.worker), slot.failures), (Some(wid(W1)), 0), "the claim stands");
+}
+
+/// A failure report names the event and its worker; when both match, the
+/// worker uuid leaves the event and its failure count rises, so another
+/// worker may claim it (plan 9.15).
+#[test]
+fn a_matching_failure_report_removes_the_worker_and_raises_the_count_for_another_worker() {
+    let mut h = H::volatile().cast();
+    h.join(W1, "work", 1);
+    let first = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
+    assert_eq!((first.event.worker, first.event.failures), (Some(wid(W1)), 0));
+    h.call(W1, Call::Window { join: h.join_id(W1, "work").1, count: 0, bytes: 0 });
+    let released = h.call(W1, Call::Release { id: id(1), worker: wid(W1), delay_ms: 0, failed: true });
+    assert!(faults(&released, W1).is_empty());
+    let slot = h.slot(id(1)).unwrap();
+    assert_eq!((slot.attempt().is_none(), slot.failures, slot.envelope().worker), (true, 1, None), "no worker, one failure");
+    let again = assigned(&h.join(W2, "work", 1), W2);
+    assert_eq!(again.len(), 1);
+    assert_eq!((again[0].event.id, again[0].event.worker, again[0].event.failures), (id(1), Some(wid(W2)), 1), "another worker claims it");
+}
+
+/// A failure report naming the event with a worker uuid that does not hold
+/// it matches nothing: counted stale, the count unchanged, the claim kept.
+#[test]
+fn a_failure_report_with_the_wrong_worker_is_stale_and_keeps_the_claim() {
+    let mut h = H::volatile().cast();
+    h.join(W1, "work", 1);
+    h.produce(P, work("work").with_id(id(1)));
+    let released = h.call(W1, Call::Release { id: id(1), worker: wid(W2), delay_ms: 0, failed: true });
+    assert!(faults(&released, W1).is_empty(), "counted, not told");
+    assert_eq!(h.s.counters.stale, 1);
+    let slot = h.slot(id(1)).unwrap();
+    assert_eq!((slot.attempt().map(|attempt| attempt.worker), slot.failures), (Some(wid(W1)), 0), "still W1's, no failure counted");
 }

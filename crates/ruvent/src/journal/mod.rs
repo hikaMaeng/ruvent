@@ -14,7 +14,7 @@
 //! | --- | --- |
 //! | `Register` | this registration exists, with this envelope (failures, times and group included) ; its payload inline, or at a location written earlier (a streamed body) |
 //! | `Body` | a payload written inline with no registration; skipped unless something points at it |
-//! | `Claim` | this registration is claimed by this worker (its uuid) under this token and lease length |
+//! | `Claim` | this registration is claimed by this worker (its uuid) with this lease length |
 //! | `Remove` | this registration is gone: completed, deleted or expired |
 //! | `Reclaim` | its lease ran out: waiting again with this failure count |
 //! | `Release` | the worker gave it back: this failure count, visible again at this uptime (or now) |
@@ -51,7 +51,7 @@ mod recover;
 mod segment;
 mod spool;
 
-use crate::envelope::{ClaimToken, Digest, Envelope, ProducerId, WorkKey};
+use crate::envelope::{Digest, Envelope, ProducerId, WorkKey, WorkerId};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::io;
@@ -140,10 +140,9 @@ pub enum Record {
     },
     Claim {
         key: WorkKey,
-        token: ClaimToken,
         lease_ms: u64,
-        /// The worker's uuid: its work connection's producer id.
-        worker: ProducerId,
+        /// The uuid of the worker that claimed it.
+        worker: WorkerId,
     },
     Remove(WorkKey),
     Reclaim {
@@ -192,9 +191,8 @@ pub enum Standing {
         until: u64,
     },
     Claimed {
-        token: ClaimToken,
         lease_ms: u64,
-        worker: ProducerId,
+        worker: WorkerId,
     },
 }
 

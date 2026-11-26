@@ -82,7 +82,7 @@ pub fn encode(events: &[Envelope]) -> Result<Vec<u8>, Malformed> {
             Kind::Dispatch => Layout::Delivery,
         };
         items.put_u8(if event.kind == Kind::Claimable { CLAIMABLE } else { DISPATCH });
-        body::encode(&Envelope { claim: None, ..event.clone() }, layout, &mut items)?;
+        body::encode(&Envelope { worker: None, ..event.clone() }, layout, &mut items)?;
         count += 1;
     }
     let mut file = MAGIC.to_vec();

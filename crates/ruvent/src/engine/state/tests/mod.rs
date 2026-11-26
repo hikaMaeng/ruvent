@@ -14,6 +14,7 @@ use super::slots::{Place, Slot};
 use super::*;
 use crate::engine::config::{Durability, Grant, MemoryConfig};
 use crate::engine::ops::{Assignment, ByeReason, FaultKind, Hello, Outbound, Refusal, Role};
+use crate::envelope::WorkerId;
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -65,6 +66,11 @@ pub fn strict() -> EngineConfig {
 
 pub fn hello(role: Role, byte: u8) -> Hello {
     Hello { role, credential: "svc".into(), producer: (role != Role::Observe).then_some([byte; 16]), nonce: [byte; 16], linger_ms: None, acks: true }
+}
+
+/// The worker uuid the tests' session `session` claims under.
+pub fn wid(session: SessionId) -> WorkerId {
+    [0x50 + session as u8; 16]
 }
 
 pub fn id(byte: u8) -> EventId {
@@ -227,7 +233,7 @@ impl H {
         self.step(|state| state.open(session, hello))
     }
 
-    pub fn close(&mut self, session: SessionId, unwritten: &[ClaimToken]) -> Effects {
+    pub fn close(&mut self, session: SessionId, unwritten: &[EventId]) -> Effects {
         let unwritten = unwritten.to_vec();
         self.step(move |state| state.close(session, &unwritten))
     }
@@ -259,9 +265,14 @@ impl H {
     /// Joins the channel labelled `channel` for every type (a fresh `req`
     /// per connection, from 100) and opens a window of `count`.
     pub fn join(&mut self, session: SessionId, channel: &str, count: u32) -> Effects {
+        self.join_as(session, wid(session), channel, count)
+    }
+
+    /// [`H::join`] as the worker uuid `worker` (a reconnected worker keeps its uuid).
+    pub fn join_as(&mut self, session: SessionId, worker: WorkerId, channel: &str, count: u32) -> Effects {
         let req = 100 + self.joined.keys().filter(|(joiner, _)| *joiner == session).count() as u32;
         let req = *self.joined.entry((session, channel.to_string())).or_insert(req);
-        let mut effects = self.call(session, Call::Join { req, channel: Some(ch(channel)), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+        let mut effects = self.call(session, Call::Join { req, worker, channel: Some(ch(channel)), types: Vec::new(), lease_ms: 30_000, dispatch: false });
         let more = self.call(session, Call::Window { join: req, count, bytes: 0 });
         effects.sends.extend(more.sends);
         effects
@@ -274,7 +285,7 @@ impl H {
 
     pub fn complete(&mut self, session: SessionId, assignment: &Assignment, follow_ups: Vec<Envelope>) -> Effects {
         let seq = self.next_seq(session);
-        self.call(session, Call::Complete { seq, id: assignment.event.id, token: assignment.token(), follow_ups, spooled: Vec::new() })
+        self.call(session, Call::Complete { seq, id: assignment.event.id, worker: wid(session), follow_ups, spooled: Vec::new() })
     }
 
     /// The slot holding `id`.

@@ -10,7 +10,7 @@ pub struct Counters {
     pub retransmits: u64,
     /// Registrations dropped because an active event had the id and the same digest.
     pub duplicates: u64,
-    /// Completions, extensions and releases whose token was not the current attempt's.
+    /// Completions, extensions and releases that named no current claim (the event and the worker did not both match).
     pub stale: u64,
     /// Leases that ran out.
     pub reclaimed: u64,

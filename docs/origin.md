@@ -62,7 +62,7 @@ ruvent는 `F:\dev\ndx_business`의 `packages/agent`(TypeScript, PostgreSQL + PGM
 | --- | --- | --- |
 | PGMQ `send` / `read` / `delete` / `set_vt` | 메서드 1(착수용 등록) / 6(구독)+3(착수) / 4(완료) / 착수 기한 | 행 잠금 대신 단일 작성자. visibility 대신 착수 블록의 기한, 회수는 다음 등록 때 |
 | `EventStore.append` + 로그 tail + 커서 | 메서드 2(발송용 등록): 그 순간의 구독 접속에 넘기고 끝 | 보존 로그·커서·범위 읽기 없음. 끊긴 접속은 놓친다 |
-| `ExecutionStore.claim/complete/release`, 시도 상한, dead letter | 메서드 3·4, 착수 표지, 재시도 카운트. 상한·실패 처리는 워커(`Service::max_retries`, `failures`) | 서버에 정책이 없다 |
+| `ExecutionStore.claim/complete/release`, 시도 상한, dead letter | 메서드 3·4, 착수(이벤트 id, 워커 uuid), 재시도 카운트. 상한·실패 처리는 워커(`Service::max_retries`, `failures`) | 서버에 정책이 없다 |
 | 리액션 표(사실 → 큐) | 완료 보고에 실은 후속 이벤트 | 워커가 무엇을 낼지 정한다 |
 | `transaction_key` 멱등·충돌 판정 | 큐에 있는 id 중복 거절(G8), 작업 키(G3) | 완료 뒤의 멱등은 워커가 작업 키로 |
 | 브로커 여러 대(연결·발송 분산) | 프록시(`ruvent-proxy`로 빌드한 서버): 채널별 상위 구독 하나 | 서버 연결 수 = 프록시 수 + 워커 서버 수 |

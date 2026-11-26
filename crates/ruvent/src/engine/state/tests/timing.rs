@@ -29,7 +29,7 @@ fn under_strict_nothing_uncommitted_is_assigned_noticed_backlogged_or_claimed() 
     let backlog = h.call(O, Call::Subscribe { req: 2, channel: ch("work"), after: None });
     assert!(matches!(sent(&backlog, O).as_slice(), [Outbound::Subscribed { backlog, .. }] if backlog.is_empty()), "not in the backlog");
     h.open(W2 + 10, hello(Role::Work, 30));
-    let claimed = h.call(W2 + 10, Call::Claim { req: 3, id: id(1), lease_ms: 1000 });
+    let claimed = h.call(W2 + 10, Call::Claim { req: 3, worker: wid(W2 + 10), id: id(1), lease_ms: 1000 });
     assert!(claimed.sends.iter().any(|send| send.session == W2 + 10 && send.gate == Some(h.carrying)), "an explicit claim's answer waits for the commit");
     // Land: the remaining event (registered and not claimed) is assigned.
     h.produce(P, work("work").with_id(id(2)));

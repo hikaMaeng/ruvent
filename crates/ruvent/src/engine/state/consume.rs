@@ -7,7 +7,7 @@ use super::wheel::Due;
 use super::State;
 use crate::engine::config::Method;
 use crate::engine::ops::{Assignment, FaultKind, Outbound, Refusal, SessionId};
-use crate::envelope::{Channel, ClaimToken, EventId, WorkKey};
+use crate::envelope::{Channel, EventId, WorkKey, WorkerId};
 use crate::journal::Record;
 use crate::names::Name;
 use std::collections::HashSet;
@@ -70,17 +70,18 @@ impl State {
         found
     }
 
-    /// The connection's join that selects the lane, if any (at most one, `Overlap`).
-    fn join_for(&self, session: SessionId, lane: &LaneKey) -> Option<JoinId> {
+    /// The connection's join of `worker` that selects the lane, if any (at most one, `Overlap`).
+    fn join_for(&self, session: SessionId, lane: &LaneKey, worker: &WorkerId) -> Option<JoinId> {
         let open = self.sessions.get(&session)?;
-        open.joins.iter().map(|req| (session, *req)).find(|id| self.joins.get(id).is_some_and(|join| join.selects(lane)))
+        open.joins.iter().map(|req| (session, *req)).find(|id| self.joins.get(id).is_some_and(|join| join.worker == *worker && join.selects(lane)))
     }
 
-    /// `Join`: needs the claim grant (2.7). The channel, if any, must be a UUIDv7.
+    /// `Join`: needs the claim grant (2.7) and a worker uuid (never nil). The
+    /// channel, if any, must be a UUIDv7.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn join(&mut self, session: SessionId, credential: &Name, req: u32, channel: Option<Channel>, types: Vec<u16>, lease_ms: u64, dispatch: bool) {
+    pub(super) fn join(&mut self, session: SessionId, credential: &Name, req: u32, worker: WorkerId, channel: Option<Channel>, types: Vec<u16>, lease_ms: u64, dispatch: bool) {
         let refuse = |state: &mut State, reason| state.send(session, Outbound::Refused { req, reason }, None);
-        if (channel.is_none() && (types.is_empty() || dispatch)) || channel.is_some_and(|channel| !channel.is_valid()) {
+        if worker == [0; 16] || (channel.is_none() && (types.is_empty() || dispatch)) || channel.is_some_and(|channel| !channel.is_valid()) {
             return refuse(self, Refusal::Malformed);
         }
         let mut types = types;
@@ -119,7 +120,7 @@ impl State {
             self.next_order += 1;
             (0, 0, 0, 0, HashSet::new(), order)
         });
-        let mut join = Join { channel, types, lease_ms, count, bytes, claimed, claimed_bytes, signalled: false, order, dispatch, lanes: Vec::new(), attempts };
+        let mut join = Join { channel, types, worker, lease_ms, count, bytes, claimed, claimed_bytes, signalled: false, order, dispatch, lanes: Vec::new(), attempts };
         if let Some(channel) = &channel {
             let covered: Vec<LaneKey> = self.lanes.keys().filter(|key| join.selects(key)).cloned().collect();
             for key in &covered {
@@ -166,7 +167,7 @@ impl State {
     }
 
     /// Leaves a join because its connection closed.
-    pub(super) fn part(&mut self, session: SessionId, join: u32, unwritten: &[ClaimToken]) {
+    pub(super) fn part(&mut self, session: SessionId, join: u32, unwritten: &[EventId]) {
         let id: JoinId = (session, join);
         let Some(join) = self.unlink(&id) else { return };
         let grace = super::millis(self.config.reconnect_grace);
@@ -174,16 +175,16 @@ impl State {
             let generation = self.slots.generation(index);
             let now = self.now;
             let Some(slot) = self.slots.get_mut(index) else { continue };
+            let id = slot.fixed.id;
             let Place::Claimed(attempt) = &mut slot.place else { continue };
             attempt.join = None;
-            if unwritten.contains(&attempt.token) {
+            if unwritten.contains(&id) {
                 // Never fully written: the worker cannot have started it.
-                let token = attempt.token;
-                self.release_unwritten(index, token);
+                self.release_unwritten(index);
             } else {
                 attempt.until = attempt.until.min(now.saturating_add(grace));
-                let (until, token) = (attempt.until, attempt.token);
-                self.wheel.wake_at(until, index, generation, Due::Lease(token));
+                let until = attempt.until;
+                self.wheel.wake_at(until, index, generation, Due::Lease);
             }
         }
     }
@@ -292,10 +293,9 @@ impl State {
         }
         // A lane only joins without a channel take goes once it is empty.
         self.tidy(lane);
-        let Some((lease_ms, worker)) = self.joins.get(id).map(|join| join.lease_ms).zip(self.worker_of(id.0)) else { return };
-        let token = self.next_token();
+        let Some((lease_ms, worker)) = self.joins.get(id).map(|join| (join.lease_ms, join.worker)) else { return };
         let until = self.now.saturating_add(lease_ms);
-        let attempt = Attempt { token, lease_ms, until, worker, join: Some(*id) };
+        let attempt = Attempt { lease_ms, until, worker, join: Some(*id) };
         let Some(len) = self.start(index, attempt) else { return };
         let more = {
             let Some(join) = self.joins.get_mut(id) else { return };
@@ -313,24 +313,24 @@ impl State {
             more
         };
         if let Some((event, cold)) = self.slots.get(index).map(|slot| (slot.envelope(), slot.cold())) {
-            self.send_event(id.0, Outbound::Assign(Assignment { event, until, more }), None, index);
+            self.send_event(id.0, Outbound::Assign(Assignment { event, lease_ms, until, more }), None, index);
             if cold {
                 self.read_ahead(lane);
             }
         }
     }
 
-    /// Marks the event claimed by `attempt`: its claim mark, the lease on the
+    /// Marks the event claimed by `attempt`: its worker uuid, the lease on the
     /// wheel, `Claim` journaled. Returns the payload length.
     fn start(&mut self, index: Index, attempt: Attempt) -> Option<u64> {
         let generation = self.slots.generation(index);
         let slot = self.slots.get_mut(index)?;
-        let (token, until, lease_ms, worker) = (attempt.token, attempt.until, attempt.lease_ms, attempt.worker);
+        let (until, lease_ms, worker) = (attempt.until, attempt.lease_ms, attempt.worker);
         slot.place = Place::Claimed(attempt);
         let (len, durable, key) = (slot.len(), slot.fixed.durable, slot.fixed.key);
-        self.wheel.wake_at(until, index, generation, Due::Lease(token));
+        self.wheel.wake_at(until, index, generation, Due::Lease);
         if durable {
-            self.record_for(index, Record::Claim { key, token, lease_ms, worker });
+            self.record_for(index, Record::Claim { key, lease_ms, worker });
         }
         Some(len)
     }
@@ -338,8 +338,11 @@ impl State {
     /// Explicit `Claim{id}`: the event with this id, whichever lane it waits
     /// in, if it is visible. Under Strict the answer waits for its
     /// registration to be on disk (2.7).
-    pub(super) fn claim(&mut self, session: SessionId, credential: &Name, req: u32, id: EventId, lease_ms: u64) {
+    pub(super) fn claim(&mut self, session: SessionId, credential: &Name, req: u32, id: EventId, worker: WorkerId, lease_ms: u64) {
         let refuse = |state: &mut State, reason| state.send(session, Outbound::Refused { req, reason }, None);
+        if worker == [0; 16] {
+            return refuse(self, Refusal::Malformed);
+        }
         let Some(index) = self.slots.by_id(&id) else { return refuse(self, Refusal::Missing) };
         let Some(slot) = self.slots.get(index) else { return refuse(self, Refusal::Missing) };
         if !self.allowed(credential, Method::Claim) {
@@ -350,15 +353,13 @@ impl State {
             Place::Delayed { .. } => return refuse(self, Refusal::Missing),
             Place::Waiting => {}
         }
-        let Some(worker) = self.worker_of(session) else { return refuse(self, Refusal::Malformed) };
         let (lane, key) = (slot.lane(), slot.fixed.key);
         if let Some(found) = self.lanes.get_mut(&lane) {
             found.queue.remove(&key);
         }
-        let join = self.join_for(session, &lane);
-        let token = self.next_token();
+        let join = self.join_for(session, &lane, &worker);
         let until = self.now.saturating_add(lease_ms);
-        let Some(len) = self.start(index, Attempt { token, lease_ms, until, worker, join }) else { return };
+        let Some(len) = self.start(index, Attempt { lease_ms, until, worker, join }) else { return };
         if let Some(join) = join.and_then(|join| self.joins.get_mut(&join)) {
             join.claimed += 1;
             join.claimed_bytes += len;
@@ -367,28 +368,22 @@ impl State {
         self.tidy(&lane);
         let gate = self.gate_for(index);
         if let Some(event) = self.slots.get(index).map(|slot| slot.envelope()) {
-            self.send_event(session, Outbound::Claimed { req, assignment: Assignment { event, until, more: false } }, gate, index);
+            self.send_event(session, Outbound::Claimed { req, assignment: Assignment { event, lease_ms, until, more: false } }, gate, index);
         }
     }
 
-    /// The worker uuid of a work connection: its producer id.
-    pub(super) fn worker_of(&self, session: SessionId) -> Option<crate::envelope::ProducerId> {
-        self.sessions.get(&session).and_then(|open| open.producer)
-    }
-
-    /// The attempt at `index` if it is `token` and its claim mark names this
-    /// connection's worker. A wrong token is a late or stale report: counted,
-    /// not told (2.7).
-    pub(super) fn attempt_for(&mut self, session: SessionId, id: EventId, token: ClaimToken) -> Option<Index> {
-        let current = self.slots.by_id(&id).and_then(|index| self.slots.get(index).and_then(|slot| slot.attempt()).map(|attempt| (index, attempt.token, attempt.worker)));
+    /// The claimed event `id` if `worker` holds it: both must match. A report
+    /// that matches nothing — the claim ran out and went elsewhere, or the
+    /// event is gone — is late or stale: counted, not told (2.7). A nil
+    /// worker is a fault: every claim names one.
+    pub(super) fn attempt_for(&mut self, session: SessionId, id: EventId, worker: WorkerId) -> Option<Index> {
+        if worker == [0; 16] {
+            self.fault(session, FaultKind::Malformed, "a report on a claim must name the worker uuid");
+            return None;
+        }
+        let current = self.slots.by_id(&id).and_then(|index| self.slots.get(index).and_then(|slot| slot.attempt()).map(|attempt| (index, attempt.worker)));
         match current {
-            Some((index, held, owner)) if held == token => {
-                if Some(owner) != self.worker_of(session) {
-                    self.fault(session, FaultKind::Forbidden, "the attempt is another worker's");
-                    return None;
-                }
-                Some(index)
-            }
+            Some((index, holder)) if holder == worker => Some(index),
             _ => {
                 self.counters.stale += 1;
                 None
@@ -399,18 +394,18 @@ impl State {
     /// `Extend`: re-arms the lease at its length from now, and moves the
     /// attempt to this connection's join that selects its lane, if it has one (2.4).
     /// Never journaled: a restart re-arms every lease anyway.
-    pub(super) fn extend(&mut self, session: SessionId, id: EventId, token: ClaimToken) {
-        let Some(index) = self.attempt_for(session, id, token) else { return };
+    pub(super) fn extend(&mut self, session: SessionId, id: EventId, worker: WorkerId) {
+        let Some(index) = self.attempt_for(session, id, worker) else { return };
         let generation = self.slots.generation(index);
         let now = self.now;
         let Some(slot) = self.slots.get_mut(index) else { return };
         let len = slot.len();
         let lane = slot.lane();
-        let Some(target) = self.join_for(session, &lane) else {
+        let Some(target) = self.join_for(session, &lane, &worker) else {
             let Some(Place::Claimed(attempt)) = self.slots.get_mut(index).map(|slot| &mut slot.place) else { return };
             attempt.until = now.saturating_add(attempt.lease_ms);
             let until = attempt.until;
-            self.wheel.wake_at(until, index, generation, Due::Lease(token));
+            self.wheel.wake_at(until, index, generation, Due::Lease);
             return;
         };
         let Some(slot) = self.slots.get_mut(index) else { return };
@@ -418,7 +413,7 @@ impl State {
         attempt.until = now.saturating_add(attempt.lease_ms);
         let until = attempt.until;
         let moved = if attempt.join.as_ref() != Some(&target) && self.joins.contains_key(&target) { Some(attempt.join.replace(target)) } else { None };
-        self.wheel.wake_at(until, index, generation, Due::Lease(token));
+        self.wheel.wake_at(until, index, generation, Due::Lease);
         if let Some(previous) = moved {
             if let Some(previous) = previous.and_then(|previous| self.joins.get_mut(&previous).map(|join| (previous, join))) {
                 let (previous, join) = previous;

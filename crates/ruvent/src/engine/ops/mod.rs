@@ -37,7 +37,7 @@
 mod codes;
 mod stats;
 
-use crate::envelope::{Channel, ClaimToken, Envelope, EventId, ProducerId, WorkKey};
+use crate::envelope::{Channel, Envelope, EventId, ProducerId, WorkKey, WorkerId};
 use crate::journal::Spooled;
 use crate::names::Name;
 
@@ -121,27 +121,17 @@ pub struct Welcome {
 /// to an explicit claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assignment {
-    /// Head, work key, failure count, `not_before`, the claim mark (worker,
-    /// token, lease) and payload.
+    /// Head, work key, failure count, `not_before`, the worker uuid it is
+    /// claimed under, and payload.
     pub event: Envelope,
+    /// The lease length the claim runs under.
+    pub lease_ms: u64,
     /// Absolute uptime at which the lease runs out. The connection owner puts
     /// "remaining lease" = `until` − uptime at the moment it starts writing,
     /// and drops an assignment whose `until` has passed before it starts.
     pub until: u64,
     /// This assignment filled the window and more work is waiting (2.4).
     pub more: bool,
-}
-
-impl Assignment {
-    /// The attempt's fencing token, from the claim mark.
-    pub fn token(&self) -> ClaimToken {
-        self.event.claim.map(|claim| claim.token).unwrap_or_default()
-    }
-
-    /// The lease length the attempt runs under, from the claim mark.
-    pub fn lease_ms(&self) -> u64 {
-        self.event.claim.map_or(0, |claim| claim.lease_ms)
-    }
 }
 
 /// A call from a connection. Which role may send which is in each variant.
@@ -170,9 +160,12 @@ pub enum Call {
     /// changes its terms and takes this name; one that overlaps another is
     /// refused (`Overlap`), so every lane has at most one join per
     /// connection. With `dispatch` (a channel join only), the channel's
-    /// dispatch events come to this connection too (2.8).
+    /// dispatch events come to this connection too (2.8). `worker` is the
+    /// uuid every assignment of this join is claimed under: required, never
+    /// nil (a claim without a worker uuid is refused, `Malformed`).
     Join {
         req: u32,
+        worker: WorkerId,
         channel: Option<Channel>,
         types: Vec<u16>,
         lease_ms: u64,
@@ -189,30 +182,35 @@ pub enum Call {
     /// `spooled`: follow-ups (by position) whose payload the connection owner
     /// received to disk instead of memory (2.6); their envelope's payload is
     /// empty. See `Engine::body_to_disk`.
+    /// The event and the worker that claimed it must both match its claim.
     Complete {
         seq: u64,
         id: EventId,
-        token: ClaimToken,
+        worker: WorkerId,
         follow_ups: Vec<Envelope>,
         spooled: Vec<(u32, Spooled)>,
     },
-    /// Work. Re-arms the lease and moves the attempt to this connection's join.
+    /// Work. Re-arms the lease and moves the claim to this connection's
+    /// join. The event and its worker must match.
     Extend {
         id: EventId,
-        token: ClaimToken,
+        worker: WorkerId,
     },
-    /// Work. Gives the event back; visible again after `delay_ms`; `failed`
-    /// counts a failure against it (2.4).
+    /// Work. Gives the event back: the worker uuid leaves the event, which is
+    /// visible again after `delay_ms`, and with `failed` its failure count
+    /// rises — a failure report. The event and its worker must match (2.4).
     Release {
         id: EventId,
-        token: ClaimToken,
+        worker: WorkerId,
         delay_ms: u64,
         failed: bool,
     },
-    /// Work. Claims the event with this id now, whichever lane it waits in.
+    /// Work. Claims the event with this id now, under `worker` (required,
+    /// never nil), whichever lane it waits in.
     Claim {
         req: u32,
         id: EventId,
+        worker: WorkerId,
         lease_ms: u64,
     },
     /// Observation. From now on, the channel's notices and dispatch events;

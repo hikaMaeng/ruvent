@@ -17,9 +17,9 @@
 
 use super::close::staged;
 use super::read::ReadEnd;
-use super::unsent::{token_of, Unsent};
+use super::unsent::{assigned_id, Unsent};
 use super::ServerOptions;
-use ruvent::{ByeReason, ClaimToken, Engine, FaultKind, Outbound, Refusal, Role, Session};
+use ruvent::{ByeReason, Engine, EventId, FaultKind, Outbound, Refusal, Role, Session};
 use ruvent_protocol::{Encoder, Message, Parts, ProtocolError};
 use std::future::Future;
 use std::io;
@@ -39,8 +39,8 @@ type WriteFuture = Pin<Box<dyn Future<Output = Written> + Send>>;
 /// What one write in progress carries besides its bytes.
 #[derive(Default)]
 struct Flight {
-    /// Where each assignment's record ends in the batch, and its token.
-    ends: Vec<(u64, ClaimToken)>,
+    /// Where each assignment's record ends in the batch, and its event id.
+    ends: Vec<(u64, EventId)>,
     /// Bytes of the batch counted against the bound.
     weight: u64,
 }
@@ -52,7 +52,7 @@ enum Ending {
     /// The peer went away: no staged close.
     Gone,
     /// The write failed; these assignments never reached the socket whole.
-    Broken(Vec<ClaimToken>),
+    Broken(Vec<EventId>),
     /// A record was refused; the fault's detail.
     Protocol(&'static str),
     /// Over the byte bound.
@@ -152,14 +152,14 @@ impl Owner {
                 Outbound::Claimed { req, assignment } if assignment.until <= now => Outbound::Refused { req, reason: Refusal::Missing },
                 other => other,
             };
-            let token = token_of(&message);
+            let assigned = assigned_id(&message);
             // What the engine hands over always encodes; a message that did
             // not is dropped rather than closing the connection.
             if self.encoder.push(&Message::Outbound(message)).is_err() {
                 continue;
             }
-            if let Some(token) = token {
-                flight.ends.push((self.encoder.len() as u64, token));
+            if let Some(id) = assigned {
+                flight.ends.push((self.encoder.len() as u64, id));
             }
             count += 1;
         }
@@ -179,12 +179,12 @@ impl Owner {
     }
 
     /// A write finished. `Some`: it failed, and these assignments never reached the socket whole.
-    fn landed(&mut self, written: Written, flight: Option<Flight>) -> Option<Vec<ClaimToken>> {
+    fn landed(&mut self, written: Written, flight: Option<Flight>) -> Option<Vec<EventId>> {
         let (write, parts, result) = written;
         self.write = Some(write);
         let flight = flight.unwrap_or_default();
         self.unsent.written(flight.weight);
-        result.err().map(|_| flight.ends.iter().filter(|(end, _)| *end > parts.written()).map(|(_, token)| *token).collect())
+        result.err().map(|_| flight.ends.iter().filter(|(end, _)| *end > parts.written()).map(|(_, id)| *id).collect())
     }
 
     /// Serves the connection until it ends, then closes it.
@@ -230,7 +230,7 @@ impl Owner {
     }
 
     /// Hands the engine the connection's close with the assignments it never got.
-    async fn close_session(&mut self, unwritten: Vec<ClaimToken>) {
+    async fn close_session(&mut self, unwritten: Vec<EventId>) {
         let Some(session) = self.session.take() else { return };
         match Arc::try_unwrap(session) {
             Ok(session) => session.close(unwritten).await,
@@ -246,7 +246,7 @@ impl Owner {
         match ending {
             Ending::Gone | Ending::Broken(_) => {
                 let mut unwritten = match ending {
-                    Ending::Broken(tokens) => tokens,
+                    Ending::Broken(ids) => ids,
                     _ => Vec::new(),
                 };
                 // A write still out fails quickly once the peer is gone.
@@ -261,9 +261,9 @@ impl Owner {
             Ending::Engine | Ending::Protocol(_) | Ending::Slow | Ending::Stopping => {
                 let unwritten = match ending {
                     Ending::Slow => {
-                        let tokens = self.unsent.drop_all();
+                        let ids = self.unsent.drop_all();
                         self.unsent.push(Outbound::Bye(ByeReason::Slow));
-                        tokens
+                        ids
                     }
                     Ending::Protocol(detail) => {
                         self.unsent.fault(FaultKind::Malformed, detail);
@@ -271,9 +271,9 @@ impl Owner {
                         Vec::new()
                     }
                     Ending::Stopping => {
-                        let tokens = self.unsent.drop_assignments();
+                        let ids = self.unsent.drop_assignments();
                         self.unsent.push(Outbound::Bye(ByeReason::Draining));
-                        tokens
+                        ids
                     }
                     _ => Vec::new(),
                 };

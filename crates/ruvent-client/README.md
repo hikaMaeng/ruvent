@@ -9,7 +9,7 @@
 | 모듈 | 하는 일 |
 | --- | --- |
 | `servers` | 서버 목록 공급자 `ServerList`(현재 목록 + 변경 알림). 정적·교체 가능한 구현 `Servers` |
-| `link` | 연결 하나를 여는 `Connector`. `Tcp`(wire v5), `Local`(프로세스 안 엔진, 이름 → `Engine`, 재기동 때 교체) |
+| `link` | 연결 하나를 여는 `Connector`. `Tcp`(wire v6), `Local`(프로세스 안 엔진, 이름 → `Engine`, 재기동 때 교체) |
 | `line` | 서버 하나 × 역할 하나: 지수 백오프 + full jitter(S20) 재접속, `Bye` 사유표, `Welcome`의 server_id·세대 변화(재기동) 감지 |
 | `buffer` | 번호 붙은 연결의 미확인 버퍼: 누적 `Committed`로 비우기, `resume` 재개, 기록을 잃은 서버의 다시 번호 매기기 |
 | `producer` | `Producer`: 선택기(`Selector`, 기본 `LeastUnacked`. `Choice`에 채널과 타입), 바이트 상한(S8, 가득이면 `send`가 기다림), `draining`, 재시도 예산(S9). 서버는 생산자를 정지시키지 않는다 |

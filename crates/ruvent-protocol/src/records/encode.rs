@@ -1,6 +1,6 @@
 //! Messages → records, for one direction of one connection.
 
-use super::fields::{close, cut, open, put_bool, put_channel, put_key, put_text, put_token, put_varint, DETAIL};
+use super::fields::{close, cut, open, put_bool, put_channel, put_key, put_text, put_varint, put_worker, DETAIL};
 use super::*;
 use crate::error::ProtocolError;
 use crate::io::Parts;
@@ -159,6 +159,7 @@ impl Encoder {
             if let Some(req) = req {
                 put_varint(out, u64::from(req));
             }
+            put_varint(out, assignment.lease_ms);
             put_varint(out, remaining);
             put_bool(out, assignment.more);
         };
@@ -210,8 +211,9 @@ impl Encoder {
                 put_channel(out, result);
                 put_key(out, *key);
             }),
-            Call::Join { req, channel, types, lease_ms, dispatch } => self.plain(JOIN, |out| {
+            Call::Join { req, worker, channel, types, lease_ms, dispatch } => self.plain(JOIN, |out| {
                 put_varint(out, u64::from(*req));
+                put_worker(out, worker);
                 put_bool(out, channel.is_some());
                 if let Some(channel) = channel {
                     put_channel(out, channel);
@@ -228,30 +230,31 @@ impl Encoder {
                 put_varint(out, u64::from(*count));
                 put_varint(out, *bytes);
             }),
-            Call::Complete { seq, id, token, follow_ups, .. } => {
+            Call::Complete { seq, id, worker, follow_ups, .. } => {
                 self.plain(COMPLETE, |out| {
                     put_varint(out, *seq);
                     out.put_slice(&id.0);
-                    put_token(out, *token);
+                    put_worker(out, worker);
                     put_varint(out, follow_ups.len() as u64);
                 });
                 for event in follow_ups {
                     self.event(FOLLOW_UP, |_| {}, event, Layout::Request);
                 }
             }
-            Call::Extend { id, token } => self.plain(EXTEND, |out| {
+            Call::Extend { id, worker } => self.plain(EXTEND, |out| {
                 out.put_slice(&id.0);
-                put_token(out, *token);
+                put_worker(out, worker);
             }),
-            Call::Release { id, token, delay_ms, failed } => self.plain(RELEASE, |out| {
+            Call::Release { id, worker, delay_ms, failed } => self.plain(RELEASE, |out| {
                 out.put_slice(&id.0);
-                put_token(out, *token);
+                put_worker(out, worker);
                 put_varint(out, *delay_ms);
                 put_bool(out, *failed);
             }),
-            Call::Claim { req, id, lease_ms } => self.plain(CLAIM, |out| {
+            Call::Claim { req, id, worker, lease_ms } => self.plain(CLAIM, |out| {
                 put_varint(out, u64::from(*req));
                 out.put_slice(&id.0);
+                put_worker(out, worker);
                 put_varint(out, *lease_ms);
             }),
             Call::Subscribe { req, channel, after } => self.plain(SUBSCRIBE, |out| {

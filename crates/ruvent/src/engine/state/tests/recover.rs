@@ -12,10 +12,10 @@ fn restarted(records: Vec<Record>, uptime: u64) -> H {
     h
 }
 
-/// A restart keeps claims as they were: token, lease length and the claim
-/// mark's worker; the lease re-armed at its length; no failure counted (2.4, M8-6).
+/// A restart keeps claims as they were: the worker uuid and the lease length;
+/// the lease re-armed at its length; no failure counted (2.4, M8-6).
 #[test]
-fn a_restart_restores_claims_with_token_lease_and_worker_and_counts_no_failure() {
+fn a_restart_restores_claims_with_lease_and_worker_and_counts_no_failure() {
     let mut h = H::durable(false).cast();
     h.join(W1, "work", 1);
     let assignment = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
@@ -25,24 +25,25 @@ fn a_restart_restores_claims_with_token_lease_and_worker_and_counts_no_failure()
     assert_eq!(after.s.generation(), h.s.generation() + 1, "the generation rises at a start and only then");
     let slot = after.slot(id(1)).expect("the same id");
     let attempt = slot.attempt().expect("still claimed");
-    assert_eq!((attempt.token, attempt.lease_ms, attempt.until, attempt.worker, slot.failures), (assignment.token(), 30_000, 40_000, [2; 16], 0));
+    assert_eq!((attempt.lease_ms, attempt.until, attempt.worker, slot.failures), (30_000, 40_000, wid(W1), 0));
     assert!(attempt.join.is_none(), "no join until the worker extends it");
-    assert!(h.records.iter().any(|record| matches!(record, Record::Claim { worker, .. } if *worker == [2; 16])), "the claim record carries the worker's uuid");
-    // Another worker under the same credential may not take it over.
+    assert!(h.records.iter().any(|record| matches!(record, Record::Claim { worker, .. } if *worker == wid(W1))), "the claim record carries the worker's uuid");
+    // Another worker's uuid names no claim: counted stale, nothing taken over.
     after.open(W2, hello(Role::Work, 3));
     let seq = after.next_seq(W2);
-    let stolen = after.call(W2, Call::Complete { seq, id: id(1), token: assignment.token(), follow_ups: Vec::new(), spooled: Vec::new() });
-    assert_eq!(faults(&stolen, W2), [FaultKind::Forbidden]);
+    let stolen = after.call(W2, Call::Complete { seq, id: id(1), worker: wid(W2), follow_ups: Vec::new(), spooled: Vec::new() });
+    assert!(faults(&stolen, W2).is_empty());
+    assert_eq!(after.s.counters.stale, 1);
     assert!(after.slot(id(1)).is_some());
     // The worker reconnects, extends what it holds, then opens its window (2.9).
-    after.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
-    after.call(W1, Call::Extend { id: id(1), token: assignment.token() });
+    after.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    after.call(W1, Call::Extend { id: id(1), worker: wid(W1) });
     let opened = after.call(W1, Call::Window { join: 1, count: 1, bytes: 0 });
     assert!(assigned(&opened, W1).is_empty(), "the extended attempt fills its window of one");
     let completed = after.complete(W1, &assignment, Vec::new());
     assert!(after.slot(id(1)).is_none(), "the original worker's completion is accepted");
     assert_eq!(assigned(&completed, W1)[0].event.id, id(2), "and its slot takes the next");
-    assert!(assigned(&completed, W1)[0].token().generation > assignment.token().generation);
+    assert_eq!(assigned(&completed, W1)[0].event.worker, Some(wid(W1)));
 }
 
 /// `not_before` is an absolute uptime and keeps its remaining time across a
@@ -81,7 +82,7 @@ fn the_producer_table_survives_a_restart_and_resume_is_the_last_journaled_sequen
 #[test]
 fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
     let mut h = H::durable(false).cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 15, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 15, dispatch: false });
     for step in 0..40u8 {
         h.now = u64::from(step) * 10;
         h.produce(P, work("work").with_id(id(step + 1)).with_not_before(Duration::from_millis(u64::from(step % 4) * 5)));
@@ -92,13 +93,11 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
             let seq = h.next_seq(P);
             h.call(P, Call::Delete { seq, id: id(step / 2 + 1), result: ch("out"), key: None });
         }
-        if step % 7 == 0 {
-            if let Some(token) = h.slot(id(step + 1)).and_then(|slot| slot.attempt()).map(|attempt| attempt.token) {
-                h.call(W1, Call::Release { id: id(step + 1), token, delay_ms: 1_000, failed: true });
-            }
+        if step % 7 == 0 && h.slot(id(step + 1)).and_then(|slot| slot.attempt()).is_some() {
+            h.call(W1, Call::Release { id: id(step + 1), worker: wid(W1), delay_ms: 1_000, failed: true });
         }
     }
-    /// (work key, channel, failures, claim mark's worker, not_before) of every slot.
+    /// (work key, channel, failures, claiming worker, not_before) of every slot.
     type View = Vec<(WorkKey, Channel, u16, Option<[u8; 16]>, Option<u64>)>;
     let view = |state: &State| {
         let mut slots: View = state.slots.iter().map(|(_, slot)| (slot.fixed.key, slot.channel, slot.failures, slot.attempt().map(|attempt| attempt.worker), slot.fixed.not_before)).collect();
@@ -122,15 +121,14 @@ fn a_full_checkpoint_replays_to_the_same_ledger_as_the_records_it_replaced() {
 }
 
 #[test]
-fn work_keys_and_tokens_are_u64_past_the_u32_range() {
+fn work_keys_are_u64_past_the_u32_range() {
     let mut h = H::volatile().cast();
     h.s.arrival = u64::from(u32::MAX);
-    h.s.claim_seq = u64::from(u32::MAX);
     let generation = h.s.generation();
     h.join(W1, "work", 2);
     let first = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let second = assigned(&h.produce(P, work("work").with_id(id(2))), W1).remove(0);
+    assert!(second.event.key.unwrap().arrival > first.event.key.unwrap().arrival);
     assert!(second.event.key.unwrap().arrival > u64::from(u32::MAX));
-    assert!(second.token() > first.token());
     assert_eq!(h.s.generation(), generation, "running out of u32 does not start a generation");
 }

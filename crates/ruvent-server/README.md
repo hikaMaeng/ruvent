@@ -1,6 +1,6 @@
 # ruvent-server
 
-이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v5(`ruvent-protocol`) TCP 수신부를 둔다.
+이벤트 서버 바이너리와 라이브러리. 엔진 하나 앞에 wire v6(`ruvent-protocol`) TCP 수신부를 둔다.
 모든 접속은 `Hello`에서 서비스 자격 토큰과 역할(생산·작업·관찰, 계획 2.2)을 밝히고, 그 뒤로는 그 역할의
 호출만 그 자격으로 보낸다. 자격이 할 수 있는 일은 엔진의 권한표(`grants`)가 정한다.
 
@@ -53,7 +53,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 * 송신: 연결별 머리와 공유 본문을 벡터 쓰기로 보낸다. `inline` 미만 본문만 머리 버퍼에 복사한다.
 * `Fault`는 (연결, 종류)마다 처음 한 번만 보낸다. 읽을 수 없는 레코드는 `Fault{malformed}` + `Bye{protocol}`.
 * 모든 `Bye` 뒤에는 단계로 닫는다: 남은 것을 쓰고 → 쓰기 쪽만 닫고 → 상대가 닫을 때까지 읽어 버리고 → 닫는다.
-  상대가 닫지 않으면 `close_ms`에 닫는다. 연결이 닫힐 때 쓰기를 끝내지 못한 `Assign`의 표지를 엔진에 넘겨
+  상대가 닫지 않으면 `close_ms`에 닫는다. 연결이 닫힐 때 쓰기를 끝내지 못한 `Assign`의 이벤트 id를 엔진에 넘겨
   곧바로 대기로 되돌린다(실패 횟수 그대로).
 * 모든 소켓에 TCP keepalive를 건다. 리눅스는 `TCP_USER_TIMEOUT`도 건다. 앱 타이머는 없다.
 * v1 클라이언트의 hello는 첫 바이트로 알아보고 v1 형식의 `Bye`로 거절한다. v5가 아닌 다른 버전(v2~v4 포함)은 `Bye{version}`.
@@ -84,7 +84,7 @@ cargo run -p ruvent-server --release -- crates/ruvent-server/server.example.json
 | `src/connection/socket.rs` | keepalive(`socket2`) |
 | `src/lib.rs` | `run`: 세그먼트 로그 복구, 엔진 시작, 수신, 종료·장애 전파 |
 | `src/main.rs` | 바이너리 |
-| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v5 연결 |
+| `tests/remote.rs` | 실제 TCP 위의 서버. 클라이언트와 원시 wire v6 연결 |
 
 타이머는 둘이다: hello 기한(`handshake.rs`)과 닫기 기한(`close.rs`). 정적 시험의 `TIMERS`에 선언돼 있다.
 

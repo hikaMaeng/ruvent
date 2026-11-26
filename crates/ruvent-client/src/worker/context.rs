@@ -1,10 +1,10 @@
-//! What a handler sees: its event, the attempt's fencing token, a way to
+//! What a handler sees: its event, the worker uuid it is claimed under, a way to
 //! queue follow-ups, and a way to emit while running.
 
 use super::{Message, RunKey};
 use crate::producer::{Producer, ProducerError, Sent};
 use parking_lot::Mutex;
-use ruvent::{Bytes, Channel, ClaimToken, Envelope, EventId, WorkKey};
+use ruvent::{Bytes, Channel, Envelope, EventId, WorkKey, WorkerId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,6 @@ pub enum EmitError {
 #[derive(Clone)]
 pub struct Context {
     event: Arc<Envelope>,
-    token: ClaimToken,
     key: RunKey,
     messages: mpsc::Sender<Message>,
     producer: Option<Producer>,
@@ -42,8 +41,8 @@ pub struct Context {
 }
 
 impl Context {
-    pub(crate) fn new(event: Envelope, token: ClaimToken, key: RunKey, messages: mpsc::Sender<Message>, producer: Option<Producer>) -> Self {
-        Context { event: Arc::new(event), token, key, messages, producer, blocked: Arc::default(), follow_ups: Arc::default() }
+    pub(crate) fn new(event: Envelope, key: RunKey, messages: mpsc::Sender<Message>, producer: Option<Producer>) -> Self {
+        Context { event: Arc::new(event), key, messages, producer, blocked: Arc::default(), follow_ups: Arc::default() }
     }
 
     /// The assigned envelope, work key and failure count included.
@@ -78,11 +77,12 @@ impl Context {
         self.event.key
     }
 
-    /// The attempt's name, rising monotonically: a fencing token (2.4
-    /// "펜싱"). Guard overwriting writes with it; protect irreversible effects
-    /// with a unique business key or a downstream idempotency key.
-    pub fn token(&self) -> ClaimToken {
-        self.token
+    /// The worker uuid the event is claimed under (the claim is this and the
+    /// event id; there is no attempt token). A run whose lease ran out may
+    /// overlap a later one: protect irreversible effects with a unique
+    /// business key or a downstream idempotency key.
+    pub fn worker(&self) -> Option<WorkerId> {
+        self.event.worker
     }
 
     /// The server this run was assigned by.

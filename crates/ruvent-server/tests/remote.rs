@@ -4,7 +4,7 @@
 
 use ruvent::{
     Assignment, ByeReason, Bytes, Call, Channel, Client, Engine, EngineConfig, Envelope, EventId, FaultKind, Grant, Grants, Hello, Inbox, Incoming, MemoryConfig, Method, Methods, Name, Outbound,
-    Refusal, Role, SegmentLog, Welcome,
+    Refusal, Role, SegmentLog, Welcome, WorkerId,
 };
 use ruvent_client::remote::{connect, Options, Refused};
 use ruvent_protocol::{features, Body, Decoder, Encoder, Message, RecordReader, Side, VERSION};
@@ -27,6 +27,9 @@ const WAIT: Duration = Duration::from_secs(10);
 /// How long "nothing arrives" is watched for.
 const QUIET: Duration = Duration::from_millis(150);
 const LEASE: Duration = Duration::from_secs(60);
+/// The worker uuids the tests' claims name: fixed, never nil, one per worker.
+const W: WorkerId = [0x57; 16];
+const W2: WorkerId = [0x58; 16];
 
 struct Server {
     address: String,
@@ -219,26 +222,79 @@ async fn each_role_does_its_own_work_over_tcp() {
     let (worker, mut work) = dial(&server, worker_hello).await;
     let (observer, mut seen) = dial(&server, Hello::observer("x")).await;
     observer.subscribe(ch("feed"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
+    let worker_join = worker.join(worker_uuid, Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 4, 0).await.unwrap();
 
     let (seq, id) = producer.register(job("orders", b"p")).await.unwrap();
     producer.committed(seq).await.unwrap();
     let assigned = assignment(&mut work).await;
     assert_eq!((assigned.event.id, assigned.event.payload.as_ref()), (id, &b"p"[..]));
-    let claim = assigned.event.claim.expect("an assignment carries its claim mark");
-    assert_eq!((claim.worker, claim.token, claim.lease_ms), (worker_uuid, assigned.token(), LEASE.as_millis() as u64), "the claim mark names the worker's uuid");
+    assert_eq!((assigned.event.worker, assigned.lease_ms), (Some(worker_uuid), LEASE.as_millis() as u64), "an assignment names the worker uuid its join gave, and the lease");
     assert!(assigned.until > 0 && assigned.until <= LEASE.as_millis() as u64, "the lease left when it was written: {}", assigned.until);
-    let done = worker.complete(id, assigned.token(), vec![Envelope::dispatch(ch("feed"), 2, Bytes::from_static(b"x"))]).await.unwrap();
+    let done = worker.complete(id, worker_uuid, vec![Envelope::dispatch(ch("feed"), 2, Bytes::from_static(b"x"))]).await.unwrap();
     worker.committed(done).await.unwrap();
     let created = delivery(&mut seen).await;
-    assert_eq!((created.event_type, created.payload.as_ref(), created.claim), (2, &b"x"[..], None));
+    assert_eq!((created.event_type, created.payload.as_ref(), created.worker), (2, &b"x"[..], None));
 
     let (_, posted) = producer.register(Envelope::dispatch(ch("feed"), 3, Bytes::new()).with_id(EventId::new_v7())).await.unwrap();
     assert_eq!(delivery(&mut seen).await.id, posted);
-    assert_eq!(producer.join(Some(ch("orders")), Vec::new(), LEASE, false).await, Err(Refusal::Malformed));
+    assert_eq!(producer.join(W, Some(ch("orders")), Vec::new(), LEASE, false).await, Err(Refusal::Malformed));
     let stats = observer.stats().await.unwrap();
     assert_eq!((stats.waiting, stats.claimed), (0, 0));
+}
+
+/// Waits until the server's statistics satisfy `ready`.
+async fn stats_until(server: &Server, ready: impl Fn(&ruvent::Stats) -> bool) -> ruvent::Stats {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let stats = stats(server).await;
+        if ready(&stats) {
+            return stats;
+        }
+        assert!(Instant::now() < deadline, "the statistics never got there: {stats:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A claim is the event and the worker uuid, over TCP (plan 9.15). A claim
+/// request without a uuid is refused; a failure report that names the event
+/// but another worker changes nothing and is counted stale; the one that
+/// names both takes the uuid off the event and raises its failure count,
+/// and another worker claims it.
+#[tokio::test]
+async fn a_failure_report_naming_the_event_and_its_worker_frees_it_for_another_worker() {
+    let engine = Engine::volatile(EngineConfig::default()).await;
+    let server = server(&engine).await;
+    let (producer, _) = dial(&server, Hello::producer("x")).await;
+    let (first, mut first_work) = dial(&server, Hello::worker("x")).await;
+    let (second, mut second_work) = dial(&server, Hello::worker("x")).await;
+    assert_eq!(first.join([0; 16], Some(ch("orders")), Vec::new(), LEASE, false).await, Err(Refusal::Malformed), "a join without a worker uuid");
+    let (_, id) = producer.register_committed(job("orders", b"p")).await.unwrap();
+    assert_eq!(first.claim(id, [0; 16], LEASE).await.map(|_| ()), Err(Refusal::Malformed), "a claim without a worker uuid");
+
+    let first_join = first.join(W, Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
+    first.window(first_join, 1, 0).await.unwrap();
+    let assigned = assignment(&mut first_work).await;
+    assert_eq!((assigned.event.id, assigned.event.worker, assigned.event.failures), (id, Some(W), 0));
+    // The first worker takes no more; the second waits with room for one.
+    first.window(first_join, 0, 0).await.unwrap();
+    let second_join = second.join(W2, Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
+    second.window(second_join, 1, 0).await.unwrap();
+
+    // The event with another worker's uuid: not its claim.
+    first.release(id, W2, Duration::ZERO, true).await.unwrap();
+    let stats = stats_until(&server, |stats| stats.counters.stale == 1).await;
+    assert_eq!((stats.claimed, stats.waiting), (1, 0), "the claim stands");
+    assert!(tokio::time::timeout(QUIET, assignment(&mut second_work)).await.is_err(), "nothing went to the second worker");
+
+    // The event and its worker: a failure report.
+    first.release(id, W, Duration::ZERO, true).await.unwrap();
+    let reassigned = assignment(&mut second_work).await;
+    assert_eq!((reassigned.event.id, reassigned.event.worker, reassigned.event.failures), (id, Some(W2), 1), "the other worker claims it, one failure counted");
+    let done = second.complete(id, W2, Vec::new()).await.unwrap();
+    second.committed(done).await.unwrap();
+    let stats = stats_until(&server, |stats| stats.claimed == 0).await;
+    assert_eq!((stats.waiting, stats.counters.stale), (0, 1));
 }
 
 /// A wrong token, a production connection whose credential may not
@@ -357,13 +413,13 @@ async fn a_window_takes_work_up_to_its_size_and_a_completion_frees_a_slot() {
         producer.register_committed(Envelope::claimable(ch("orders"), 1, Bytes::from_static(payload))).await.unwrap();
     }
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    let worker_join = worker.join(Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
+    let worker_join = worker.join(W, Some(ch("orders")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 2, 0).await.unwrap();
     let first = assignment(&mut work).await;
     let second = assignment(&mut work).await;
     assert!(second.more, "the window is full and one more waits");
     assert!(tokio::time::timeout(QUIET, assignment(&mut work)).await.is_err(), "no more than the window");
-    let seq = worker.complete(first.event.id, first.token(), Vec::new()).await.unwrap();
+    let seq = worker.complete(first.event.id, W, Vec::new()).await.unwrap();
     let third = assignment(&mut work).await;
     worker.committed(seq).await.unwrap();
     let mut payloads = vec![first.event.payload, second.event.payload, third.event.payload];
@@ -382,12 +438,12 @@ async fn a_large_body_arrives_whole() {
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
     let (observer, mut seen) = dial(&server, Hello::observer("x")).await;
     observer.subscribe(ch("feed"), None).await.unwrap();
-    let worker_join = worker.join(Some(ch("big")), Vec::new(), LEASE, false).await.unwrap();
+    let worker_join = worker.join(W, Some(ch("big")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     producer.register_committed(Envelope::claimable(ch("big"), 1, body.clone())).await.unwrap();
     let assigned = assignment(&mut work).await;
     assert_eq!(assigned.event.payload, body);
-    worker.complete(assigned.event.id, assigned.token(), vec![Envelope::dispatch(ch("feed"), 5, body.clone())]).await.unwrap();
+    worker.complete(assigned.event.id, W, vec![Envelope::dispatch(ch("feed"), 5, body.clone())]).await.unwrap();
     assert_eq!(delivery(&mut seen).await.payload, body);
     // Over the bound, the client refuses it before it leaves (B13).
     let over = Bytes::from(vec![0u8; ruvent_protocol::MAX_BODY + 1]);
@@ -409,7 +465,7 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
         let (producer, _) = dial(&server, Hello::producer("x")).await;
         let (worker, mut work) = dial(&server, Hello::worker("x")).await;
         producer.register_committed(job("work", b"p")).await.unwrap();
-        let worker_join = worker.join(Some(ch("work")), Vec::new(), LEASE, false).await.unwrap();
+        let worker_join = worker.join(W, Some(ch("work")), Vec::new(), LEASE, false).await.unwrap();
         worker.window(worker_join, 1, 0).await.unwrap();
         let assigned = assignment(&mut work).await;
         for _ in 0..11 {
@@ -417,7 +473,7 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
         }
         assert!(engine.body_to_disk(durable_body.len() as u64), "{:?}", engine.pressure());
         let follow_ups = vec![Envelope::claimable(ch("next"), 1, durable_body.clone())];
-        let seq = worker.complete(assigned.event.id, assigned.token(), follow_ups).await.unwrap();
+        let seq = worker.complete(assigned.event.id, W, follow_ups).await.unwrap();
         worker.committed(seq).await.unwrap();
         assert_eq!(stats(&server).await.waiting, 12, "every registration was taken: nothing paused the producer");
         drop((producer, worker));
@@ -426,7 +482,7 @@ async fn a_work_connection_streams_follow_up_bodies_to_disk_under_pressure() {
     let engine = durable(&path, EngineConfig::default()).await;
     let server = server(&engine).await;
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    let worker_join = worker.join(Some(ch("next")), Vec::new(), LEASE, false).await.unwrap();
+    let worker_join = worker.join(W, Some(ch("next")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, 1, 0).await.unwrap();
     assert_eq!(assignment(&mut work).await.event.payload, durable_body);
 }
@@ -525,26 +581,28 @@ async fn draining_while_producers_send_misses_no_final_acknowledgement() {
 }
 
 /// A claim survives a graceful restart: the worker comes back with the same
-/// token, extends and completes it, and nothing was reassigned or counted
+/// uuid, extends and completes it by the event and that uuid, and nothing was reassigned or counted
 /// as a failure (2.4, M8-6, raw connections). A peer that never closes after
 /// its `Bye` holds the shutdown up to the close deadline, far past the
 /// reconnect grace, and still cannot make the claim run out meanwhile.
 #[tokio::test]
-async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
+async fn a_claim_survives_a_graceful_restart_and_completes_under_its_worker_uuid() {
     let path = scratch("restart");
-    let (id, token, generation) = {
+    let (id, generation) = {
         let engine = durable(&path, EngineConfig { reconnect_grace: Duration::from_millis(100), ..EngineConfig::default() }).await;
         let server = Server::start(&engine, ServerOptions { close: Duration::from_secs(1), ..ServerOptions::default() }).await;
         let (_lingering, _) = Raw::welcomed(&server.address, raw_hello(Role::Observe, [0; 16], [23; 16])).await;
         let (producer, _) = dial(&server, Hello::producer("x")).await;
         let (_, id) = producer.register_committed(job("work", b"p")).await.unwrap();
         let (mut worker, welcome) = Raw::welcomed(&server.address, raw_hello(Role::Work, [21; 16], [22; 16])).await;
-        worker.send([call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }), call(Call::Window { join: 1, count: 1, bytes: 0 })]).await;
+        worker
+            .send([call(Call::Join { req: 1, worker: W, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }), call(Call::Window { join: 1, count: 1, bytes: 0 })])
+            .await;
         assert_eq!(worker.expect().await, Message::Outbound(Outbound::Joined { req: 1 }));
-        let token = match worker.expect().await {
-            Message::Outbound(Outbound::Assign(assignment)) => assignment.token(),
+        match worker.expect().await {
+            Message::Outbound(Outbound::Assign(assignment)) => assert_eq!(assignment.event.worker, Some(W), "claimed under the join's worker uuid"),
             other => panic!("expected an assignment, got {other:?}"),
-        };
+        }
         drop(producer);
         let stopping = tokio::spawn(server.stop());
         assert_eq!(worker.expect().await, Message::Outbound(Outbound::Bye(ByeReason::Draining)));
@@ -554,7 +612,7 @@ async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
         stopping.await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(500), "the lingering peer held the shutdown to the deadline");
         assert!(engine.stopped().await.is_ok(), "the server shut the engine down");
-        (id, token, welcome.generation)
+        (id, welcome.generation)
     };
     let engine = durable(&path, EngineConfig::default()).await;
     let server = server(&engine).await;
@@ -562,10 +620,10 @@ async fn a_claim_survives_a_graceful_restart_and_completes_under_its_token() {
     assert!(welcome.generation > generation);
     worker
         .send([
-            call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }),
+            call(Call::Join { req: 1, worker: W, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }),
             call(Call::Window { join: 1, count: 1, bytes: 0 }),
-            call(Call::Extend { id, token }),
-            call(Call::Complete { seq: 1, id, token, follow_ups: Vec::new(), spooled: Vec::new() }),
+            call(Call::Extend { id, worker: W }),
+            call(Call::Complete { seq: 1, id, worker: W, follow_ups: Vec::new(), spooled: Vec::new() }),
         ])
         .await;
     assert_eq!(worker.expect().await, Message::Outbound(Outbound::Joined { req: 1 }));
@@ -659,7 +717,9 @@ async fn assignments_never_written_go_back_at_once_when_the_worker_goes() {
         producer.register_committed(Envelope::claimable(ch("big"), 1, payload.clone())).await.unwrap();
     }
     let (mut stalled, _) = Raw::welcomed(&server.address, raw_hello(Role::Work, [41; 16], [42; 16])).await;
-    stalled.send([call(Call::Join { req: 1, channel: Some(ch("big")), types: Vec::new(), lease_ms: 600_000, dispatch: false }), call(Call::Window { join: 1, count: total, bytes: 0 })]).await;
+    stalled
+        .send([call(Call::Join { req: 1, worker: W2, channel: Some(ch("big")), types: Vec::new(), lease_ms: 600_000, dispatch: false }), call(Call::Window { join: 1, count: total, bytes: 0 })])
+        .await;
     loop {
         let stats = stats(&server).await;
         if stats.claimed == u64::from(total) {
@@ -669,7 +729,7 @@ async fn assignments_never_written_go_back_at_once_when_the_worker_goes() {
     }
     drop(stalled);
     let (worker, mut work) = dial(&server, Hello::worker("x")).await;
-    let worker_join = worker.join(Some(ch("big")), Vec::new(), LEASE, false).await.unwrap();
+    let worker_join = worker.join(W, Some(ch("big")), Vec::new(), LEASE, false).await.unwrap();
     worker.window(worker_join, total, 0).await.unwrap();
     let mut returned = 0;
     while let Ok(incoming) = tokio::time::timeout(Duration::from_secs(1), work.recv()).await {

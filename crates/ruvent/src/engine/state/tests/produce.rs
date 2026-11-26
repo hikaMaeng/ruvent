@@ -115,10 +115,9 @@ fn malformed_requests_invalid_ids_and_forbidden_kinds_are_faults() {
     grants.insert("svc".into(), Grant { methods: vec![crate::engine::config::Method::RegisterClaimable] });
     let mut h = H::with(EngineConfig { grants: Some(grants), ..config() }, false);
     h.open(P, hello(Role::Produce, 1));
-    let claim = crate::envelope::ClaimMark { worker: [2; 16], token: ClaimToken::default(), lease_ms: 1 };
     let cases: Vec<(Envelope, FaultKind)> = vec![
         (Envelope { failures: 1, ..work("pub.x") }, FaultKind::Malformed),
-        (Envelope { claim: Some(claim), ..work("pub.x") }, FaultKind::Malformed),
+        (Envelope { worker: Some([2; 16]), ..work("pub.x") }, FaultKind::Malformed),
         (Envelope::claimable(ch("pub.x"), crate::envelope::SERVER_TYPE, Bytes::new()), FaultKind::Malformed),
         (work("pub.x").with_id(EventId([0xff; 16])), FaultKind::InvalidId),
         (Envelope::dispatch(ch("pub.x"), 2, Bytes::new()), FaultKind::Forbidden),
@@ -156,7 +155,7 @@ fn a_producer_that_may_register_nothing_is_refused_before_welcome() {
 #[test]
 fn a_call_the_role_does_not_send_is_refused() {
     let mut h = H::volatile().cast();
-    let effects = h.call(P, Call::Join { req: 5, channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
+    let effects = h.call(P, Call::Join { req: 5, worker: wid(P), channel: Some(ch("work")), types: Vec::new(), lease_ms: 1000, dispatch: false });
     assert_eq!(faults(&effects, P), [FaultKind::Malformed]);
     assert!(sent(&effects, P).contains(&Outbound::Refused { req: 5, reason: Refusal::Malformed }));
     let emit = h.call(W1, Call::Register { seq: None, event: work("work") });

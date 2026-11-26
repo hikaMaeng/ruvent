@@ -116,7 +116,7 @@ fn entry(slot: &Slot) -> Entry {
     let standing = match &slot.place {
         Place::Waiting => Standing::Waiting,
         Place::Delayed { until } => Standing::Delayed { until: *until },
-        Place::Claimed(attempt) => Standing::Claimed { token: attempt.token, lease_ms: attempt.lease_ms, worker: attempt.worker },
+        Place::Claimed(attempt) => Standing::Claimed { lease_ms: attempt.lease_ms, worker: attempt.worker },
     };
     Entry { event, at: slot.at, serial: slot.serial, standing }
 }

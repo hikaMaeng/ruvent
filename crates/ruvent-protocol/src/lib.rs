@@ -1,9 +1,16 @@
-//! The event server's binary wire protocol, version 5 (plan 2.2, 2.11, 9.15).
+//! The event server's binary wire protocol, version 6 (plan 2.2, 2.11, 9.15).
 //!
-//! Version 5 differs from 4 in carrying only what the server's own work
+//! Version 6 differs from 5 in naming a claim by the event and the worker
+//! uuid alone. There is no claim token and no claim mark: an assigned event
+//! carries the uuid of the worker that claimed it, and its presence is the
+//! claim. `Join` and `Claim` carry the worker uuid (a claim request without
+//! one is refused), `Complete`, `Extend` and `Release` carry the event id and
+//! that worker uuid (both must match), and an assignment carries its lease
+//! length beside the lease left.
+//!
+//! Version 5 differed from 4 in carrying only what the server's own work
 //! needs. The envelope has no names and no policy fields: no `principal`,
-//! `delegate`, `expires`, `group` or isolated bit; an assignment's claim mark
-//! (worker uuid, token, lease) is in its envelope. With nothing left to name,
+//! `delegate`, `expires`, `group` or isolated bit. With nothing left to name,
 //! the per-connection name dictionary (`NameDef`, `DictReset`) is gone, and
 //! so are `Paused`/`Resumed` (nothing pauses a producer) and the types a
 //! `Hello` declared. Version 4 made the channel a 16-octet UUIDv7, the type a
@@ -44,13 +51,13 @@
 //! | `0x04` | `Fault` | ← server | kind code u8, detail (text, ≤ 255 bytes) | — |
 //! | `0x10` | `Register` | → server | seq (0: none, a work connection's dispatch), event head (request layout) | payload |
 //! | `0x11` | `Delete` | → server | seq, id 16, result channel 16, key? | — |
-//! | `0x12` | `Join` | → server | req, has channel u8, channel 16?, type count, types (u16 each), lease ms, dispatch u8 | — |
+//! | `0x12` | `Join` | → server | req, worker 16, has channel u8, channel 16?, type count, types (u16 each), lease ms, dispatch u8 | — |
 //! | `0x13` | `Window` | → server | join (its `Join`'s req), count, bytes | — |
-//! | `0x14` | `Complete` | → server | seq, id 16, token, follow-up count | — |
+//! | `0x14` | `Complete` | → server | seq, id 16, worker 16, follow-up count | — |
 //! | `0x15` | `FollowUp` | → server | event head (request layout) | payload |
-//! | `0x16` | `Extend` | → server | id 16, token | — |
-//! | `0x17` | `Release` | → server | id 16, token, delay ms, failed u8 | — |
-//! | `0x18` | `Claim` | → server | req, id 16, lease ms | — |
+//! | `0x16` | `Extend` | → server | id 16, worker 16 | — |
+//! | `0x17` | `Release` | → server | id 16, worker 16, delay ms, failed u8 | — |
+//! | `0x18` | `Claim` | → server | req, id 16, worker 16, lease ms | — |
 //! | `0x19` | `Subscribe` | → server | req, channel 16, key? | — |
 //! | `0x1a` | `Unsubscribe` | → server | req, channel 16 | — |
 //! | `0x1b` | `Stats` | → server | req | — |
@@ -68,10 +75,11 @@
 //! | `0x2c` | `StatsReply` | ← server | req, totals, counters, top types, idle lanes | — |
 //! | `0x2d` | `Draining` | ← server | req | — |
 //!
-//! * token = generation, seq. key? = presence u8, then generation, arrival.
-//! * assignment = remaining lease ms, more u8, event head (assigned layout:
-//!   work key, failure count and the claim mark — worker, token, lease —
-//!   included). The server writes the lease left at the moment it starts
+//! * key? = presence u8, then generation, arrival. worker = the worker's
+//!   uuid, 16 octets, never nil in a request.
+//! * assignment = lease ms, remaining lease ms, more u8, event head
+//!   (assigned layout: work key, failure count and the worker uuid it is
+//!   claimed under included). The server writes the lease left at the moment it starts
 //!   writing the record; a decoded `ruvent::Assignment` carries it in `until`
 //!   (the client has no server clock), so `until` on the client side is "ms
 //!   left when sent".
@@ -122,7 +130,7 @@ pub use io::{sniff_v1, Parts, RawRecord, RecordReader, HEADER};
 pub use records::{validate, Body, Decoder, Encoder, Message, Side};
 
 /// The only protocol version this build speaks.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 /// Default bound on one record's body (B13).
 pub const MAX_BODY: usize = 16 << 20;
 /// Default: a body below this many bytes is copied into the head's buffer

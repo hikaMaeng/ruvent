@@ -43,13 +43,13 @@ fn recovery_holds_metadata_only_and_payloads_come_back_through_reads() {
         let used = engine.pressure().memory_used;
         assert!(used < 64 * 1024, "{used} managed bytes after recovering 3 MiB of payloads: metadata only");
         let (worker, mut assignments) = worker(&engine).await;
-        let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+        let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
         worker.window(worker_join, 1, 0).await.unwrap();
         for _ in 0..ids.len() {
             let assignment = next_assignment(&mut assignments).await;
             let index = ids[&assignment.event.id];
             assert_eq!(assignment.event.payload, payload(index, 128 * 1024), "event {index} came back whole");
-            let seq = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+            let seq = worker.complete(assignment.event.id, WORKER, Vec::new()).await.unwrap();
             worker.committed(seq).await.unwrap();
         }
         let (observer, _) = observer(&engine).await;
@@ -146,7 +146,7 @@ fn relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothin
         let engine = Engine::start(config.clone(), StallingLog { inner, checkpoints: Some(checkpoints) }, recovered).await.unwrap();
         let (producer, _) = producer(&engine).await;
         let (worker, mut assignments) = worker(&engine).await;
-        let worker_join = worker.join(Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+        let worker_join = worker.join(WORKER, Some(ch("work")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
         worker.window(worker_join, 2, 0).await.unwrap();
         let mut index = 0u32;
         for round in 0..400u32 {
@@ -157,7 +157,7 @@ fn relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothin
             if channel == "work" {
                 let assignment = next_assignment(&mut assignments).await;
                 assert_eq!(assignment.event.payload, payload(live[&assignment.event.id], 1024), "a hot or cold payload, whole");
-                let seq = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+                let seq = worker.complete(assignment.event.id, WORKER, Vec::new()).await.unwrap();
                 worker.committed(seq).await.unwrap();
                 live.remove(&assignment.event.id);
             }
@@ -178,7 +178,7 @@ fn relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothin
             live.insert(id, index);
             index += 1;
             let assignment = next_assignment(&mut assignments).await;
-            let seq = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+            let seq = worker.complete(assignment.event.id, WORKER, Vec::new()).await.unwrap();
             worker.committed(seq).await.unwrap();
             live.remove(&assignment.event.id);
             if tokio::time::timeout(Duration::from_millis(1), &mut begun).await.is_ok() {
@@ -207,12 +207,12 @@ fn relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothin
         }
         assert_eq!(back, live.keys().copied().collect::<BTreeSet<_>>(), "everything committed and not completed, and nothing else");
         let (worker, mut assignments) = worker(&engine).await;
-        let worker_join = worker.join(Some(ch("slow")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+        let worker_join = worker.join(WORKER, Some(ch("slow")), Vec::new(), Duration::from_secs(60), false).await.unwrap();
         worker.window(worker_join, 4, 0).await.unwrap();
         for _ in 0..live.len() {
             let assignment = next_assignment(&mut assignments).await;
             assert_eq!(assignment.event.payload, payload(live[&assignment.event.id], 1024), "the payload, wherever relocation left it");
-            let seq = worker.complete(assignment.event.id, assignment.token(), Vec::new()).await.unwrap();
+            let seq = worker.complete(assignment.event.id, WORKER, Vec::new()).await.unwrap();
             worker.committed(seq).await.unwrap();
         }
     });
@@ -263,7 +263,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_survive_a_restart() {
         producer.register_committed(work("work")).await.unwrap();
         let (session, mut out) = engine.open(Hello::worker("svc")).await.unwrap();
         assert!(matches!(out.recv().await, Some(Outbound::Welcome(_))));
-        session.call(Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }).await.unwrap();
+        session.call(Call::Join { req: 1, worker: WORKER, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false }).await.unwrap();
         session.call(Call::Window { join: 1, count: 1, bytes: 0 }).await.unwrap();
         let assignment = loop {
             if let Some(Outbound::Assign(assignment)) = out.recv().await {
@@ -273,7 +273,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_survive_a_restart() {
         let first = spool(&engine, b"a body received to disk").await;
         let second = spool(&engine, b"another body received to disk").await;
         let follow_ups = vec![Envelope::claimable(ch(labels[0]), 1, Bytes::new()), Envelope::claimable(ch(labels[1]), 1, Bytes::new())];
-        session.call(Call::Complete { seq: 1, id: assignment.event.id, token: assignment.token(), follow_ups, spooled: vec![(0, first), (1, second)] }).await.unwrap();
+        session.call(Call::Complete { seq: 1, id: assignment.event.id, worker: WORKER, follow_ups, spooled: vec![(0, first), (1, second)] }).await.unwrap();
         loop {
             if let Some(Outbound::Committed { seq: 1 }) = out.recv().await {
                 break;
@@ -282,7 +282,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_survive_a_restart() {
         let (taker, mut taken) = connect(&engine, Hello::worker("svc"), 64).await.unwrap();
         let mut taker_joins = Vec::new();
         for label in labels {
-            let taker_join = taker.join(Some(ch(label)), Vec::new(), Duration::from_secs(60), false).await.unwrap();
+            let taker_join = taker.join(TAKER, Some(ch(label)), Vec::new(), Duration::from_secs(60), false).await.unwrap();
             taker.window(taker_join, 1, 0).await.unwrap();
             taker_joins.push(taker_join);
         }
@@ -300,7 +300,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_survive_a_restart() {
             taker.window(taker_join, 0, 0).await.unwrap();
         }
         for assignment in held {
-            taker.release(assignment.event.id, assignment.token(), Duration::ZERO, false).await.unwrap();
+            taker.release(assignment.event.id, TAKER, Duration::ZERO, false).await.unwrap();
         }
         assert_eq!(bodies[labels[0]], Bytes::from_static(b"a body received to disk"));
         assert_eq!(bodies[labels[1]], Bytes::from_static(b"another body received to disk"));
@@ -310,7 +310,7 @@ async fn streamed_follow_up_bodies_go_out_from_disk_and_survive_a_restart() {
     let (journal, recovered) = SegmentLog::open(&path).unwrap();
     let engine = Engine::start(EngineConfig::default(), journal, recovered).await.unwrap();
     let (worker, mut assignments) = worker(&engine).await;
-    let worker_join = worker.join(None, vec![1], Duration::from_secs(60), false).await.unwrap();
+    let worker_join = worker.join(WORKER, None, vec![1], Duration::from_secs(60), false).await.unwrap();
     worker.window(worker_join, 2, 0).await.unwrap();
     let mut bodies = vec![next_assignment(&mut assignments).await.event.payload, next_assignment(&mut assignments).await.event.payload];
     bodies.sort();

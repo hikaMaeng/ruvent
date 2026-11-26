@@ -21,8 +21,8 @@ impl State {
     /// Checks a registration request or a follow-up. Faults (once per kind)
     /// and returns `None` when it may not be applied.
     pub(super) fn admit(&mut self, session: SessionId, credential: &Name, event: Envelope) -> Option<Envelope> {
-        if event.failures != 0 || event.key.is_some() || event.claim.is_some() {
-            self.fault(session, FaultKind::Malformed, "a request may not carry failures, a work key or a claim mark");
+        if event.failures != 0 || event.key.is_some() || event.worker.is_some() {
+            self.fault(session, FaultKind::Malformed, "a request may not carry failures, a work key or a worker");
             return None;
         }
         if !event.channel.is_valid() {

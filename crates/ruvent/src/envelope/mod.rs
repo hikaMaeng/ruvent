@@ -11,8 +11,7 @@
 //!  work key (claimable, when the server sends or journals it)
 //!  ┌── generation 4 · arrival varint ──┐
 //!  not_before varint                                  (flag bit, claimable)
-//!  claim mark: worker 16 · token generation 4 · token seq varint · lease ms varint
-//!                                                     (flag bit, an assignment)
+//!  worker 16                                          (flag bit: claimed, and by whom)
 //!  payload: length 4 + bytes
 //! ```
 //!
@@ -26,14 +25,14 @@
 //!
 //! | field | the server's work that needs it |
 //! | --- | --- |
-//! | id | idempotent registration and completion; claim and delete by id |
+//! | id | idempotent registration; with the worker, names a claim; claim and delete by id |
 //! | channel | dispatch goes to the channel's subscribers; the waiting lane |
 //! | type | claimable work goes to the worker that joined its type (`Call::Join`) |
 //! | kind | claimable waits for a completion, dispatch is handed over and gone |
 //! | failures | the retry count: lease expiries and failed releases. The worker reads it and decides |
 //! | work key | the waiting order, and the registration's name in the journal |
 //! | not_before | a delayed registration or release becomes visible then |
-//! | claim mark | which worker holds the event (its uuid), the attempt's fencing token and lease |
+//! | worker | the uuid of the worker that claimed it. Present: claimed; absent: not. A completion, an extension or a failure report names the event and this worker, and both must match |
 //!
 //! Policies are not here: no isolation, expiry, grouping, delegation or
 //! credential. Retry limits, dead letters and deadlines are the workers'
@@ -169,15 +168,6 @@ pub struct WorkKey {
     pub arrival: u64,
 }
 
-/// The name of one attempt: issued fresh at every assignment and compared at
-/// completion, extension and release. Rises monotonically; workers use it as
-/// a fencing token.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
-pub struct ClaimToken {
-    pub generation: u32,
-    pub seq: u64,
-}
-
 /// What happens to an event: one worker claims it, or it is sent to every subscriber.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
@@ -217,21 +207,15 @@ pub struct Envelope {
     pub key: Option<WorkKey>,
     /// Visible from this time on (see the module's "Times").
     pub not_before: Option<u64>,
-    /// Set by the server on an assignment: who holds the event and under which attempt.
-    pub claim: Option<ClaimMark>,
+    /// Set by the server on an assignment: the uuid of the worker that
+    /// claimed it. Its presence is the claim; there is no other mark.
+    pub worker: Option<WorkerId>,
     pub payload: Bytes,
 }
 
-/// The claim mark of an assigned event: the worker that holds it, the
-/// attempt, and the lease the attempt runs under.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ClaimMark {
-    /// The worker's uuid: its work connection's producer id. A completion,
-    /// extension or release must come from this worker with this token.
-    pub worker: ProducerId,
-    pub token: ClaimToken,
-    pub lease_ms: u64,
-}
+/// A worker's uuid: what a claim names. Every claim request carries it, and a
+/// completion, an extension or a failure report must carry the same one.
+pub type WorkerId = [u8; 16];
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -239,7 +223,7 @@ fn millis(duration: Duration) -> u64 {
 
 impl Envelope {
     fn draft(kind: Kind, channel: Channel, event_type: u16, payload: impl Into<Bytes>) -> Self {
-        Envelope { id: EventId::NIL, channel, event_type, kind, failures: 0, key: None, not_before: None, claim: None, payload: payload.into() }
+        Envelope { id: EventId::NIL, channel, event_type, kind, failures: 0, key: None, not_before: None, worker: None, payload: payload.into() }
     }
 
     /// A claimable event to register; the server assigns the id unless [`Envelope::with_id`] sets one.
@@ -266,7 +250,7 @@ impl Envelope {
     /// The `flags` word this envelope encodes with, before a layout masks it.
     pub fn flags(&self) -> u16 {
         let mut flags = 0;
-        for (present, bit) in [(self.kind == Kind::Dispatch, codec::KIND), (self.not_before.is_some(), codec::NOT_BEFORE), (self.claim.is_some(), codec::CLAIMED)] {
+        for (present, bit) in [(self.kind == Kind::Dispatch, codec::KIND), (self.not_before.is_some(), codec::NOT_BEFORE), (self.worker.is_some(), codec::WORKER)] {
             if present {
                 flags |= bit;
             }
@@ -276,7 +260,7 @@ impl Envelope {
 
     /// The same event as a notice: the head and the work key, nothing else.
     pub fn notice(&self) -> Envelope {
-        Envelope { not_before: None, claim: None, payload: Bytes::new(), ..self.clone() }
+        Envelope { not_before: None, worker: None, payload: Bytes::new(), ..self.clone() }
     }
 }
 

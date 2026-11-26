@@ -1,8 +1,8 @@
 //! The envelope's byte layout. One body codec, used by the wire and the journal.
 //!
-//! Fixed-width numbers are little-endian; `id`, the channel and the claim
-//! mark's worker are 16 octets. The work key's arrival, `not_before`, the
-//! token's sequence and the lease are unsigned LEB128 varints
+//! Fixed-width numbers are little-endian; `id`, the channel and the worker
+//! are 16 octets. The work key's arrival and `not_before` are unsigned
+//! LEB128 varints
 //! ([`put_varint`]). There are no names: nothing here needs a dictionary. A
 //! decoder knows every length from the [`Layout`] and the `flags` word alone.
 //!
@@ -12,18 +12,18 @@
 //! | --- | --- |
 //! | 0 | kind: set means dispatch |
 //! | 1 | `not_before` present (claimable) |
-//! | 2 | claim mark present (an assignment) |
+//! | 2 | worker present: the event is claimed (an assignment) |
 //! | 3–15 | reserved, always zero |
 
-use super::{Channel, ClaimMark, ClaimToken, Envelope, EventId, Kind, WorkKey};
+use super::{Channel, Envelope, EventId, Kind, WorkKey};
 use bytes::{BufMut, Bytes};
 use std::fmt;
 
 pub const KIND: u16 = 1 << 0;
 pub const NOT_BEFORE: u16 = 1 << 1;
-pub const CLAIMED: u16 = 1 << 2;
+pub const WORKER: u16 = 1 << 2;
 /// Bits no layout may set.
-pub const RESERVED: u16 = !(KIND | NOT_BEFORE | CLAIMED);
+pub const RESERVED: u16 = !(KIND | NOT_BEFORE | WORKER);
 
 /// id 16 + channel 16 + type 2 + flags 2 + failures 2.
 pub const HEAD: usize = 38;
@@ -32,11 +32,11 @@ pub const HEAD: usize = 38;
 ///
 /// | layout | carries | refused |
 /// | --- | --- | --- |
-/// | `Request` | head, `not_before`, payload | failures ≠ 0, claim mark |
-/// | `Notice` | head, work key | `not_before`, claim mark |
-/// | `Assigned` | head, work key, `not_before`, claim mark (required), payload | dispatch |
-/// | `Delivery` | head, payload | failures ≠ 0, claimable, `not_before`, claim mark |
-/// | `Journal` | head, work key, `not_before`, payload | dispatch, claim mark (a claim is its own record) |
+/// | `Request` | head, `not_before`, payload | failures ≠ 0, worker |
+/// | `Notice` | head, work key | `not_before`, worker |
+/// | `Assigned` | head, work key, `not_before`, worker (required), payload | dispatch |
+/// | `Delivery` | head, payload | failures ≠ 0, claimable, `not_before`, worker |
+/// | `Journal` | head, work key, `not_before`, payload | dispatch, worker (a claim is its own record) |
 ///
 /// Every layout refuses the reserved bits, and `not_before` and the claim
 /// mark on a dispatch event.
@@ -72,7 +72,7 @@ impl Layout {
         match self {
             Layout::Notice | Layout::Delivery => KIND,
             Layout::Request | Layout::Journal => KIND | NOT_BEFORE,
-            Layout::Assigned => KIND | NOT_BEFORE | CLAIMED,
+            Layout::Assigned => KIND | NOT_BEFORE | WORKER,
         }
     }
 
@@ -81,8 +81,8 @@ impl Layout {
             return Err(Malformed::Reserved);
         }
         let dispatch = flags & KIND != 0;
-        if dispatch && flags & (NOT_BEFORE | CLAIMED) != 0 {
-            return Err(Malformed::Forbidden("not_before or a claim mark on a dispatch event"));
+        if dispatch && flags & (NOT_BEFORE | WORKER) != 0 {
+            return Err(Malformed::Forbidden("not_before or a worker on a dispatch event"));
         }
         if !self.has_failures() && failures != 0 {
             return Err(Malformed::Forbidden("failures"));
@@ -93,7 +93,7 @@ impl Layout {
         match self {
             Layout::Delivery if !dispatch => Err(Malformed::Forbidden("claimable")),
             Layout::Assigned | Layout::Journal if dispatch => Err(Malformed::Forbidden("dispatch")),
-            Layout::Assigned if flags & CLAIMED == 0 => Err(Malformed::Missing("claim mark")),
+            Layout::Assigned if flags & WORKER == 0 => Err(Malformed::Missing("worker")),
             _ => Ok(()),
         }
     }
@@ -158,8 +158,8 @@ pub fn size(envelope: &Envelope, layout: Layout) -> usize {
     if flags & NOT_BEFORE != 0 {
         size += varint_len(envelope.not_before.unwrap_or_default());
     }
-    if let (true, Some(claim)) = (flags & CLAIMED != 0, &envelope.claim) {
-        size += 16 + 4 + varint_len(claim.token.seq) + varint_len(claim.lease_ms);
+    if flags & WORKER != 0 {
+        size += 16;
     }
     if layout.has_payload() {
         size += 4 + envelope.payload.len();
@@ -221,11 +221,8 @@ fn encode_parts(envelope: &Envelope, layout: Layout, out: &mut impl BufMut, payl
     if flags & NOT_BEFORE != 0 {
         put_varint(out, envelope.not_before.unwrap_or_default());
     }
-    if let (true, Some(claim)) = (flags & CLAIMED != 0, &envelope.claim) {
-        out.put_slice(&claim.worker);
-        out.put_u32_le(claim.token.generation);
-        put_varint(out, claim.token.seq);
-        put_varint(out, claim.lease_ms);
+    if let (true, Some(worker)) = (flags & WORKER != 0, &envelope.worker) {
+        out.put_slice(worker);
     }
     if payload && layout.has_payload() {
         out.put_u32_le(envelope.payload.len() as u32);
@@ -338,13 +335,7 @@ fn decode_parts(reader: &mut Reader<'_>, layout: Layout, with_payload: bool) -> 
     layout.check(flags, failures)?;
     let key = if layout.has_key() { Some(WorkKey { generation: reader.u32()?, arrival: reader.varint()? }) } else { None };
     let not_before = if flags & NOT_BEFORE != 0 { Some(reader.varint()?) } else { None };
-    let claim = if flags & CLAIMED != 0 {
-        let worker = reader.bytes16()?;
-        let token = ClaimToken { generation: reader.u32()?, seq: reader.varint()? };
-        Some(ClaimMark { worker, token, lease_ms: reader.varint()? })
-    } else {
-        None
-    };
+    let worker = if flags & WORKER != 0 { Some(reader.bytes16()?) } else { None };
     let payload = if with_payload && layout.has_payload() {
         let length = reader.u32()? as usize;
         reader.take_shared(length)?
@@ -352,5 +343,5 @@ fn decode_parts(reader: &mut Reader<'_>, layout: Layout, with_payload: bool) -> 
         Bytes::new()
     };
     let kind = if flags & KIND != 0 { Kind::Dispatch } else { Kind::Claimable };
-    Ok(Envelope { id, channel, event_type, kind, failures, key, not_before, claim, payload })
+    Ok(Envelope { id, channel, event_type, kind, failures, key, not_before, worker, payload })
 }

@@ -1,13 +1,13 @@
 //! Records → messages, for one direction of one connection.
 
-use super::fields::{boolean, channel, intern, key, text, token, varint32};
+use super::fields::{boolean, channel, intern, key, text, varint32, worker};
 use super::*;
 use crate::error::ProtocolError;
 use crate::io::RawRecord;
 use crate::VERSION;
 use bytes::Bytes;
 use ruvent::envelope::codec::{self, Layout, Malformed, Reader};
-use ruvent::{Assignment, ByeReason, Channel, ClaimToken, Envelope, EventId, FaultKind, Name, Refusal, Role};
+use ruvent::{Assignment, ByeReason, Channel, Envelope, EventId, FaultKind, Name, Refusal, Role, WorkerId};
 
 /// Most follow-ups one `Complete`, or notices one `Subscribed`, may announce.
 /// The engine bounds both far lower (S10, `backlog_page`); this only keeps a
@@ -16,7 +16,7 @@ const GATHERED: u64 = 1 << 16;
 
 /// A message whose records are still arriving.
 enum Gather {
-    Complete { seq: u64, id: EventId, token: ClaimToken, left: u64, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)> },
+    Complete { seq: u64, id: EventId, worker: WorkerId, left: u64, follow_ups: Vec<Envelope>, spooled: Vec<(u32, Spooled)> },
     Subscribed { req: u32, channel: Channel, more: bool, left: u64, backlog: Vec<Envelope> },
 }
 
@@ -150,10 +150,11 @@ impl Decoder {
     }
 
     fn assignment(&self, reader: &mut Reader<'_>, record: &RawRecord, body: Body) -> Result<Assignment, ProtocolError> {
+        let lease_ms = reader.varint()?;
         let remaining = reader.varint()?;
         let more = boolean(reader)?;
         let event = self.carried(reader, Layout::Assigned, record, body)?;
-        Ok(Assignment { event, until: remaining, more })
+        Ok(Assignment { event, lease_ms, until: remaining, more })
     }
 
     fn record(&mut self, record: &RawRecord, reader: &mut Reader<'_>, body: Body) -> Result<Option<Message>, ProtocolError> {
@@ -215,13 +216,14 @@ impl Decoder {
             }
             JOIN => {
                 let req = req(reader)?;
+                let worker = worker(reader)?;
                 let channel = if boolean(reader)? { Some(channel(reader)?) } else { None };
                 let mut types = Vec::new();
                 for _ in 0..count(reader, GATHERED)? {
                     types.push(reader.u16()?);
                 }
                 let lease_ms = reader.varint()?;
-                Message::Call(Call::Join { req, channel, types, lease_ms, dispatch: boolean(reader)? })
+                Message::Call(Call::Join { req, worker, channel, types, lease_ms, dispatch: boolean(reader)? })
             }
             WINDOW => {
                 let join = varint32(reader)?;
@@ -230,13 +232,13 @@ impl Decoder {
             COMPLETE => {
                 let seq = reader.varint()?;
                 let id = reader.id()?;
-                let token = token(reader)?;
+                let worker = worker(reader)?;
                 let left = count(reader, GATHERED)?;
                 if left > 0 {
-                    self.gather = Some(Gather::Complete { seq, id, token, left, follow_ups: Vec::new(), spooled: Vec::new() });
+                    self.gather = Some(Gather::Complete { seq, id, worker, left, follow_ups: Vec::new(), spooled: Vec::new() });
                     return Ok(None);
                 }
-                Message::Call(Call::Complete { seq, id, token, follow_ups: Vec::new(), spooled: Vec::new() })
+                Message::Call(Call::Complete { seq, id, worker, follow_ups: Vec::new(), spooled: Vec::new() })
             }
             FOLLOW_UP => {
                 let event = self.event(reader, Layout::Request)?;
@@ -258,24 +260,25 @@ impl Decoder {
                     return Ok(None);
                 }
                 match self.gather.take() {
-                    Some(Gather::Complete { seq, id, token, follow_ups, spooled, .. }) => Message::Call(Call::Complete { seq, id, token, follow_ups, spooled }),
+                    Some(Gather::Complete { seq, id, worker, follow_ups, spooled, .. }) => Message::Call(Call::Complete { seq, id, worker, follow_ups, spooled }),
                     _ => return Err(ProtocolError::WrongDirection(tag)),
                 }
             }
             EXTEND => {
                 let id = reader.id()?;
-                Message::Call(Call::Extend { id, token: token(reader)? })
+                Message::Call(Call::Extend { id, worker: worker(reader)? })
             }
             RELEASE => {
                 let id = reader.id()?;
-                let token = token(reader)?;
+                let worker = worker(reader)?;
                 let delay_ms = reader.varint()?;
-                Message::Call(Call::Release { id, token, delay_ms, failed: boolean(reader)? })
+                Message::Call(Call::Release { id, worker, delay_ms, failed: boolean(reader)? })
             }
             CLAIM => {
                 let req = req(reader)?;
                 let id = reader.id()?;
-                Message::Call(Call::Claim { req, id, lease_ms: reader.varint()? })
+                let worker = worker(reader)?;
+                Message::Call(Call::Claim { req, id, worker, lease_ms: reader.varint()? })
             }
             SUBSCRIBE => {
                 let req = req(reader)?;

@@ -2,7 +2,7 @@
 //! a real disk.
 
 use super::*;
-use crate::envelope::{Channel, ClaimToken, Envelope, EventId};
+use crate::envelope::{Channel, Envelope, EventId};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -91,7 +91,7 @@ fn every_record_kind_survives_a_reopen_and_payloads_stay_on_disk() {
         Record::Generation(1),
         Record::ProducerDef { number: 0, id: [9; 16] },
         registration(0, "orders"),
-        Record::Claim { key: key(0), token: ClaimToken { generation: 1, seq: u64::MAX }, lease_ms: 30_000, worker: [0x77; 16] },
+        Record::Claim { key: key(0), lease_ms: u64::MAX, worker: [0x77; 16] },
         Record::Reclaim { key: key(0), failures: 4 },
         Record::Release { key: key(0), failures: 5, visible_at: Some(123_456) },
         Record::Release { key: key(0), failures: 5, visible_at: None },
@@ -129,7 +129,7 @@ fn every_record_kind_survives_a_reopen_and_payloads_stay_on_disk() {
 #[test]
 fn a_claim_removed_in_the_same_frame_is_not_written_and_keeps_its_serial() {
     let path = scratch();
-    let claim = |arrival| Record::Claim { key: key(arrival), token: ClaimToken { generation: 1, seq: arrival }, lease_ms: 30_000, worker: [1; 16] };
+    let claim = |arrival| Record::Claim { key: key(arrival), lease_ms: 30_000, worker: [1; 16] };
     append(&path, DEFAULT_SEGMENT_BYTES, vec![batch(0, vec![registration(0, "work"), claim(0), Record::Remove(key(0)), registration(1, "work")]), batch(4, vec![claim(1)])]);
     let (items, _) = drain(SegmentLog::open(&path).unwrap().1).unwrap();
     let serials: Vec<u64> = records(&items).iter().map(|(serial, _)| *serial).collect();
@@ -256,7 +256,7 @@ fn segments_roll_at_their_size_and_each_decodes_on_its_own() {
 
 fn entry(arrival: u64, at: Option<Location>, serial: u64) -> Entry {
     let Record::Register { event, .. } = registration(arrival, "work") else { unreachable!() };
-    Entry { event: Envelope { payload: Bytes::new(), ..event }, at, serial, standing: Standing::Claimed { token: ClaimToken { generation: 1, seq: 4 }, lease_ms: 9, worker: [0x66; 16] } }
+    Entry { event: Envelope { payload: Bytes::new(), ..event }, at, serial, standing: Standing::Claimed { lease_ms: 9, worker: [0x66; 16] } }
 }
 
 /// Recovery reads the checkpoint, then the tail from the checkpoint's start:

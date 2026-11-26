@@ -53,7 +53,7 @@ pub use disk::Warm;
 
 use super::config::{EngineConfig, Grants, Method};
 use super::ops::{ByeReason, Call, Counters, FaultKind, Hello, Outbound, Refusal, Role, SessionId, Welcome};
-use crate::envelope::{Channel, ClaimToken, Envelope, EventId, ProducerId, WorkKey};
+use crate::envelope::{Channel, Envelope, EventId, ProducerId, WorkKey};
 use crate::journal::{Location, Record};
 use crate::names::{Name, Names};
 use lanes::{Join, Lane, LaneKey};
@@ -183,7 +183,6 @@ pub struct State {
     server_id: [u8; 16],
     generation: u32,
     arrival: u64,
-    claim_seq: u64,
     /// Accumulated uptime (ms) of the batch being applied.
     now: u64,
     /// The last commit number on disk.
@@ -241,7 +240,6 @@ impl State {
             server_id: config.server_id.unwrap_or_else(|| EventId::new_v7().0),
             generation: 0,
             arrival: 0,
-            claim_seq: 0,
             now: 0,
             durable: 0,
             carrying: 1,
@@ -416,12 +414,6 @@ impl State {
         key
     }
 
-    fn next_token(&mut self) -> ClaimToken {
-        let token = ClaimToken { generation: self.generation, seq: self.claim_seq };
-        self.claim_seq += 1;
-        token
-    }
-
     /// The commit number a send about this slot must wait for under Strict.
     fn gate_for(&self, index: Index) -> Option<u64> {
         let slot = self.slots.get(index)?;
@@ -477,11 +469,11 @@ impl State {
         self.send(session, Outbound::Welcome(welcome), gate);
     }
 
-    /// A connection closed. `unwritten` are the tokens of assignments its
+    /// A connection closed. `unwritten` are the event ids of assignments its
     /// owner had not finished writing: they go back to waiting at once, with
     /// their failure count unchanged. Fully written ones are due within the
     /// reconnect grace (2.4).
-    pub fn close(&mut self, session: SessionId, unwritten: &[ClaimToken]) {
+    pub fn close(&mut self, session: SessionId, unwritten: &[EventId]) {
         let Some(gone) = self.sessions.remove(&session) else { return };
         for channel in &gone.channels {
             self.subscribers.remove(channel, session);
@@ -538,12 +530,12 @@ impl State {
         match call {
             Call::Register { event, .. } => self.register(session, role, &credential, event),
             Call::Delete { id, result, key, .. } => self.delete(session, &credential, id, result, key),
-            Call::Join { req, channel, types, lease_ms, dispatch } => self.join(session, &credential, req, channel, types, lease_ms, dispatch),
+            Call::Join { req, worker, channel, types, lease_ms, dispatch } => self.join(session, &credential, req, worker, channel, types, lease_ms, dispatch),
             Call::Window { join, count, bytes } => self.window(session, join, count, bytes),
-            Call::Complete { id, token, follow_ups, spooled, .. } => self.complete(session, &credential, id, token, follow_ups, spooled),
-            Call::Extend { id, token } => self.extend(session, id, token),
-            Call::Release { id, token, delay_ms, failed } => self.give_back(session, &credential, id, token, delay_ms, failed),
-            Call::Claim { req, id, lease_ms } => self.claim(session, &credential, req, id, lease_ms),
+            Call::Complete { id, worker, follow_ups, spooled, .. } => self.complete(session, &credential, id, worker, follow_ups, spooled),
+            Call::Extend { id, worker } => self.extend(session, id, worker),
+            Call::Release { id, worker, delay_ms, failed } => self.give_back(session, &credential, id, worker, delay_ms, failed),
+            Call::Claim { req, id, worker, lease_ms } => self.claim(session, &credential, req, id, worker, lease_ms),
             Call::Subscribe { req, channel, after } => self.subscribe(session, &credential, req, channel, after),
             Call::Unsubscribe { req, channel } => {
                 if let Some(open) = self.sessions.get_mut(&session) {

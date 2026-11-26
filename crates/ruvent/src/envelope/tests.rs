@@ -28,7 +28,7 @@ fn sample() -> Envelope {
 }
 
 const KEY: WorkKey = WorkKey { generation: 3, arrival: 9 };
-const CLAIM: ClaimMark = ClaimMark { worker: [0x55; 16], token: ClaimToken { generation: 3, seq: 5 }, lease_ms: 30_000 };
+const WORKER: WorkerId = [0x55; 16];
 
 #[test]
 fn the_head_is_38_bytes_and_the_key_adds_four_plus_a_varint() {
@@ -38,8 +38,8 @@ fn the_head_is_38_bytes_and_the_key_adds_four_plus_a_varint() {
     let waiting = Envelope { key: Some(KEY), ..sample() };
     assert_eq!(codec::size(&waiting, Layout::Journal), 47, "a small arrival is one varint byte");
     assert_eq!(codec::size(&waiting, Layout::Notice), 43);
-    let late = Envelope { key: Some(WorkKey { generation: 3, arrival: u64::MAX }), claim: Some(CLAIM), ..sample() };
-    assert_eq!(codec::size(&late, Layout::Assigned), 56 + 16 + 4 + 1 + 3, "u64::MAX takes ten varint bytes; the claim mark is worker 16, token 4 + varint, lease varint");
+    let late = Envelope { key: Some(WorkKey { generation: 3, arrival: u64::MAX }), worker: Some(WORKER), ..sample() };
+    assert_eq!(codec::size(&late, Layout::Assigned), 56 + 16, "u64::MAX takes ten varint bytes; the worker uuid is 16");
     for (envelope, layout) in [(&dispatch, Layout::Delivery), (&waiting, Layout::Journal), (&late, Layout::Assigned), (&waiting, Layout::Notice)] {
         assert_eq!(roundtrip(envelope, layout).unwrap().0.len(), codec::size(envelope, layout));
     }
@@ -48,21 +48,19 @@ fn the_head_is_38_bytes_and_the_key_adds_four_plus_a_varint() {
 /// The byte layout, pinned: changing it breaks every peer and every journal.
 #[test]
 fn an_assigned_event_has_these_exact_bytes() {
-    let event = Envelope { failures: 2, key: Some(KEY), not_before: Some(300), claim: Some(CLAIM), payload: Bytes::from_static(b"hi"), ..sample() };
+    let event = Envelope { failures: 2, key: Some(KEY), not_before: Some(300), worker: Some(WORKER), payload: Bytes::from_static(b"hi"), ..sample() };
     let (bytes, decoded) = roundtrip(&event, Layout::Assigned).unwrap();
     let mut expected = vec![0x11; 16];
     expected.extend_from_slice(&ch("orders").0); // channel: its 16 octets
     expected.extend_from_slice(&[17, 0]); // type 17
-    expected.extend_from_slice(&(codec::NOT_BEFORE | codec::CLAIMED).to_le_bytes());
+    expected.extend_from_slice(&(codec::NOT_BEFORE | codec::WORKER).to_le_bytes());
     expected.extend_from_slice(&[2, 0]); // failures
     expected.extend_from_slice(&[3, 0, 0, 0, 9]); // work key: generation, arrival varint
     expected.extend_from_slice(&[0xac, 0x02]); // not_before 300 as a varint
-    expected.extend_from_slice(&[0x55; 16]); // claim mark: the worker's uuid
-    expected.extend_from_slice(&[3, 0, 0, 0, 5]); // token: generation, seq varint
-    expected.extend_from_slice(&[0xb0, 0xea, 0x01]); // lease 30000 ms as a varint
+    expected.extend_from_slice(&[0x55; 16]); // the worker's uuid: the claim
     expected.extend_from_slice(&[2, 0, 0, 0, b'h', b'i']); // payload
     assert_eq!(bytes, expected);
-    assert_eq!(decoded.claim, Some(CLAIM));
+    assert_eq!(decoded.worker, Some(WORKER));
 }
 
 #[test]
@@ -83,21 +81,21 @@ fn layouts_refuse_what_they_must_not_carry() {
     assert_eq!(roundtrip(&sample(), Layout::Delivery).unwrap_err(), Malformed::Forbidden("claimable"));
     assert_eq!(roundtrip(&Envelope::dispatch(ch("c"), 10, Bytes::new()).with_id(EventId::new_v7()), Layout::Assigned).unwrap_err(), Malformed::Forbidden("dispatch"));
     assert_eq!(roundtrip(&sample(), Layout::Journal).unwrap_err(), Malformed::Missing("work key"));
-    assert_eq!(roundtrip(&Envelope { key: Some(KEY), ..sample() }, Layout::Assigned).unwrap_err(), Malformed::Missing("claim mark"), "an assignment names its worker");
+    assert_eq!(roundtrip(&Envelope { key: Some(KEY), ..sample() }, Layout::Assigned).unwrap_err(), Malformed::Missing("worker"), "an assignment names its worker");
     assert_eq!(roundtrip(&Envelope { failures: 1, ..sample() }, Layout::Request).map(|(_, event)| event.failures), Ok(0), "a request never carries failures");
-    assert_eq!(roundtrip(&Envelope { claim: Some(CLAIM), ..sample() }, Layout::Request).map(|(_, event)| event.claim), Ok(None), "a request never carries a claim mark");
-    assert_eq!(roundtrip(&Envelope { claim: Some(CLAIM), key: Some(KEY), ..sample() }, Layout::Journal).map(|(_, event)| event.claim), Ok(None), "the journal keeps a claim as its own record");
+    assert_eq!(roundtrip(&Envelope { worker: Some(WORKER), ..sample() }, Layout::Request).map(|(_, event)| event.worker), Ok(None), "a request never carries a worker");
+    assert_eq!(roundtrip(&Envelope { worker: Some(WORKER), key: Some(KEY), ..sample() }, Layout::Journal).map(|(_, event)| event.worker), Ok(None), "the journal keeps a claim as its own record");
 }
 
-/// The claim mark travels only in an assignment; a notice of the same event carries none.
+/// The worker uuid travels only in an assignment; a notice of the same event carries none.
 #[test]
-fn the_claim_mark_travels_in_assignments_only() {
-    let claimed = Envelope { failures: 4, key: Some(KEY), claim: Some(CLAIM), ..sample() };
+fn the_worker_uuid_travels_in_assignments_only() {
+    let claimed = Envelope { failures: 4, key: Some(KEY), worker: Some(WORKER), ..sample() };
     let (bytes, decoded) = roundtrip(&claimed, Layout::Assigned).unwrap();
-    assert_eq!(decoded.claim, Some(CLAIM));
-    assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]) & codec::CLAIMED, codec::CLAIMED, "bit 2 of flags");
-    assert_eq!(roundtrip(&claimed, Layout::Notice).unwrap().1.claim, None);
-    assert!(claimed.notice().claim.is_none());
+    assert_eq!(decoded.worker, Some(WORKER));
+    assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]) & codec::WORKER, codec::WORKER, "bit 2 of flags");
+    assert_eq!(roundtrip(&claimed, Layout::Notice).unwrap().1.worker, None);
+    assert!(claimed.notice().worker.is_none());
 }
 
 /// A channel is a UUIDv7; the envelope carries any 16 octets and the server checks.
@@ -117,7 +115,7 @@ fn a_channel_is_valid_only_as_a_uuidv7() {
 #[test]
 fn not_before_is_claimable_only() {
     let dispatch = Envelope::dispatch(ch("c"), 10, Bytes::new()).with_not_before(std::time::Duration::from_secs(1));
-    assert_eq!(roundtrip(&dispatch, Layout::Request).unwrap_err(), Malformed::Forbidden("not_before or a claim mark on a dispatch event"));
+    assert_eq!(roundtrip(&dispatch, Layout::Request).unwrap_err(), Malformed::Forbidden("not_before or a worker on a dispatch event"));
     let timed = sample().with_not_before(std::time::Duration::from_millis(5));
     assert_eq!(roundtrip(&timed, Layout::Request).unwrap().1, timed);
 }
@@ -146,10 +144,10 @@ fn the_decoder_refuses_forbidden_combinations_reserved_bits_and_leftovers() {
     for bit in 3..16 {
         assert_eq!(decode_raw(raw(1 << bit, 0, &payload), Layout::Request).unwrap_err(), Malformed::Reserved, "bit {bit} is reserved (format 5's policy fields are gone)");
     }
-    assert_eq!(decode_raw(raw(codec::CLAIMED, 0, &payload), Layout::Request).unwrap_err(), Malformed::Forbidden("a field this record does not carry"));
-    assert_eq!(decode_raw(raw(codec::KIND | codec::NOT_BEFORE, 0, &payload), Layout::Delivery).unwrap_err(), Malformed::Forbidden("not_before or a claim mark on a dispatch event"));
+    assert_eq!(decode_raw(raw(codec::WORKER, 0, &payload), Layout::Request).unwrap_err(), Malformed::Forbidden("a field this record does not carry"));
+    assert_eq!(decode_raw(raw(codec::KIND | codec::NOT_BEFORE, 0, &payload), Layout::Delivery).unwrap_err(), Malformed::Forbidden("not_before or a worker on a dispatch event"));
     assert_eq!(decode_raw(raw(codec::NOT_BEFORE, 0, &[0; 6]), Layout::Notice).unwrap_err(), Malformed::Forbidden("a field this record does not carry"));
-    assert_eq!(decode_raw(raw(0, 0, &[3, 0, 0, 0, 9, 0, 0, 0, 0]), Layout::Assigned).unwrap_err(), Malformed::Missing("claim mark"));
+    assert_eq!(decode_raw(raw(0, 0, &[3, 0, 0, 0, 9, 0, 0, 0, 0]), Layout::Assigned).unwrap_err(), Malformed::Missing("worker"));
     assert_eq!(decode_raw(raw(0, 1, &payload), Layout::Request).unwrap_err(), Malformed::Forbidden("failures"));
     assert_eq!(decode_raw(raw(codec::KIND, 1, &payload), Layout::Delivery).unwrap_err(), Malformed::Forbidden("failures"));
     assert_eq!(decode_raw(raw(0, 0, &[0, 0, 0, 0, 9]), Layout::Request).unwrap_err(), Malformed::Trailing);
@@ -194,10 +192,10 @@ fn ids_are_uuids_and_nil_means_unassigned() {
 fn envelope() -> impl Strategy<Value = Envelope> {
     (
         (any::<[u8; 16]>(), any::<[u8; 16]>(), any::<u16>(), any::<bool>(), any::<u16>(), any::<(u32, u64)>()),
-        (proptest::option::of(any::<u64>()), proptest::option::of((any::<[u8; 16]>(), any::<(u32, u64)>(), any::<u64>()))),
+        (proptest::option::of(any::<u64>()), proptest::option::of(any::<[u8; 16]>())),
         proptest::collection::vec(any::<u8>(), 0..64),
     )
-        .prop_map(|((id, channel, event_type, dispatch, failures, key), (not_before, claim), payload)| Envelope {
+        .prop_map(|((id, channel, event_type, dispatch, failures, key), (not_before, worker), payload)| Envelope {
             id: EventId(id),
             channel: Channel(channel),
             event_type,
@@ -205,7 +203,7 @@ fn envelope() -> impl Strategy<Value = Envelope> {
             failures,
             key: Some(WorkKey { generation: key.0, arrival: key.1 }),
             not_before,
-            claim: claim.map(|(worker, (generation, seq), lease_ms)| ClaimMark { worker, token: ClaimToken { generation, seq }, lease_ms }),
+            worker,
             payload: Bytes::from(payload),
         })
 }
@@ -220,7 +218,7 @@ fn kept(event: &Envelope, layout: Layout) -> Envelope {
         event.failures = 0;
     }
     if layout != Layout::Assigned {
-        event.claim = None;
+        event.worker = None;
     }
     if layout == Layout::Delivery {
         event.not_before = None;

@@ -1,11 +1,18 @@
 use super::*;
-use ruvent::{Assignment, ByeReason, Bytes, ClaimMark, ClaimToken, Envelope, WorkKey};
+use ruvent::{Assignment, ByeReason, Bytes, Envelope, EventId, WorkKey};
+
+/// The event id an assignment's number names (its last byte).
+fn event_id(seq: u64) -> EventId {
+    let mut bytes = [0x11; 16];
+    bytes[15] = seq as u8;
+    EventId(bytes)
+}
 
 fn assign(seq: u64) -> Outbound {
-    let mut event = Envelope::claimable(ruvent::Channel::new(), 10, Bytes::from_static(b"p"));
+    let mut event = Envelope::claimable(ruvent::Channel::new(), 10, Bytes::from_static(b"p")).with_id(event_id(seq));
     event.key = Some(WorkKey::default());
-    event.claim = Some(ClaimMark { worker: [9; 16], token: ClaimToken { generation: 1, seq }, lease_ms: 1000 });
-    Outbound::Assign(Assignment { event, until: 1000, more: false })
+    event.worker = Some([9; 16]);
+    Outbound::Assign(Assignment { event, lease_ms: 1000, until: 1000, more: false })
 }
 
 fn drain(unsent: &mut Unsent) -> Vec<Outbound> {
@@ -65,20 +72,20 @@ fn an_observer_past_its_byte_bound_is_slow_and_bytes_count_until_written() {
     assert!(work.accept(Outbound::Delivery(event)));
 }
 
-/// Dropped assignments come back as tokens; a slow connection drops everything else too.
+/// Dropped assignments come back as their event ids; a slow connection drops everything else too.
 #[test]
-fn dropping_assignments_returns_their_tokens_and_keeps_the_rest_in_order() {
+fn dropping_assignments_returns_their_event_ids_and_keeps_the_rest_in_order() {
     let mut unsent = Unsent::new(Role::Work, u64::MAX);
     unsent.accept(assign(1));
     unsent.accept(Outbound::Committed { seq: 4 });
     unsent.accept(assign(2));
     unsent.accept(Outbound::Pending { join: 1 });
-    let tokens = unsent.drop_assignments();
-    assert_eq!(tokens.iter().map(|token| token.seq).collect::<Vec<_>>(), [1, 2]);
+    let ids = unsent.drop_assignments();
+    assert_eq!(ids, [event_id(1), event_id(2)]);
     assert_eq!(unsent.len(), 2);
     unsent.accept(assign(3));
     unsent.push(Outbound::Bye(ByeReason::Slow));
-    assert_eq!(unsent.drop_all().iter().map(|token| token.seq).collect::<Vec<_>>(), [3]);
+    assert_eq!(unsent.drop_all(), [event_id(3)]);
     assert!(unsent.is_empty());
     assert_eq!(unsent.counted(), 0);
 }

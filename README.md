@@ -8,9 +8,9 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
   구독 취소다.
 * **이벤트는 두 종류다.** 착수용 이벤트는 완료 보고로 큐에서 지워지고, 발송용 이벤트는 발송하는 순간 지워진다.
   둘 다 한 가지 엔벨롭을 쓴다(바이너리, 고정 머리 38바이트: id · 채널 · 타입 · flags · 실패 횟수). 채널은 이름 없는
-  UUIDv7이고, 타입(u16)은 서버가 워커에게 배정할 때 쓴다. 워커는 채널, 타입, 또는 둘로 참여한다. 배정에는 착수 마크(워커
-  uuid, 표지, lease)가 실린다. 페이로드는 임의 바이트다.
-* **이벤트 서버의 프로토콜은 하나다.** TCP 위의 ruvent wire(v5)다. 프록시와 워커 서버는 SDK로 그 프로토콜만
+  UUIDv7이고, 타입(u16)은 서버가 워커에게 배정할 때 쓴다. 워커는 채널, 타입, 또는 둘로 참여한다. 배정에는 착수한 워커
+  uuid가 실린다(있으면 착수 중). 착수 요청은 워커 uuid 없이 할 수 없고, 완료·실패 보고는 이벤트 uuid와 워커 uuid가 맞아야 한다. 페이로드는 임의 바이트다.
+* **이벤트 서버의 프로토콜은 하나다.** TCP 위의 ruvent wire(v6)다. 프록시와 워커 서버는 SDK로 그 프로토콜만
   써서 붙는다. 일반 클라이언트는 이벤트 서버에 직접 붙지 않는다. 클라이언트의 여러 프로토콜을 받는 일은 전부
   프록시의 몫이다.
 * **서버는 접속자를 구분하지 않는다.** 워커 서버, 프록시, 내장 워커 모두 같은 메서드를 부른다. 내장 워커는
@@ -31,7 +31,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 
 | 크레이트 | 내용 | 문서 |
 | --- | --- | --- |
-| `ruvent` | 엔벨롭과 코덱, 채널(UUIDv7), 엔진(두 큐, 메서드 일곱 개), 저널 형식 6, 운영 스냅샷, 메서드 계약과 인프로세스 연결 | [crates/ruvent/README.md](crates/ruvent/README.md) |
+| `ruvent` | 엔벨롭과 코덱, 채널(UUIDv7), 엔진(두 큐, 메서드 일곱 개), 저널 형식 7, 운영 스냅샷, 메서드 계약과 인프로세스 연결 | [crates/ruvent/README.md](crates/ruvent/README.md) |
 | `ruvent-protocol` | 이진 와이어 프로토콜 v5: 핸드셰이크, 레코드, 메서드 레코드(이름 사전 없음) | [crates/ruvent-protocol/README.md](crates/ruvent-protocol/README.md) |
 | `ruvent-server` | 이벤트 서버 바이너리와 수신부. JSON 설정 | [crates/ruvent-server/README.md](crates/ruvent-server/README.md) |
 | `ruvent-client` | 원격 연결과 워커 프레임워크(`App`, `Service`, 실행기, 재시도 정책) | [crates/ruvent-client/README.md](crates/ruvent-client/README.md) |
@@ -56,5 +56,5 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 cargo xtask verify
 ```
 
-마지막 실행 기록은 [docs/reports/test-2026-11-26-minimal-server.txt](docs/reports/test-2026-11-26-minimal-server.txt), 측정은
+마지막 실행 기록은 [docs/reports/test-2026-11-26-worker-uuid-claim.txt](docs/reports/test-2026-11-26-worker-uuid-claim.txt), 측정은
 [docs/reports/bench-2026-11-23.txt](docs/reports/bench-2026-11-23.txt)에 있다.

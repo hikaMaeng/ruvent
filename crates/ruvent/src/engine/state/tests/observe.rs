@@ -47,7 +47,7 @@ fn a_channel_that_is_not_a_uuidv7_is_refused_everywhere() {
 #[test]
 fn a_dispatch_join_receives_the_channels_dispatch_events() {
     let mut h = H::volatile().cast();
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("answer.me")), types: Vec::new(), lease_ms: 5_000, dispatch: true });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("answer.me")), types: Vec::new(), lease_ms: 5_000, dispatch: true });
     let chunk = h.call(W2, Call::Register { seq: None, event: Envelope::dispatch(ch("answer.me"), 18, Bytes::new()) });
     assert_eq!(deliveries(&chunk, W1), 1, "a stream chunk emitted on a work connection reaches the requester's work connection");
 }
@@ -151,8 +151,7 @@ fn drain_sends_new_producers_away_and_closes_open_ones_after_a_final_committed()
     assert!(late.sends.is_empty() && h.slot(id(3)).is_none(), "nothing after the drain is applied");
     let newcomer = h.open(30, hello(Role::Produce, 30));
     assert_eq!(sent(&newcomer, 30), [Outbound::Bye(ByeReason::Draining)]);
-    let assignment = h.slot(id(1)).unwrap().attempt().unwrap().token;
     let seq = h.next_seq(W1);
-    let completed = h.call(W1, Call::Complete { seq, id: id(1), token: assignment, follow_ups: Vec::new(), spooled: Vec::new() });
+    let completed = h.call(W1, Call::Complete { seq, id: id(1), worker: wid(W1), follow_ups: Vec::new(), spooled: Vec::new() });
     assert_eq!(assigned(&completed, W1).len(), 1, "work connections carry on");
 }

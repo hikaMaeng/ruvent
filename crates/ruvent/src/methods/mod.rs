@@ -15,7 +15,7 @@
 
 use crate::engine::ops::{Assignment, ByeReason, Call, FaultKind, Hello, Outbound, Refusal, Role, Stats, Welcome};
 use crate::engine::{Closed, Engine, Session};
-use crate::envelope::{Channel, ClaimToken, Envelope, EventId, Kind, WorkKey};
+use crate::envelope::{Channel, Envelope, EventId, Kind, WorkKey, WorkerId};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -58,19 +58,23 @@ pub trait Methods: Send + Sync + 'static {
     /// Waits until the cumulative `Committed` reaches `seq`.
     async fn committed(&self, seq: u64) -> Result<(), Refusal>;
     /// Work: joins `channel` (`None`: every channel) for `types` (empty: all;
-    /// not empty without a channel) with this lease length. Returns the
-    /// join's name, the `req` of its `Join`.
-    async fn join(&self, channel: Option<Channel>, types: Vec<u16>, lease: Duration, dispatch: bool) -> Result<u32, Refusal>;
+    /// not empty without a channel) with this lease length, as `worker`
+    /// (never nil: refused `Malformed`). Its assignments are claimed under
+    /// that uuid. Returns the join's name, the `req` of its `Join`.
+    async fn join(&self, worker: WorkerId, channel: Option<Channel>, types: Vec<u16>, lease: Duration, dispatch: bool) -> Result<u32, Refusal>;
     /// Work: sets the absolute window of the join named `join` (`bytes` 0: no byte bound). Not answered.
     async fn window(&self, join: u32, count: u32, bytes: u64) -> Result<(), Refusal>;
-    /// Work: completes the attempt `token` on `id`, registering `follow_ups` in the same step.
-    async fn complete(&self, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>) -> Result<u64, Refusal>;
-    /// Work: re-arms the lease. Not answered.
-    async fn extend(&self, id: EventId, token: ClaimToken) -> Result<(), Refusal>;
-    /// Work: gives the event back, visible after `delay`; `failed` counts a failure. Not answered.
-    async fn release(&self, id: EventId, token: ClaimToken, delay: Duration, failed: bool) -> Result<(), Refusal>;
-    /// Work: claims the event with this id now.
-    async fn claim(&self, id: EventId, lease: Duration) -> Result<Assignment, Refusal>;
+    /// Work: completes the claim of `worker` on `id` (both must match),
+    /// registering `follow_ups` in the same step.
+    async fn complete(&self, id: EventId, worker: WorkerId, follow_ups: Vec<Envelope>) -> Result<u64, Refusal>;
+    /// Work: re-arms the lease of `worker`'s claim on `id`. Not answered.
+    async fn extend(&self, id: EventId, worker: WorkerId) -> Result<(), Refusal>;
+    /// Work: gives the event back: the worker uuid leaves it, visible again
+    /// after `delay`; `failed` (a failure report) raises its failure count.
+    /// Both must match. Not answered.
+    async fn release(&self, id: EventId, worker: WorkerId, delay: Duration, failed: bool) -> Result<(), Refusal>;
+    /// Work: claims the event with this id now, as `worker` (never nil).
+    async fn claim(&self, id: EventId, worker: WorkerId, lease: Duration) -> Result<Assignment, Refusal>;
     /// Observation: subscribes and returns one page of the channel's waiting backlog after `after`.
     async fn subscribe(&self, channel: Channel, after: Option<WorkKey>) -> Result<Backlog, Refusal>;
     async fn unsubscribe(&self, channel: Channel) -> Result<(), Refusal>;
@@ -337,8 +341,8 @@ impl Methods for Client {
         }
     }
 
-    async fn join(&self, channel: Option<Channel>, types: Vec<u16>, lease: Duration, dispatch: bool) -> Result<u32, Refusal> {
-        match self.ask(|req| Call::Join { req, channel, types, lease_ms: millis(lease), dispatch }).await? {
+    async fn join(&self, worker: WorkerId, channel: Option<Channel>, types: Vec<u16>, lease: Duration, dispatch: bool) -> Result<u32, Refusal> {
+        match self.ask(|req| Call::Join { req, worker, channel, types, lease_ms: millis(lease), dispatch }).await? {
             Outbound::Joined { req } => Ok(req),
             _ => unexpected(),
         }
@@ -348,20 +352,20 @@ impl Methods for Client {
         self.tell(Call::Window { join, count, bytes }).await
     }
 
-    async fn complete(&self, id: EventId, token: ClaimToken, follow_ups: Vec<Envelope>) -> Result<u64, Refusal> {
-        self.numbered(|seq| Call::Complete { seq, id, token, follow_ups, spooled: Vec::new() }).await
+    async fn complete(&self, id: EventId, worker: WorkerId, follow_ups: Vec<Envelope>) -> Result<u64, Refusal> {
+        self.numbered(|seq| Call::Complete { seq, id, worker, follow_ups, spooled: Vec::new() }).await
     }
 
-    async fn extend(&self, id: EventId, token: ClaimToken) -> Result<(), Refusal> {
-        self.tell(Call::Extend { id, token }).await
+    async fn extend(&self, id: EventId, worker: WorkerId) -> Result<(), Refusal> {
+        self.tell(Call::Extend { id, worker }).await
     }
 
-    async fn release(&self, id: EventId, token: ClaimToken, delay: Duration, failed: bool) -> Result<(), Refusal> {
-        self.tell(Call::Release { id, token, delay_ms: millis(delay), failed }).await
+    async fn release(&self, id: EventId, worker: WorkerId, delay: Duration, failed: bool) -> Result<(), Refusal> {
+        self.tell(Call::Release { id, worker, delay_ms: millis(delay), failed }).await
     }
 
-    async fn claim(&self, id: EventId, lease: Duration) -> Result<Assignment, Refusal> {
-        match self.ask(|req| Call::Claim { req, id, lease_ms: millis(lease) }).await? {
+    async fn claim(&self, id: EventId, worker: WorkerId, lease: Duration) -> Result<Assignment, Refusal> {
+        match self.ask(|req| Call::Claim { req, id, worker, lease_ms: millis(lease) }).await? {
             Outbound::Claimed { assignment, .. } => Ok(assignment),
             _ => unexpected(),
         }

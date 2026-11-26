@@ -69,18 +69,18 @@ cargo run --release -p ruvent --example bench   # 측정
 
 | 보장 | 테스트 |
 | --- | --- |
-| 정확히 하나의 착수, 배정·착수·배달은 한 스텝 | `of_many_workers_racing_for_one_event_exactly_one_takes_it`, `an_assignment_carries_the_whole_event_and_its_claim_mark`, `an_open_window_takes_work_as_it_arrives_without_a_request_per_event` |
+| 정확히 하나의 착수, 배정·착수·배달은 한 스텝 | `of_many_workers_racing_for_one_event_exactly_one_takes_it`, `an_assignment_carries_the_whole_event_and_the_worker_uuid`, `an_open_window_takes_work_as_it_arrives_without_a_request_per_event` |
 | 논리 id는 회수해도 그대로, 시도는 표지로 가른다(2.1) | `a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window`, `registration_claim_and_completion_are_idempotent_and_a_reclaimed_event_keeps_its_id`, `a_lease_end_wakes_the_engine_without_any_registration` |
-| 순번은 u64, 세대는 기동 때만 오른다(2.1, B20) | `work_keys_and_tokens_are_u64_past_the_u32_range`, `a_restart_restores_claims_with_token_lease_and_worker_and_counts_no_failure` |
+| 순번은 u64, 세대는 기동 때만 오른다(2.1, B20) | `work_keys_are_u64_past_the_u32_range`, `a_restart_restores_claims_with_lease_and_worker_and_counts_no_failure` |
 | 생산자 순번: 재전송은 버리고 빈자리는 닫는다(2.3) | `a_retransmitted_sequence_is_dropped_and_a_gap_closes_the_connection`, `the_producer_table_survives_a_restart_and_resume_is_the_last_journaled_sequence`, `an_acknowledged_sequence_survives_a_crash_and_resume_says_so` |
 | 누적 확인: 연산별 기준, 커밋 완료와 묶음 끝이 계기, N건(S2), 끌 수 있다(2.3, B2) | `committed_waits_for_the_disk_for_claimable_work_and_not_for_dispatch`, `committed_goes_out_once_every_n_while_later_work_still_waits`, `a_volatile_broadcast_producer_can_turn_acknowledgements_off`, `registrations_are_not_answered_one_by_one_but_acknowledged_cumulatively`, `welcome_resumes_at_the_last_applied_sequence_after_it_is_committed` |
 | 인스턴스 nonce와 `superseded`(2.3, M8-7) | `the_same_process_reconnecting_replaces_quietly_and_another_instance_supersedes`, `a_second_instance_under_one_producer_id_supersedes_the_first_and_both_are_told` |
 | 다이제스트로 중복·충돌(2.3) | `a_duplicate_id_with_the_same_content_is_dropped_and_other_content_is_a_conflict_told_once`, `a_follow_up_with_an_active_id_is_skipped_when_identical_and_refuses_the_completion_when_not`, `an_active_id_is_not_registered_twice_ids_are_uuidv7_and_a_departed_id_may_return` |
-| 오류 통보는 (연결, 종류)마다 첫 1회, 권한은 앞에서(2.7) | `malformed_requests_invalid_ids_and_forbidden_kinds_are_faults`, `a_producer_that_may_register_nothing_is_refused_before_welcome`, `a_call_the_role_does_not_send_is_refused`, `a_join_needs_the_claim_method_and_nothing_narrower`, `another_worker_with_the_right_token_may_not_complete_extend_or_release`, `stats_and_drain_need_the_operator_grant` |
+| 오류 통보는 (연결, 종류)마다 첫 1회, 권한은 앞에서(2.7) | `malformed_requests_invalid_ids_and_forbidden_kinds_are_faults`, `a_producer_that_may_register_nothing_is_refused_before_welcome`, `a_call_the_role_does_not_send_is_refused`, `a_join_needs_the_claim_method_and_nothing_narrower`, `a_report_naming_another_worker_is_stale_and_changes_nothing`, `stats_and_drain_need_the_operator_grant` |
 | 창은 절댓값, 등록순 순환, `more`·`Pending`, 바이트 진행 규칙(2.4) | `a_window_receives_assignments_round_robin_in_join_order`, `a_full_window_gets_more_on_the_last_assignment_and_pending_once_per_window`, `a_window_of_zero_refuses_and_a_join_holding_nothing_takes_one_event_over_its_byte_bound`, `types_are_lanes_and_an_unsupported_type_does_not_block_the_rest` |
 | lease는 배정 시점부터, 회수 때 창을 닫는다, 회수 전 완료는 수락(2.4) | `a_lease_that_runs_out_reclaims_under_the_same_id_and_closes_the_window`, `a_late_completion_before_the_reclaim_is_accepted_and_after_it_is_dropped` |
 | 연결이 닫히면: 못 쓴 배정은 즉시 대기로, 다 쓴 배정은 재접속 유예로(2.4, S20, M8-2) | `a_closed_connection_returns_unwritten_assignments_at_once_and_pulls_written_ones_to_the_grace`, `a_closing_connection_gives_back_unwritten_assignments_at_once` |
-| `Extend`는 참여를 옮긴다, 재기동은 착수를 그대로 둔다(2.4, M8-6) | `extend_moves_the_attempt_to_the_extending_connections_join`, `a_restart_restores_claims_with_token_lease_and_worker_and_counts_no_failure`, `a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_workers_completion` |
+| `Extend`는 참여를 옮긴다, 재기동은 착수를 그대로 둔다(2.4, M8-6) | `extend_moves_the_attempt_to_the_extending_connections_join`, `a_restart_restores_claims_with_lease_and_worker_and_counts_no_failure`, `a_restart_keeps_waiting_order_and_claims_and_accepts_the_original_workers_completion` |
 | `Release{지연, 실패}`와 실패 횟수(이벤트 탓만 센다, 서버는 세기만 한다)(2.4, 9.15, M8-12) | `release_keeps_or_raises_the_failure_count_and_a_delay_hides_the_event`, `failures_keep_counting_and_the_server_never_acts_on_them` |
 | `not_before`(재기동 뒤 남은 시간)(2.4, M8-11) | `not_before_hides_an_event_until_its_time_and_the_wheel_wakes_for_it`, `a_restart_keeps_the_remaining_time_of_not_before` |
 | 명시 착수 | `an_explicit_claim_takes_a_waiting_event_and_refuses_claimed_delayed_or_missing_ones`, `a_claim_carries_the_attempt_and_the_time_out_the_worker_chose_and_completion_removes_it` |
@@ -99,7 +99,7 @@ cargo run --release -p ruvent --example bench   # 측정
 | 본문 캐시와 읽기 경로: 고수위에서 놓기만, 콜드 본문은 읽어서 보냄, 줄 머리 미리 읽기, 복구는 메타만(2.5, M3) | `cached_payloads_are_released_at_the_watermark_and_go_out_through_a_read`, `recovery_holds_metadata_only_and_payloads_come_back_through_reads` |
 | `Body` 흘려 읽기: 후속은 본문 위치를 가리키고 재기동을 넘음, 디스크로 받을지의 판단(2.6 4번) | `streamed_follow_ups_point_at_their_body_and_come_back_pointing_at_it`, `streamed_follow_up_bodies_go_out_from_disk_and_survive_a_restart`, `body_to_disk_says_yes_at_the_watermark_and_never_without_a_spool`, `a_streamed_body_reads_back_and_its_segment_waits_for_it` |
 | M8-4: 이주·삭제·콜드 읽기·체크포인트 훑기가 겹치고 훑는 도중에 죽어도 잃는 것이 없다 | `relocation_removal_reads_and_a_walk_overlap_and_a_crash_mid_walk_loses_nothing` |
-| 장부 정합성(속성): 한 이벤트는 한 자리, 줄·참여·회계의 합이 맞다, 착수 마크는 착수 기록과 같다 | `random_operations_keep_the_ledgers_bookkeeping_consistent` |
+| 장부 정합성(속성): 한 이벤트는 한 자리, 줄·참여·회계의 합이 맞다, 엔벨롭의 워커 uuid는 착수 기록과 같다 | `random_operations_keep_the_ledgers_bookkeeping_consistent` |
 
 ## 타입 라우팅과 UUIDv7 채널 (계획 9.14, v4.9)
 
@@ -108,17 +108,17 @@ cargo run --release -p ruvent --example bench   # 측정
 | 채널은 UUIDv7만: 등록·참여·구독·삭제 결과 채널 | `a_channel_is_valid_only_as_a_uuidv7`, `a_channel_that_is_not_a_uuidv7_is_refused_everywhere`, `a_join_without_a_valid_selection_is_malformed` |
 | 워커는 채널, 타입, 또는 둘로 참여한다. 참여의 이름은 `req`, 겹침과 이름 충돌은 거절 | `a_typed_worker_takes_one_type_from_fresh_channels_and_answers_on_each`, `a_join_name_in_use_is_refused_for_another_selection_and_leaves_nothing_behind` |
 | 권한은 타입으로: 참여·등록·구독이 넘기는 것 | `a_join_needs_the_claim_method_and_nothing_narrower`, `grants_are_methods_and_a_subscription_hands_over_every_type`, `registering_the_servers_own_type_is_malformed` |
-| 엔벨롭 38 B와 착수 마크, 이름 없음, 은퇴한 기능 비트 예약 | `the_claim_mark_travels_in_assignments_only`, `a_38_byte_head_with_not_before_and_a_claim_mark_decodes_only_as_an_assignment`, `an_assignment_needs_a_claim_mark_and_a_request_never_carries_one`, `no_record_defines_a_name_and_the_retired_tags_are_unknown`, `the_retired_feature_bits_are_reserved` |
+| 엔벨롭 38 B와 워커 uuid, 이름 없음, 은퇴한 기능 비트 예약 | `the_worker_uuid_travels_in_assignments_only`, `a_38_byte_head_with_not_before_and_a_worker_decodes_only_as_an_assignment`, `an_assignment_needs_a_worker_and_a_request_never_carries_one`, `no_record_defines_a_name_and_the_retired_tags_are_unknown`, `the_retired_feature_bits_are_reserved` |
 
 ## 최소 서버 (계획 9.15, v5)
 
 | 요구 | 테스트 |
 | --- | --- |
-| 착수 마크: 배정에 워커 uuid·표지·lease, 그 워커만 완료·연장·반환, 재기동을 넘음 | `an_assignment_carries_the_whole_event_and_its_claim_mark`, `another_worker_with_the_right_token_may_not_complete_extend_or_release`, `the_claim_mark_names_the_worker_and_only_that_worker_completes_across_a_restart`, `the_claim_mark_travels_in_assignments_only` |
+| 착수 = (이벤트 id, 워커 uuid)(계획 9.16): 배정에 워커 uuid와 lease, nil 워커의 착수 요청은 거절·보고는 오류, 둘이 맞아야 완료·연장·반환, 맞는 실패 보고는 워커 uuid를 지우고 실패 횟수를 올려 다른 워커가 착수, 재기동을 넘음 | `a_join_or_claim_without_a_worker_uuid_is_refused`, `a_report_without_a_worker_uuid_is_malformed`, `a_matching_failure_report_removes_the_worker_and_raises_the_count_for_another_worker`, `a_failure_report_with_the_wrong_worker_is_stale_and_keeps_the_claim`, `a_claim_is_the_event_and_the_worker_uuid_and_a_matching_failure_report_frees_it_for_another_worker`, `a_failure_report_naming_the_event_and_its_worker_frees_it_for_another_worker`, `an_assignment_carries_the_whole_event_and_the_worker_uuid`, `a_report_naming_another_worker_is_stale_and_changes_nothing`, `the_claim_names_the_worker_uuid_and_only_that_uuid_completes_across_a_restart`, `the_worker_uuid_travels_in_assignments_only` |
 | 실패는 세기만 하고 서버는 아무것도 하지 않는다. 한도는 워커의 것 | `failures_keep_counting_and_the_server_never_acts_on_them`, `failures_are_counted_and_the_server_never_acts_on_them_across_a_restart`, `the_retry_limit_is_the_workers_the_server_only_counts_failures` |
 | 아무도 멈추지 않고 거절되지 않는다. 고수위에서는 캐시된 본문만 내린다 | `memory_past_the_watermark_refuses_and_pauses_nothing`, `nothing_pauses_a_producer_while_nobody_consumes`, `a_full_server_refuses_nothing_and_holds_up_no_producer` |
 | 권한은 메서드뿐 | `a_join_needs_the_claim_method_and_nothing_narrower`, `grants_are_methods_and_a_subscription_hands_over_every_type`, `a_producer_that_may_register_nothing_is_refused_before_welcome` |
-| 이름 없는 wire v5: 사전·정지 태그 없음, 착수 마크 머리 | `no_record_defines_a_name_and_the_retired_tags_are_unknown`, `a_38_byte_head_with_not_before_and_a_claim_mark_decodes_only_as_an_assignment`, `an_assignment_needs_a_claim_mark_and_a_request_never_carries_one`, `the_retired_feature_bits_are_reserved` |
+| 이름 없는 wire v6: 사전·정지 태그 없음, 착수 요청·보고가 워커 uuid를 싣는다 | `claim_requests_and_reports_carry_the_worker_uuid`, `no_record_defines_a_name_and_the_retired_tags_are_unknown`, `a_38_byte_head_with_not_before_and_a_worker_decodes_only_as_an_assignment`, `an_assignment_needs_a_worker_and_a_request_never_carries_one`, `the_retired_feature_bits_are_reserved` |
 
 ## 코어 단위 (`crates/ruvent/src/**/tests.rs`, `src/engine/state/tests/`)
 
@@ -177,7 +177,7 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 영역 | 테스트 |
 | --- | --- |
 | 설정(8장 값 전부, 기본값) | `the_example_configuration_parses_into_grants_and_every_section`, `a_minimal_configuration_takes_every_default`, `bad_configurations_are_refused_with_a_reason` |
-| 미송신 대기열: 누적 확인 접기, `Fault` 첫 1회, 바이트 상한(S7), 미송신 `Assign` 반환 | `a_newer_committed_replaces_the_queued_one`, `a_fault_is_told_once_per_kind_on_one_connection`, `an_observer_past_its_byte_bound_is_slow_and_bytes_count_until_written`, `dropping_assignments_returns_their_tokens_and_keeps_the_rest_in_order` |
+| 미송신 대기열: 누적 확인 접기, `Fault` 첫 1회, 바이트 상한(S7), 미송신 `Assign` 반환 | `a_newer_committed_replaces_the_queued_one`, `a_fault_is_told_once_per_kind_on_one_connection`, `an_observer_past_its_byte_bound_is_slow_and_bytes_count_until_written`, `dropping_assignments_returns_their_event_ids_and_keeps_the_rest_in_order` |
 | 역할별 흐름(2.2) | `each_role_does_its_own_work_over_tcp` |
 | 자격·권한(2.7) | `a_wrong_token_and_a_forbidden_method_are_refused_with_their_reason` |
 | 재전송 무시, 누적 확인(2.3) | `a_retransmission_is_dropped_quietly`, `acknowledgements_are_cumulative_not_one_per_registration` |
@@ -188,7 +188,7 @@ wire v3(2.11): 레코드 = `[tag][head_len][body_len][head][body]`, 바깥 프�
 | 작업 연결 흘려 읽기(2.6 4·5번, B15) | `a_work_connection_streams_follow_up_bodies_to_disk_under_pressure` |
 | 관찰 연결 바이트 상한 → `Bye{slow}`(S7) | `an_observer_that_does_not_read_is_sent_bye_slow` |
 | drain 중 송신: 최종 확인을 놓친 연결 0(M8-5, B22) | `draining_while_producers_send_misses_no_final_acknowledgement` |
-| 착수 중 정상 재시작 뒤 같은 표지의 완료(M8-6, 원시 연결, 닫지 않는 피어 포함) | `a_claim_survives_a_graceful_restart_and_completes_under_its_token` |
+| 착수 중 정상 재시작 뒤 같은 워커 uuid의 완료(M8-6, 원시 연결, 닫지 않는 피어 포함) | `a_claim_survives_a_graceful_restart_and_completes_under_its_worker_uuid` |
 | 쓰지 못한 `Assign`은 즉시 대기로(M8-2) | `assignments_never_written_go_back_at_once_when_the_worker_goes` |
 | 단계로 닫기와 닫기 기한(2.2, S20) | `a_bye_is_read_whole_even_when_the_peer_had_sent_more_than_the_server_read`, `a_peer_that_never_closes_after_bye_is_closed_at_the_deadline` |
 | v1·다른 버전 거절(B12) | `version_1_and_other_versions_are_refused` |

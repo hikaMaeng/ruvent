@@ -5,8 +5,8 @@ use super::*;
 use crate::engine::config::StorageConfig;
 use crate::journal::{End, Journal as _, Lane, Location, Part, Recovered, Replay, SegmentLog, SegmentState, Spooled, Written};
 
-/// Per event: key, channel, failures, attempt (token and worker), delayed until.
-type View = Vec<(WorkKey, Channel, u16, Option<(ClaimToken, [u8; 16])>, Option<u64>)>;
+/// Per event: key, channel, failures, claim (lease length and worker), delayed until.
+type View = Vec<(WorkKey, Channel, u16, Option<(u64, WorkerId)>, Option<u64>)>;
 
 fn view(state: &State) -> View {
     let mut slots: Vec<_> = state
@@ -17,7 +17,7 @@ fn view(state: &State) -> View {
                 Place::Delayed { until } => Some(until),
                 _ => None,
             };
-            (slot.fixed.key, slot.channel, slot.failures, slot.attempt().map(|attempt| (attempt.token, attempt.worker)), delayed)
+            (slot.fixed.key, slot.channel, slot.failures, slot.attempt().map(|attempt| (attempt.lease_ms, attempt.worker)), delayed)
         })
         .collect();
     slots.sort();
@@ -67,9 +67,9 @@ fn a_fuzzy_checkpoint_misses_no_change_made_during_its_walk() {
     parts_into(&mut items, first);
     // Seen by the walk already (ids 1 and 2): completed with a follow-up, released.
     h.complete(W1, &assignments[0], vec![work("next").with_id(id(20))]);
-    h.call(W1, Call::Release { id: id(2), token: assignments[1].token(), delay_ms: 5_000, failed: true });
+    h.call(W1, Call::Release { id: id(2), worker: wid(W1), delay_ms: 5_000, failed: true });
     // Not seen yet (ids 7 and 8): claimed explicitly, deleted.
-    h.call(W2, Call::Claim { req: 1, id: id(7), lease_ms: 30_000 });
+    h.call(W2, Call::Claim { req: 1, worker: wid(W2), id: id(7), lease_ms: 30_000 });
     let seq = h.next_seq(P);
     h.call(P, Call::Delete { seq, id: id(8), result: ch("out"), key: None });
     let mut more = 30;
@@ -151,7 +151,7 @@ fn cached_payloads_are_released_at_the_watermark_and_go_out_through_a_read() {
     assert_eq!(h.s.counters.released, 2, "down to 7/8 of the watermark: ids 6 and 5");
     assert!(h.slot(id(6)).unwrap().cold() && h.slot(id(5)).unwrap().cold() && !h.slot(id(4)).unwrap().cold());
     assert_eq!(h.s.live(), 7, "releasing is all that happens: nothing is refused");
-    h.call(W1, Call::Join { req: 1, channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
+    h.call(W1, Call::Join { req: 1, worker: wid(W1), channel: Some(ch("work")), types: Vec::new(), lease_ms: 30_000, dispatch: false });
     let joined = h.call(W1, Call::Window { join: 1, count: 5, bytes: 0 });
     let reads: Vec<Location> = joined.sends.iter().filter_map(|send| send.read).collect();
     assert_eq!(reads, [h.slot(id(5)).unwrap().at.unwrap()], "only the cold one is read");
@@ -186,7 +186,7 @@ fn streamed_follow_ups_point_at_their_body_and_come_back_pointing_at_it() {
     let parent = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let follow_ups = vec![Envelope::claimable(ch("next"), 1, Bytes::new()).with_id(id(2)), Envelope::claimable(ch("other"), 2, Bytes::new()).with_id(id(3))];
     let seq = h.next_seq(W1);
-    let effects = h.call(W1, Call::Complete { seq, id: parent.event.id, token: parent.token(), follow_ups, spooled: vec![(0, first_body.clone()), (1, second_body.clone())] });
+    let effects = h.call(W1, Call::Complete { seq, id: parent.event.id, worker: wid(W1), follow_ups, spooled: vec![(0, first_body.clone()), (1, second_body.clone())] });
     let registered: Vec<(Channel, Option<Location>)> =
         effects.records.iter().filter_map(|record| if let Record::Register { event, at, .. } = record { Some((event.channel, *at)) } else { None }).collect();
     assert_eq!(registered, [(ch("next"), Some(first_body.at)), (ch("other"), Some(second_body.at))], "both are journaled, pointing at their bodies");
@@ -205,7 +205,7 @@ fn streamed_follow_ups_point_at_their_body_and_come_back_pointing_at_it() {
     h.join(W1, "work", 1);
     let parent = assigned(&h.produce(P, work("work").with_id(id(1))), W1).remove(0);
     let seq = h.next_seq(W1);
-    let refused = h.call(W1, Call::Complete { seq, id: parent.event.id, token: parent.token(), follow_ups: vec![work("next")], spooled: vec![(0, first_body)] });
+    let refused = h.call(W1, Call::Complete { seq, id: parent.event.id, worker: wid(W1), follow_ups: vec![work("next")], spooled: vec![(0, first_body)] });
     assert_eq!(faults(&refused, W1), [FaultKind::Malformed]);
     assert!(h.slot(id(1)).is_some());
     let _ = std::fs::remove_dir_all(&dir);

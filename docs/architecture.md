@@ -37,7 +37,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 * `State`([state/mod.rs](../crates/ruvent/src/engine/state/mod.rs))는 순수 상태 기계다. 시각을 입력으로
   받고 태스크·소켓·시계가 없다. 부분은 폴더로 나뉜다: 생산(`produce`, `producers`), 소비(`consume`, `lanes`,
   `wheel`), 메모리(`memory`), 디스크(`disk`, `checkpoint`), 복구(`recover`), 관찰(`observe`), 슬롯(`slots`).
-* **식별자.** 논리 id는 회수해도 바뀌지 않는다. 시도는 착수 표지(`ClaimToken`, u64 순번)로 가른다. `WorkKey`
+* **식별자.** 논리 id는 회수해도 바뀌지 않는다. 착수는 (이벤트 id, 워커 uuid) 쌍이 이름이고 시도 표지는 없다. `WorkKey`
   (세대, u64 도착 순번)가 대기 순서다. 세대는 기동 때만 오른다. 대기 줄은 (채널, 타입)별이다.
 * **생산.** 생산자 순번표가 재전송을 조용히 버리고, 연산별 기준(영속 레코드는 fsync, 그 밖은 적용)으로
   누적 `Committed`를 낸다. 계기는 로그 쓰기 완료와 장부 묶음 끝이다. 타이머는 없다.
@@ -47,8 +47,10 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
   참여는 타입별 목록(`type_joins`)과 타입별 줄 목록(`typed_lanes`)으로 찾는다. 타입 참여만 받는 줄은 비면
   지우므로 요청마다 새 채널이어도 줄이 남지 않는다. lease는 배정한 순간부터 재고, 회수하면 그 참여의 창을
   닫는다. `Extend`, `Release{지연, 실패}`, `not_before`가 있다.
-* **착수 마크.** 배정은 착수 마크(워커 uuid = 작업 연결의 producer id, 표지, lease)를 엔벨롭에 싣는다. 완료·연장·반환은
-  그 워커가 그 표지로 해야 한다. 저널의 `Claim` 레코드와 체크포인트가 워커 uuid를 남겨 재기동을 넘는다.
+* **착수 = 워커 uuid.** 착수는 엔벨롭의 워커 uuid가 있느냐 없느냐다(계획 9.16). 착수 요청(`Join`, `Claim`)은 워커 uuid를
+  실어야 하고 nil이면 `Refused{malformed}`다. 완료·연장·반환은 이벤트 id와 워커 uuid가 둘 다 맞아야 하고, 안 맞으면 `stale`로
+  센다. 반환은 워커 uuid를 지우고 실패면 실패 횟수를 올려 다른 워커가 착수하게 한다. lease는 장부의 착수 기록(`Attempt`)에 있다.
+  저널의 `Claim` 레코드(작업 키, lease, 워커 uuid)와 체크포인트가 재기동을 넘긴다.
 * **커밋 가시성.** Strict에서 영속 이벤트는 등록이 커밋되기 전에는 배정·통지·backlog·명시 착수 어느 경로로도
   보이지 않는다. 같은 연결의 뒤 송신은 앞 송신의 커밋과 본문 읽기를 기다린다.
 * **자원.** 관리 메모리와 디스크를 바이트로 회계한다. 고수위에서는 캐시된 본문만 내린다(페이징). 생산자를 멈추거나
@@ -63,14 +65,14 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
  고정 머리 38   id 16 · channel 16 · type u16 · flags u16 · failures u16
  작업 키        generation 4 · arrival varint                       (착수용, 서버가 보내거나 기록할 때)
  not_before     varint                                              (선택, 착수용)
- 착수 마크      worker 16 · token generation 4 · token seq varint · lease ms varint   (배정에만)
+ worker         16                                                  (배정에만: 착수한 워커 uuid)
  payload        길이 4 + 바이트(서버는 읽지 않는다)
 ```
 
 * `not_before`는 등록 요청에서는 적용 순간부터의 길이이고, 서버가 쥐거나 보낼 때는 누적 가동 시각의 절대값이다.
 * 레코드 종류별로 실리는 필드는 `Layout`이 정한다(Request, Notice, Assigned, Delivery, Journal).
 * `failures`는 이벤트 탓인 실패 횟수다(lease 만료 회수, `Release{실패 = 예}`). 65,535에서 멈춘다.
-* `flags`: 비트 0 종류, 1 `not_before`, 2 착수 마크. 나머지는 예약이다. 이름은 없다.
+* `flags`: 비트 0 종류, 1 `not_before`, 2 워커 uuid(착수 중). 나머지는 예약이다. 이름은 없다.
 
 ## 이름표
 
@@ -78,7 +80,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 
 엔벨롭에는 서버가 그 값으로 행동하는 필드만 있다(계획 v4.8, v4.9). 요청–응답의 "어느 요청의 답인가"는 채널이 정한다: 묻는 쪽이 요청마다 채널(UUIDv7)을 정해 구독하고 그 채널에 요청을 등록한다. 워커는 타입으로 참여해 받고 같은 채널에 낸다. 서버는 발송을 채널로만 나눈다.
 
-## 저널 형식 6 ([crates/ruvent/src/journal](../crates/ruvent/src/journal/mod.rs))
+## 저널 형식 7 ([crates/ruvent/src/journal](../crates/ruvent/src/journal/mod.rs))
 
 레코드 집합(`Record`)과 세그먼트 컨테이너(`SegmentLog`)로 나뉜다. 바이트 배치와 태그 표는
 `journal/codec.rs`(세그먼트)와 `journal/checkpoint/mod.rs`(체크포인트)의 doc comment에 있다.
@@ -127,7 +129,7 @@ tokio 태스크 하나가 장부를 쥐고 `mpsc` + `recv_many`로 연산을 받
 
 ## 와이어 ([crates/ruvent-protocol](../crates/ruvent-protocol/README.md))
 
-wire v5. 레코드 `[tag][head_len][body_len][head][body]`의 연속이고 바깥 프레임은 없다. 핸드셰이크(Hello/Welcome/Bye),
+wire v6. 레코드 `[tag][head_len][body_len][head][body]`의 연속이고 바깥 프레임은 없다. 핸드셰이크(Hello/Welcome/Bye),
 호출·응답·알림·전달 레코드로 이뤄진다. 이름 사전은 없다. 채널은 16 B, 타입은 u16으로 실린다. 엔벨롭 머리는
 코어 코덱 하나로 인코딩한다. 태그 표는 `crates/ruvent-protocol/src/lib.rs`의 모듈 문서에 있다.
 
@@ -149,5 +151,5 @@ wire v5. 레코드 `[tag][head_len][body_len][head][body]`의 연속이고 바�
   확인(`Observed::Subscribed`) 이후의 발송만 그 구성원에게 보낸다. 엔벨롭은 허브가 `Arc`로 나눈다. 허브는 구독
   장부(`fanout/channels`, 순수 상태), 허브 태스크(`fanout/task.rs`), 핸들(`fanout/mod.rs`의 `Fanout`·`Member`)로
   나뉜다. 클라이언트 쪽 프로토콜, 인증, 등록(SDK 생산자), 요청–응답(요청별 응답 채널), 기한, 역압, 준비 상태의 노출은
-  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v5 하나만
+  프로젝트의 것이고 이 크레이트에는 없다(`the_proxy_is_a_skeleton`이 막는다). 이벤트 서버는 TCP 위의 wire v6 하나만
   말하고, 프록시와 워커 서버만 그것으로 붙는다.

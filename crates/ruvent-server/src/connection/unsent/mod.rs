@@ -10,7 +10,7 @@
 //!   connection holds a constant: one `Committed`, pause notices, faults.
 
 use ruvent::envelope::codec::{self, Layout};
-use ruvent::{ClaimToken, FaultKind, Outbound, Role};
+use ruvent::{EventId, FaultKind, Outbound, Role};
 use std::collections::VecDeque;
 
 /// Bytes counted for a message that carries no event on an observation connection.
@@ -38,10 +38,10 @@ pub(super) struct Unsent {
     told: u8,
 }
 
-/// The token of an assignment message.
-pub(super) fn token_of(message: &Outbound) -> Option<ClaimToken> {
+/// The event id of an assignment message.
+pub(super) fn assigned_id(message: &Outbound) -> Option<EventId> {
     match message {
-        Outbound::Assign(assignment) | Outbound::Claimed { assignment, .. } => Some(assignment.token()),
+        Outbound::Assign(assignment) | Outbound::Claimed { assignment, .. } => Some(assignment.event.id),
         _ => None,
     }
 }
@@ -131,32 +131,32 @@ impl Unsent {
         }
     }
 
-    /// Drops every queued assignment and returns their tokens: they were
+    /// Drops every queued assignment and returns their event ids: they were
     /// never written, so they go back to waiting.
-    pub(super) fn drop_assignments(&mut self) -> Vec<ClaimToken> {
-        let mut tokens = Vec::new();
+    pub(super) fn drop_assignments(&mut self) -> Vec<EventId> {
+        let mut ids = Vec::new();
         let mut kept = VecDeque::with_capacity(self.queue.len());
         while let Some((message, weight)) = self.pop() {
             self.written(weight);
-            match token_of(&message) {
-                Some(token) => tokens.push(token),
+            match assigned_id(&message) {
+                Some(id) => ids.push(id),
                 None => kept.push_back(message),
             }
         }
         for message in kept {
             self.push(message);
         }
-        tokens
+        ids
     }
 
     /// Drops everything queued (a slow connection's dispatches are one-shot,
-    /// 0.3) and returns the tokens of the assignments among them.
-    pub(super) fn drop_all(&mut self) -> Vec<ClaimToken> {
-        let tokens = self.drop_assignments();
+    /// 0.3) and returns the event ids of the assignments among them.
+    pub(super) fn drop_all(&mut self) -> Vec<EventId> {
+        let ids = self.drop_assignments();
         while let Some((_, weight)) = self.pop() {
             self.written(weight);
         }
-        tokens
+        ids
     }
 }
 
