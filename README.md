@@ -50,7 +50,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 | [docs/testing.md](docs/testing.md) | 관문, 테스트 수준, 요구사항 ↔ 테스트 지도 |
 | [docs/origin.md](docs/origin.md) | 원본(`packages/agent`) 분석과 대응 |
 | [docs/proposals/event-server-redesign.md](docs/proposals/event-server-redesign.md) | 재설계 제안서(승인됨)와 구현 기록 |
-| [docs/intro/ruvent-intro.pptx](docs/intro/ruvent-intro.pptx) | 처음 보는 개발자를 위한 소개 덱(19장). 생성기 `python docs/intro/build.py` |
+| [docs/intro/](docs/intro/README.md) | 처음 보는 개발자를 위한 소개 덱(18장), 생성기와 모양 규칙 |
 
 ## 검증
 
