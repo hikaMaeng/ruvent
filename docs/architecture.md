@@ -5,7 +5,7 @@
 ```text
 일반 클라이언트 ──► 프록시(ruvent-proxy로 빌드) ──────┐  서버마다, 채널마다 상위 구독 하나
                                                      ├──► ruvent-server ──► Engine (단일 작성자)
-워커 서버(ruvent-client: App) ───────────────────────┘          │
+워커 서버(ruvent-client: Worker) ────────────────────┘          │
 내장 워커: ruvent::connect — 같은 메서드, 소켓 없음 ────────────┘
 ```
 

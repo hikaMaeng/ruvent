@@ -66,7 +66,7 @@ ruvent는 `F:\dev\ndx_business`의 `packages/agent`(TypeScript, PostgreSQL + PGM
 | 리액션 표(사실 → 큐) | 완료 보고에 실은 후속 이벤트 | 워커가 무엇을 낼지 정한다 |
 | `transaction_key` 멱등·충돌 판정 | 큐에 있는 id 중복 거절(G8), 작업 키(G3) | 완료 뒤의 멱등은 워커가 작업 키로 |
 | 브로커 여러 대(연결·발송 분산) | 프록시(`ruvent-proxy`로 빌드한 서버): 채널별 상위 구독 하나 | 서버 연결 수 = 프록시 수 + 워커 서버 수 |
-| 워커 서버(`createWorkerServer`), 인라인/스레드 풀 | `ruvent-client` `App`·`Service`·실행기. 내장도 원격도 같은 메서드 | 허가는 핸들러가 끝나면 반환 |
+| 워커 서버(`createWorkerServer`), 인라인/스레드 풀 | `ruvent-client` `Worker`·`Service`·실행기. 내장도 원격도 같은 메서드 | 허가는 핸들러가 끝나면 반환 |
 | heartbeat·이중 리스 | 착수 기한 하나(워커가 기간으로 정함) | 기한 연장 없음. 긴 일은 실행기 이벤트로 |
 | `event_store` 영구 이력 | 운영 스냅샷(고른 채널, 별도 파일) | 재생하지 않는다 |
 | 게이트웨이 인증 훅 | 서비스 자격(서버), 최종 사용자 인증은 프록시(none / static / worker) | 프록시에 사용자 코드가 없다 |

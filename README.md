@@ -5,7 +5,8 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 [재설계 제안서](docs/proposals/event-server-redesign.md)에 있다.
 
 * **이벤트 서버는 일곱 개의 메서드만 제공한다.** 착수용 등록, 발송용 등록, 착수 마킹, 완료 보고, 삭제, 구독,
-  구독 취소다.
+  구독 취소다. 메서드는 권한의 단위이고, 한 메서드에 호출이 여럿일 수 있다(착수 마킹: `Join`·`Claim`, 완료 보고:
+  `Complete`·`Extend`·`Release`). 운영용 `operate`(`Stats`·`Drain`)는 따로 있다.
 * **이벤트는 두 종류다.** 착수용 이벤트는 완료 보고로 큐에서 지워지고, 발송용 이벤트는 발송하는 순간 지워진다.
   둘 다 한 가지 엔벨롭을 쓴다(바이너리, 고정 머리 38바이트: id · 채널 · 타입 · flags · 실패 횟수). 채널은 이름 없는
   UUIDv7이고, 타입(u16)은 서버가 워커에게 배정할 때 쓴다. 워커는 채널, 타입, 또는 둘로 참여한다. 배정에는 착수한 워커
@@ -23,7 +24,7 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 ```text
 일반 클라이언트 ──► 프록시(프로젝트가 만든다. 골조는 ruvent-proxy) ┐
                                                                ├──► 이벤트 서버(ruvent-server: 메서드 7개, 단일 작성자)
-                    워커 서버(ruvent-client: App·Service) ─────┘      ├ 착수용 큐: 완료 보고로 제거, 저널 대상
+                    워커 서버(ruvent-client: Worker·Service) ─────┘      ├ 착수용 큐: 완료 보고로 제거, 저널 대상
                     내장 워커 = 같은 메서드를 함수로 호출                └ 발송: 등록 순간 구독 접속에 넘기고 제거
 ```
 
@@ -32,9 +33,9 @@ PostgreSQL + PGMQ)를 대체하려고 만들었다. 설계와 그 근거는
 | 크레이트 | 내용 | 문서 |
 | --- | --- | --- |
 | `ruvent` | 엔벨롭과 코덱, 채널(UUIDv7), 엔진(두 큐, 메서드 일곱 개), 저널 형식 7, 운영 스냅샷, 메서드 계약과 인프로세스 연결 | [crates/ruvent/README.md](crates/ruvent/README.md) |
-| `ruvent-protocol` | 이진 와이어 프로토콜 v5: 핸드셰이크, 레코드, 메서드 레코드(이름 사전 없음) | [crates/ruvent-protocol/README.md](crates/ruvent-protocol/README.md) |
+| `ruvent-protocol` | 이진 와이어 프로토콜 v6: 핸드셰이크, 레코드, 메서드 레코드(이름 사전 없음) | [crates/ruvent-protocol/README.md](crates/ruvent-protocol/README.md) |
 | `ruvent-server` | 이벤트 서버 바이너리와 수신부. JSON 설정 | [crates/ruvent-server/README.md](crates/ruvent-server/README.md) |
-| `ruvent-client` | 원격 연결과 워커 프레임워크(`App`, `Service`, 실행기, 재시도 정책) | [crates/ruvent-client/README.md](crates/ruvent-client/README.md) |
+| `ruvent-client` | 원격 연결과 워커 프레임워크(`Worker`, `Service`, 실행기, 재시도 정책) | [crates/ruvent-client/README.md](crates/ruvent-client/README.md) |
 | `ruvent-proxy` | 프록시 골조: 서버별 상향 관찰 연결과 채널마다 상위 구독 하나의 팬아웃(구독 효력 시점). 클라이언트 쪽 프로토콜·인증·요청–응답·기한·역압은 프로젝트의 것 | [crates/ruvent-proxy/README.md](crates/ruvent-proxy/README.md) |
 | `xtask` | 검증 관문 `cargo xtask verify` | [docs/testing.md](docs/testing.md) |
 

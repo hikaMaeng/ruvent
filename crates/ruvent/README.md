@@ -60,7 +60,7 @@ if let Some(Incoming::Assign(assignment)) = inbox.recv().await {
 
 세그먼트 로그: `let (journal, recovered) = SegmentLog::open_with(dir, config.storage.segment_bytes)?; Engine::start(config, journal, recovered).await?`.
 복구는 체크포인트와 꼬리를 디스크에서 흘려 읽고(본문은 읽지 않는다), 새 세대가 디스크에 기록된 뒤에 `start`가 돌아온다.
-정상 종료(`shutdown`)는 멈춘 장부의 체크포인트를 마지막으로 쓴다. 저장의 구조는 [docs/architecture.md](../../docs/architecture.md)의 "저널 형식 6".
+정상 종료(`shutdown`)는 멈춘 장부의 체크포인트를 마지막으로 쓴다. 저장의 구조는 [docs/architecture.md](../../docs/architecture.md)의 "저널 형식 7".
 
 ## 설정 (`EngineConfig`, 계획 8장)
 
